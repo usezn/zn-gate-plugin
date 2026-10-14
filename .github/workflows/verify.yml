@@ -1,0 +1,205 @@
+# Checks every pull request into main, and main itself, against usezn/zn and
+# the published zn-gate package. The checks are the ones in PROVENANCE.md; the
+# script that runs them comes from usezn/zn at the commit that pinned the
+# plugin to this release.
+#
+# pull_request_target: the workflow that runs is this file as it is on main,
+# so a pull request cannot change or replace its own check. The pull request
+# is checked out only as data: none of its code runs, no secret is used and
+# the token can only read. main requires this check and branches that are up
+# to date with main, so the check always ran against the current main.
+name: Verify
+
+on:
+  pull_request_target:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  attestations: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the plugin (as data)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: plugin
+          persist-credentials: false
+
+      - name: Check out main of this repository (for the version check)
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out usezn/zn main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: usezn/zn
+          ref: main
+          path: zn
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.x
+
+      - name: Check git file modes
+        run: |
+          # Only regular files with mode 100644: no links, submodules or executables.
+          bad="$(git -C plugin ls-tree -r HEAD | awk '$1 != "100644" || $2 != "blob"' | head -5)"
+          if [ -n "$bad" ]; then
+            echo "::error::the plugin has entries that are not regular files with mode 100644"
+            printf '%s\n' "$bad" | cut -c1-200
+            exit 1
+          fi
+
+      - name: The workflow is the one in usezn/zn
+        run: |
+          f=plugin/.github/workflows/verify.yml
+          if [ ! -f "$f" ] || [ -L "$f" ] || ! cmp -s "$f" zn/plugins/claude-dir/verify.yml; then
+            echo "::error::.github/workflows/verify.yml must be plugins/claude-dir/verify.yml from usezn/zn main"
+            exit 1
+          fi
+
+      - name: What this change is
+        id: kind
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Before the first release the repository holds only its README, LICENSE and
+          # this workflow; a pull request can never remove a released plugin.
+          if [ ! -e plugin/.claude-plugin/plugin.json ]; then
+            if [ "$EVENT" = "pull_request_target" ] && [ -e base/.claude-plugin/plugin.json ]; then
+              echo "::error::a pull request cannot remove the plugin"
+              exit 1
+            fi
+            files="$(git -C plugin ls-tree -r --name-only HEAD | sort | tr '\n' ' ')"
+            if [ "$files" != ".github/workflows/verify.yml LICENSE README.md " ] && [ "$files" != ".github/workflows/verify.yml " ]; then
+              echo "::error::before the first release the repository holds only README.md, LICENSE and .github/workflows/verify.yml"
+              exit 1
+            fi
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A pull request that changes only the workflow file (to bring it up to date
+          # with usezn/zn) has no release to check; compared as git objects.
+          if [ "$EVENT" = "pull_request_target" ]; then
+            changed="$(diff <(git -C base ls-tree -r HEAD) <(git -C plugin ls-tree -r HEAD) | grep -E '^[<>]' | sed -E 's/^[<>] [0-9]+ [a-z]+ [0-9a-f]+\t//' | sort -u | tr '\n' ' ')"
+            if [ "$changed" = ".github/workflows/verify.yml " ]; then
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
+      - name: Read the release version and the source commit
+        id: meta
+        if: steps.kind.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          for f in plugin/.claude-plugin/plugin.json plugin/scripts/zn-gate.lock.json; do
+            if [ ! -f "$f" ] || [ -L "$f" ]; then echo "::error::$f is missing or not a regular file"; exit 1; fi
+          done
+          v="$(node -e "process.stdout.write(String(JSON.parse(require('fs').readFileSync('plugin/.claude-plugin/plugin.json','utf8')).version))")"
+          s="$(node -e "process.stdout.write(String(JSON.parse(require('fs').readFileSync('plugin/scripts/zn-gate.lock.json','utf8')).source))")"
+          if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "::error::.claude-plugin/plugin.json has no release version"; exit 1; fi
+          if [[ ! "$s" =~ ^[0-9a-f]{40}$ ]]; then echo "::error::scripts/zn-gate.lock.json has no source commit"; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "source=$s" >> "$GITHUB_OUTPUT"
+
+      - name: Newer than main
+        if: steps.kind.outputs.release == 'true' && github.event_name == 'pull_request_target'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          current="0.0.0"
+          f=base/.claude-plugin/plugin.json
+          if [ -f "$f" ] && [ ! -L "$f" ]; then
+            current="$(node -e "process.stdout.write(String(JSON.parse(require('fs').readFileSync('$f','utf8')).version))")"
+          fi
+          if [ "$current" = "$VERSION" ] || [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+            echo "::error::a release pull request must bring a version newer than the one on main"
+            exit 1
+          fi
+
+      - name: The source is the commit on usezn/zn main that pinned the plugin
+        if: steps.kind.outputs.release == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SOURCE: ${{ steps.meta.outputs.source }}
+        run: |
+          set -euo pipefail
+          lock=plugins/zn-gate/scripts/zn-gate.lock.json
+          if [ "$EVENT" = "pull_request_target" ]; then
+            # A release pull request: exactly the latest pin, so a stale one fails.
+            pin="$(git -C zn log -1 --format=%H HEAD -- "$lock")"
+            if [ "$SOURCE" != "$pin" ]; then
+              echo "::error::the plugin must be generated from $pin, the commit on usezn/zn main that last pinned the plugin"
+              exit 1
+            fi
+          else
+            # main itself: a commit on usezn/zn main that pinned this version (a later
+            # change of the pin without a newer release does not make main fail).
+            git -C zn merge-base --is-ancestor "$SOURCE" HEAD || { echo "::error::the source commit is not in usezn/zn main"; exit 1; }
+            git -C zn log --format=%H HEAD -- "$lock" | grep -qx "$SOURCE" || { echo "::error::the source commit did not pin the plugin"; exit 1; }
+            pinned="$(git -C zn show "$SOURCE:$lock" | node -e "let s='';process.stdin.on('data',(c)=>s+=c).on('end',()=>process.stdout.write(String(JSON.parse(s).version)))")"
+            [ "$pinned" = "$VERSION" ] || { echo "::error::the source commit pins another version"; exit 1; }
+          fi
+          git -C zn merge-base --is-ancestor "refs/tags/v$VERSION" "$SOURCE" || { echo "::error::the source commit does not contain the release tag"; exit 1; }
+          git -C zn worktree add --quiet --detach ../src "$SOURCE"
+
+      - name: Download the published package
+        if: steps.kind.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          # Right after a release, the package can take a few minutes to reach every npm mirror.
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if npm pack "zn-gate@$VERSION" --silent --ignore-scripts; then exit 0; fi
+            sleep 30
+          done
+          echo "::error::zn-gate is not on npm in the version of this pull request"
+          exit 1
+
+      - name: Check the package's provenance attestation
+        if: steps.kind.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SOURCE: ${{ steps.meta.outputs.source }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "zn-gate-$VERSION.tgz" --repo usezn/zn \
+            --signer-workflow usezn/zn/.github/workflows/release.yml \
+            --source-ref "refs/tags/v$VERSION" --format json > attestation.json
+          # The package was built from a commit that the source commit contains.
+          built="$(node -e "const a=JSON.parse(require('fs').readFileSync('attestation.json','utf8'));process.stdout.write(String(a[0].verificationResult.signature.certificate.sourceRepositoryDigest))")"
+          if [[ ! "$built" =~ ^[0-9a-f]{40}$ ]]; then echo "::error::the attestation names no source commit"; exit 1; fi
+          git -C zn merge-base --is-ancestor "$built" "$SOURCE" || { echo "::error::the package was not built from a commit in the source history"; exit 1; }
+
+      - name: Compare the plugin with usezn/zn and the package
+        if: steps.kind.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: node src/plugins/tools/verify-plugin-repo.js --repo plugin --tarball "zn-gate-$VERSION.tgz"
+
+      - name: Validate the plugin with Claude Code
+        if: steps.kind.outputs.release == 'true'
+        run: |
+          npm install -g --silent @anthropic-ai/claude-code@2.1.299
+          claude plugin validate --strict plugin
