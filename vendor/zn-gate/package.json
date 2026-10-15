@@ -1,7 +1,7 @@
 {
   "name": "zn-gate",
   "mcpName": "io.github.usezn/zn-gate",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "description": "Local security layer for coding agents (Claude Code, Codex CLI, Cursor, OpenCode): keeps secrets out of what the agent sends to the model, checks for prompt injection and guards the MCP servers you wrap.",
   "license": "MIT",
   "author": "usezn <admin@usezn.com>",
@@ -33,7 +33,7 @@
   },
   "main": "lib/client.js",
   "scripts": {
-    "test": "node test/unit_test.js && node test/contract.test.js && node test/scrub_patterns.test.js && node test/scrub_structured.test.js && node test/scrub_exact.test.js && node test/scrub_engine.test.js && node test/vault.test.js && node --test test/vault_prompt.test.js test/stats.test.js && node test/fake_secrets.test.js && node test/shield.test.js && node test/init.test.js && node --test test/init_paths.test.js && node test/local_only.test.js && node test/evidence.test.js && node --test test/rules_redos.test.js test/redos_linear.test.js test/rules_ignore.test.js test/rules_advisory.test.js test/rules_tiers.test.js test/rules_parity.test.js test/rules_snapshot.test.js test/rules_credentials.test.js test/rules_unicode.test.js test/cli_scan.test.js test/audit.test.js test/audit_review.test.js test/hooks_claude_code.test.js test/plain_messages.test.js test/client_long_input.test.js test/scrub_prompt.test.js test/hooks_agents.test.js test/hooks_paths_agents.test.js test/hooks_policy_hardening.test.js test/hooks_failclosed.test.js test/hook_quoting.test.js test/broker_run.test.js test/broker_mcp.test.js test/broker_audit.test.js test/audit_tail.test.js test/e2e_shadow_run.test.js test/team_policy.test.js test/team_effective.test.js test/team_detectors.test.js test/team_api.test.js test/team_upload.test.js test/team_otel.test.js test/team_e2e.test.js test/team_join_preview.test.js test/vault_cli_outdated.test.js && node test/integration/test_agent_workflows.js && node bin/cli.js test"
+    "test": "node test/unit_test.js && node test/contract.test.js && node test/scrub_patterns.test.js && node test/scrub_structured.test.js && node test/scrub_exact.test.js && node test/scrub_engine.test.js && node test/vault.test.js && node --test test/vault_prompt.test.js test/stats.test.js && node test/fake_secrets.test.js && node test/shield.test.js && node test/init.test.js && node --test test/init_paths.test.js && node test/local_only.test.js && node test/evidence.test.js && node --test test/rules_redos.test.js test/redos_linear.test.js test/mcp_annotations.test.js test/rules_ignore.test.js test/rules_advisory.test.js test/rules_tiers.test.js test/rules_parity.test.js test/rules_snapshot.test.js test/rules_credentials.test.js test/rules_unicode.test.js test/cli_scan.test.js test/audit.test.js test/audit_review.test.js test/hooks_claude_code.test.js test/plain_messages.test.js test/client_long_input.test.js test/scrub_prompt.test.js test/hooks_agents.test.js test/hooks_paths_agents.test.js test/hooks_policy_hardening.test.js test/hooks_failclosed.test.js test/hook_quoting.test.js test/broker_run.test.js test/broker_mcp.test.js test/broker_audit.test.js test/audit_tail.test.js test/e2e_shadow_run.test.js test/team_policy.test.js test/team_effective.test.js test/team_detectors.test.js test/team_api.test.js test/team_upload.test.js test/team_otel.test.js test/team_e2e.test.js test/team_join_preview.test.js test/vault_cli_outdated.test.js && node test/integration/test_agent_workflows.js && node bin/cli.js test"
   },
   "files": [
     "bin/",

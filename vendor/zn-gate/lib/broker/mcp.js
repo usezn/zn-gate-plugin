@@ -50,11 +50,13 @@ const NO_GET = 'There is no tool that returns a secret value, by design: use the
 const TOOLS = [
   {
     name: 'secrets_list',
+    annotations: { title: 'List stored secrets (names only)', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     description: 'List the secrets stored in the local zn vault: name, marker, mode, allowed hosts and allowed commands. Never returns values. ' + NO_GET,
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'secrets_http_request',
+    annotations: { title: 'Send an HTTP request that uses a stored secret', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     description: 'Make an HTTP request that needs a secret. Write the secret as its marker in a header (for example "Authorization": "Bearer __ZN_GITHUB_TOKEN__"); zn sends the request with the real value, only if the host is in that secret\'s allowHosts, and returns the response with any secret replaced by markers. Markers in the URL or the body are refused unless the user allowed that placement for the secret. Use this instead of curl or WebFetch for authenticated APIs. ' + NO_GET,
     inputSchema: {
       type: 'object',
@@ -69,6 +71,7 @@ const TOOLS = [
   },
   {
     name: 'secrets_render_file',
+    annotations: { title: 'Write a config file from a template', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     description: 'Render a template file that contains __ZN_<NAME>__ markers into an output file with the real values, for tools that need a config file (e.g. ~/.npmrc). Only for secrets in "file" mode, and the output must be git-ignored or outside any git repository. A new file inside the project is written directly; overwriting an existing file or writing outside the project waits for the user to confirm it in the zn vault prompt. Returns only the output path, never the content. ' + NO_GET,
     inputSchema: {
       type: 'object',
@@ -81,6 +84,7 @@ const TOOLS = [
   },
   {
     name: 'secrets_request',
+    annotations: { title: 'Ask the user to add a secret', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     description: 'Ask the user to add a secret you need (for example GITHUB_TOKEN). The user adds the value in their own terminal; you never receive it. Do not pass a value: if you already have it, it is exposed and the user should rotate it. ' + NO_GET,
     inputSchema: {
       type: 'object',
