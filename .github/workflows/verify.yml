@@ -98,7 +98,9 @@ jobs:
           # A pull request that changes only the workflow file (to bring it up to date
           # with usezn/zn) has no release to check; compared as git objects.
           if [ "$EVENT" = "pull_request_target" ]; then
-            changed="$(diff <(git -C base ls-tree -r HEAD) <(git -C plugin ls-tree -r HEAD) | grep -E '^[<>]' | sed -E 's/^[<>] [0-9]+ [a-z]+ [0-9a-f]+\t//' | sort -u | tr '\n' ' ')"
+            # diff exits 1 when the trees differ and grep exits 1 when nothing matches;
+            # with -o pipefail either would end the step, so both are allowed here.
+            changed="$({ diff <(git -C base ls-tree -r HEAD) <(git -C plugin ls-tree -r HEAD) || true; } | { grep -E '^[<>]' || true; } | sed -E 's/^[<>] [0-9]+ [a-z]+ [0-9a-f]+\t//' | sort -u | tr '\n' ' ')"
             if [ "$changed" = ".github/workflows/verify.yml " ]; then
               echo "release=false" >> "$GITHUB_OUTPUT"
               exit 0
@@ -156,7 +158,8 @@ jobs:
             # main itself: a commit on usezn/zn main that pinned this version (a later
             # change of the pin without a newer release does not make main fail).
             git -C zn merge-base --is-ancestor "$SOURCE" HEAD || { echo "::error::the source commit is not in usezn/zn main"; exit 1; }
-            git -C zn log --format=%H HEAD -- "$lock" | grep -qx "$SOURCE" || { echo "::error::the source commit did not pin the plugin"; exit 1; }
+            # grep reads all of git log's output: with -q it would stop early and git log would end with SIGPIPE.
+            git -C zn log --format=%H HEAD -- "$lock" | grep -x "$SOURCE" >/dev/null || { echo "::error::the source commit did not pin the plugin"; exit 1; }
             pinned="$(git -C zn show "$SOURCE:$lock" | node -e "let s='';process.stdin.on('data',(c)=>s+=c).on('end',()=>process.stdout.write(String(JSON.parse(s).version)))")"
             [ "$pinned" = "$VERSION" ] || { echo "::error::the source commit pins another version"; exit 1; }
           fi
