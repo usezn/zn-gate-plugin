@@ -1,10 +1,10 @@
 {
   "package": "zn-gate",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "registry": "https://registry.npmjs.org",
-  "integrity": "sha512-sj3/MDIawytUZEA3WFFfgZtoy2mzPK0AptYTw5REWO8ljnF6EzVSYkN/iklrj++K5NM3HCkXVryqevoM3CiJgw==",
+  "integrity": "sha512-ScsgYkDRQkOUgz76Eq1v+eU18d/xDdeYXm9Vdmm7rFi3T7AW8q0yDP6CWMji1IzNS3V2pUxRCmCaT1JNjCJIhw==",
   "bundled": "vendor/zn-gate",
-  "source": "f67c4264607a3a18334054b6a241de5a2774164b",
+  "source": "ba809e76037bca741987c4c04f608607ef0d6717",
   "files": {
     "LICENSE": "a14f2e34934125e28ec5b4f2eb3de931f91115157345a0262454f290f0a74fa9",
     "README.md": "af9f560c3563b5ea7527f6f32f5ce462484410bb11b617ba777f6a850435d842",
@@ -28,7 +28,7 @@
     "lib/broker/files.js": "45dd8927cc626ac35e8c036e5118ec3c584a3f3a396640c09cee8b545e67c097",
     "lib/broker/markers.js": "301eb1d763e8e88c32e32a02c344be8f44b342b06b61897f3a2d478dbe55d6b4",
     "lib/broker/mask.js": "34300e883385a3d0f0f190391b4e3de9714f0a13e3dd971f818ac704f5a82f98",
-    "lib/broker/mcp.js": "649cd9d217d83da473413ba3b11922de2a036e00b7b8da138037ef5164c5618a",
+    "lib/broker/mcp.js": "22cde673b6e96a887d48ec3479933617b2e1c160aefec39d67cdf04666785a83",
     "lib/broker/run.js": "8015dddf982ce21f94c0c83e1a7d4dac326973e48a1a0eb6c643934eb0604b17",
     "lib/broker/tty.js": "216c471c52c5d640d5889409474a0932e21a0d5be5e5d20d3dc94d3273d6d3a5",
     "lib/client.js": "7b22ffdd6c4302d8339e6ad81f9d0815715aadebec2ebb87e4423a52baaadf6d",
@@ -41,7 +41,7 @@
     "lib/init.js": "19d465368b11e4b868d4046de86328f122681e7ccc512f50a33b15cafaf59c59",
     "lib/linear-text.js": "791d8de56d6a2377edfebe5e6f53dfa95ddf6fe1d1d08335ed3947c4a839ecc7",
     "lib/mcp-pins.js": "c055af4c852c06407b08f187c4d5a5932802c426acf768d6308948baaca02246",
-    "lib/mcp.js": "895b34bd0185626f35f665b6309c5b9742e6e41de7533bf46912ae98111a8a74",
+    "lib/mcp.js": "8031b86e953b638e94022b235f0cafd8b7d721a27e984a64a0e15fb0c2386a1a",
     "lib/pins-cli.js": "3bed78a5bab1a598bdc7415312fa21aec4efc76467f41e1f504f50919080e415",
     "lib/rules.js": "a597232ad87c13c48ee88cada4fa60b8ddfd310e2576ac55d4b0da6381c79a6b",
     "lib/scrub/engine.js": "9a451877b109daae29fcbb6bbbcd8877c4dcbabac289e987e439afdfb3dc840e",
@@ -203,6 +203,6 @@
     "node_modules/age-encryption/dist/webauthn.js": "f0cc43ba2916f3c8b4b948fc6e3ef6c0cac3fdf3eaf03e1eec8c17310c6ae560",
     "node_modules/age-encryption/dist/x25519.js": "6d40040e713b5d050b2c52a139e915e3b50792f29034a68c15014b8dfebc7774",
     "node_modules/age-encryption/package.json": "2f3b8be06de0b6c00139f51bb1085c368a2298b172ed63aa017ef75483a7987d",
-    "package.json": "7db08d8136f950668950b0371e6ba1c377e9929cc84e30641e7d3f1466d62e3c"
+    "package.json": "b9c8a1d5d55d8324b1365aef90f76d8b2cc88d6d7321142b5a8f907e51c5ab24"
   }
 }
