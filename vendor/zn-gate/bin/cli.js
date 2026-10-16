@@ -129,7 +129,8 @@ USAGE:
   zn-gate <command> [options]
 
 COMMANDS:
-  init                Find and wrap MCP servers in known agent configs (Claude, Cursor, Codex, OpenCode...)
+  init                Set up zn for the coding agents on this machine, one step at a time, then check it
+  init --wrap-mcp     Find and wrap the MCP servers in known agent configs (Claude, Cursor, Codex, OpenCode...)
   shield, mcp-shield  Wrap and protect ANY external MCP server (uvx, npx, node, python)
   scan <path>         Recursively audit prompt templates, markdown, skills, and configs for injection traps
                       [--format text|json|github] (matched values are never printed)
@@ -162,6 +163,8 @@ SECRETS (values stay on this machine; agents only see __ZN_<NAME>__ markers):
   secret log          Show the local audit log of secret use [--since 1h] (same as vault log)
   hooks install claude-code [--project]
                       Install the Claude Code hooks and the "secrets" MCP server
+  check               Show that zn blocks your agent from reading a fake secret
+                      (also: doctor). Safe: a temporary folder, nothing is sent
   secrets-mcp         Run the "secrets" MCP server (stdio)
   hook <agent>        Hook entry point used by agents (reads the event on stdin)
 
@@ -197,7 +200,7 @@ TEAM (zn Team: organization policy and audit upload; needs the vault unlocked):
   team sync           Download the policy and upload the audit log now
   team leave          Disconnect this machine (confirmed outside the agent)
 
-INIT OPTIONS:
+INIT --wrap-mcp OPTIONS (each one also selects --wrap-mcp):
   --dry-run           Scan environments and preview changes without modifying configs
   --shadow            Wrap servers in non-blocking shadow mode (alerts logged without drops)
   --revert            Restore pre-zn backups for all detected configurations
@@ -212,8 +215,11 @@ EVIDENCE OPTIONS:
   --tail <number>     Display the last N security records (default: 20)
 
 EXAMPLES:
-  # Wrap the MCP servers found in your agent configs (backups are written first)
+  # Set up zn for your coding agents, then see it block a test secret
   npx -y zn-gate init
+
+  # Wrap the MCP servers found in your agent configs (backups are written first)
+  npx -y zn-gate init --wrap-mcp
 
   # Audit prompt templates / agent skills for hidden injection traps
   npx -y zn-gate scan ./prompts
@@ -664,6 +670,13 @@ async function main() {
     process.exit(await runVaultCommand(args));
   }
 
+  if (command === 'init' && !(args.includes('--wrap-mcp') || options.dryRun || options.revert || options.shadow)) {
+    // Guided setup: one route per agent, run only by a person in a terminal, then zn-gate check.
+    process.env.ZN_STATS = 'off';
+    process.exitCode = await require('../lib/init-guide').guide({});
+    return;
+  }
+
   if (command === 'init') {
     process.stdout.write(`
 🛡️  zn-gate init - Zero-Touch MCP Auto-Discovery & Shielding
@@ -791,6 +804,13 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
     return;
   }
 
+  if (command === 'check' || command === 'doctor') {
+    process.env.ZN_STATS = 'off'; // the test read is not counted in zn-gate stats
+    const zc = require('../lib/check');
+    process.exitCode = zc.report(await zc.check({}));
+    return;
+  }
+
   if (command === 'pins') {
     process.exitCode = await require('../lib/pins-cli').run(args.slice(1));
     return;
@@ -833,6 +853,24 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
   Leaves machine  : ${cloud ? 'analyze_prompt text only, secrets redacted locally first' : 'Nothing'}
 
 `);
+    // Claude Code settings that stop zn's hooks or its MCP server (read-only).
+    try {
+      const cc = require('../lib/agents/claude-code');
+      if (cc.detect()) {
+        const path = require('path');
+        // The user-scope MCP servers live in .claude.json (in CLAUDE_CONFIG_DIR when set).
+        const claudeJson = process.env.CLAUDE_CONFIG_DIR ? path.join(cc.configDir(), '.claude.json') : path.join(require('os').homedir(), '.claude.json');
+        let mcp = null;
+        try { mcp = (JSON.parse(require('fs').readFileSync(claudeJson, 'utf8')).mcpServers || {}).secrets || null; } catch (_) { /* not registered */ }
+        const notes = require('../lib/agents/managed-policy').claudeCodePolicyWarnings({
+          userSettings: [path.join(cc.configDir(), 'settings.json')],
+          mcp: Boolean(mcp && JSON.stringify(mcp).includes('secrets-mcp')),
+          mcpCommand: mcp && mcp.command ? [mcp.command, ...(Array.isArray(mcp.args) ? mcp.args : [])] : null,
+        });
+        for (const n of notes) process.stdout.write('  Claude Code     : ' + n + '\n');
+        if (notes.length) process.stdout.write('\n');
+      }
+    } catch (_) { /* status never fails on this check */ }
     process.exit(0);
   }
 

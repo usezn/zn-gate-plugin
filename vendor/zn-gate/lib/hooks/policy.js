@@ -27,7 +27,7 @@ const { znCommand } = require('../zn-command');
 
 // Version of the policy rules (credential paths, zn home, secret commands,
 // command wrapping). Bump it when a rule changes; see CONTRIBUTING.md.
-const POLICY_RULES_VERSION = '2026-10-15.15';
+const POLICY_RULES_VERSION = '2026-10-15.21';
 
 /* ------------------------------ paths ------------------------------ */
 
@@ -533,7 +533,7 @@ function readDenial(p, opts = {}) {
     return 'zn: ' + path.basename(abs) + ' holds plain-text secrets. Ask the user to run `' +
       znCommand('env shadow ' + path.basename(abs)) + '` in their terminal: it moves the values to the local vault and leaves __ZN_<NAME>__ markers you can read and use.';
   }
-  if (c.kind === 'zn_state') return 'zn: ~/.zn is the local secret vault; agents may not read or change it.';
+  if (c.kind === 'zn_state') return vaultMessage(opts);
   return credentialDenial(p, c);
 }
 
@@ -550,7 +550,7 @@ function agentConfigDenial(p, c) {
 /** Writes are only blocked for zn's own state and the agents' hook and plugin configuration. */
 function writeDenial(p, opts = {}) {
   const c = classifyPath(p, opts);
-  if (c && c.kind === 'zn_state') return 'zn: ~/.zn is the local secret vault; agents may not read or change it.';
+  if (c && c.kind === 'zn_state') return vaultMessage(opts);
   if (c && c.kind === 'agent_config') return agentConfigDenial(p, c);
   return null;
 }
@@ -693,12 +693,13 @@ function wrapWithZnRun(cmd, znRunPrefix) {
   }
   for (let j = 0; j < k; j++) {
     if (markers.findNamedMarkers(scan.words[j].text).length) {
-      return { ok: false, reason: 'zn: pass secrets to a command with `zn run --secrets NAME -- <command>` instead of a leading VAR=__ZN_NAME__ assignment.' };
+      return { ok: false, reason: 'zn: a secret in a VAR=__ZN_NAME__ assignment before a command cannot be filled in, so the command was blocked. ' +
+        'Next step: give it to the program with `' + znCommand('run --secrets NAME -- <command>') + '` instead.' };
     }
   }
   const first = scan.words[k];
   if (RESERVED_WORDS.has(first.text)) {
-    return { ok: false, reason: 'zn: a secret cannot be used with `' + first.text + '`.' + guidance };
+    return { ok: false, reason: 'zn: a secret cannot be used with `' + first.text + '`, because it is a shell keyword, not a program zn can hand the value to.' + guidance };
   }
   // Already wrapped by the agent or a previous hook: leave it alone, zn run applies policy.
   if (/(^|[\\/])(zn|zn-gate)(\.js|\.cmd)?$/.test(first.text) && scan.words[k + 1] && scan.words[k + 1].text === 'run') {
@@ -820,7 +821,7 @@ function hasNetworkSignals(cmd) {
 }
 
 // The program is zn, zn-gate (also with a version: npx -y zn-gate@1.6.0, pnpm dlx zn-gate@latest) or the bin file.
-const ZN_ADMIN_RE = /(^|[\s;&|(`$'"\\\/])((?:zn|zn-gate(?:@[^\s"'`;&|]+)?|cli\.js))(\.cmd|\.js|\.ps1)?["']?\s+(?:--\s+)?(secret\s+(set|get|rm|remove|import|adopt|approve|allow|reveal|link)|env\s+(shadow|unshadow)|unlock|lock|hooks\s+(install|uninstall)|stats(?:\s+(?:-{1,2}[^\s-]\S*|\d+))*\s+share\s+on|["']?pins["']?\s+["']?approve)\b/i;
+const ZN_ADMIN_RE = /(^|[\s;&|(`$'"\\\/])((?:zn|zn-gate(?:@[^\s"'`;&|]+)?|cli\.js))(\.cmd|\.js|\.ps1)?["']?\s+(?:--\s+)?(secret\s+(set|get|rm|remove|import|adopt|approve|allow|reveal|link)|env\s+(shadow|unshadow)|unlock|lock|hooks\s+(install|uninstall)|init(?![^\n;&|#`$()'"<>]{0,512}\s--(?:wrap-mcp|dry-run|revert|shadow)(?=\s|$))|stats(?:\s+(?:-{1,2}[^\s-]\S*|\d+))*\s+share\s+on|["']?pins["']?\s+["']?approve)\b/i;
 
 function adminCommand(cmd) {
   const m = ZN_ADMIN_RE.exec(String(cmd || ''));
@@ -832,6 +833,11 @@ function adminCommand(cmd) {
 // longer than the agent waits for the hook, and a hook that times out lets the
 // command run unchecked.
 const SHELL_SCAN_CAP = 100 * 1024; // characters
+function vaultMessage(opts = {}) {
+  return 'zn blocked this: ~/.zn is where zn keeps your secrets, so agents may not read or change it. ' +
+    'Next step: to use a secret in a command, write __ZN_NAME__ where the value goes (zn fills it in); to add one, ask the user to run `' +
+    znCommand('secret set NAME', opts) + '` in their own terminal.';
+}
 const TOO_LONG_MESSAGE = 'zn: this command is too long for zn to check (over 100 KB), so it was blocked. Next step: tell the user; do not resend it in parts.';
 
 /**
@@ -841,13 +847,7 @@ const TOO_LONG_MESSAGE = 'zn: this command is too long for zn to check (over 100
 function bashDenial(cmd, opts = {}) {
   if (String(cmd || '').length > SHELL_SCAN_CAP) return TOO_LONG_MESSAGE;
   const admin = adminCommand(cmd);
-  if (admin) {
-    if (/pins/i.test(admin)) {
-      return 'zn: approving MCP tool changes (`zn-gate pins approve`) is the user\'s decision and must be run by the user in their own terminal, not by an agent. Ask the user to run it.';
-    }
-    return 'zn: `zn ' + admin + '` manages secret values and must be run by the user in their own terminal, not by an agent. ' +
-      'Ask the user to run it.';
-  }
+  if (admin) return adminDenial(admin, opts, cmd);
   // The context (home, project, agent directories) is built once per command.
   opts = { ...opts, ctx: contextOf(opts) };
   // The command is read three times: a backslash before a letter is a Windows
@@ -888,9 +888,46 @@ function bashDenial(cmd, opts = {}) {
   return null;
 }
 
+/* zn commands only the user may run: what the command does, why an agent may not, and the next step. */
+function adminDenial(admin, opts = {}, cmd = '') {
+  const run = (args) => 'Next step: ask the user to run `' + znCommand(args, opts) + '` in their own terminal.';
+  const m = ZN_ADMIN_RE.exec(String(cmd));
+  const words = m ? String(cmd).slice(m.index + m[0].length).trim().split(/[\s;&|]+/).slice(0, 8).map((w) => w.replace(/^["']|["']$/g, '')) : [];
+  const next = words.find((w) => !w.startsWith('-')) || '';
+  let arg = '';
+  if (/^hooks/i.test(admin)) {
+    arg = /^(claude-code|codex|cursor|opencode)$/.test(next) ? next : '<agent>';
+    // The fixed options of zn hooks install, so the user installs in the same place the agent asked for.
+    for (const o of ['--project', '--no-mcp']) if (words.includes(o)) arg += ' ' + o;
+  } else if (/^secret (set|get|rm|remove|reveal|allow|approve|link)$/i.test(admin)) {
+    arg = /^[A-Z_][A-Z0-9_]{0,63}$/.test(next) ? next : 'NAME';
+  } else if (/^env/i.test(admin)) {
+    const base = path.basename(next);
+    arg = /^[\w.-]{1,128}$/.test(base) && !/^\.+$/.test(base) ? base : '.env';
+  }
+  const full = arg ? admin + ' ' + arg : admin;
+  if (/pins/i.test(admin)) {
+    return 'zn blocked this: approving changed MCP tools is the user\'s decision, so an agent may not run `zn-gate pins approve`. ' + run('pins approve');
+  }
+  if (/^init$/i.test(admin)) {
+    return 'zn blocked this: `zn-gate init` turns zn\'s protection on for coding agents, which is the user\'s decision. ' +
+      'Next step: ask the user to run it in their own terminal (`npx -y zn-gate init`).';
+  }
+  if (/^hooks/i.test(admin)) {
+    return 'zn blocked this: `' + znCommand(admin, opts) + '` turns zn\'s protection on or off for a coding agent, which is the user\'s decision. ' + run(full);
+  }
+  if (/^(un)?lock$/i.test(admin)) {
+    return 'zn blocked this: locking or unlocking the secret vault is the user\'s decision, so an agent may not run `' + znCommand(admin, opts) + '`. ' + run(admin);
+  }
+  if (/^stats/i.test(admin)) {
+    return 'zn blocked this: only the user can turn on sharing of zn\'s usage statistics. ' + run('stats share on');
+  }
+  return 'zn blocked this: `' + znCommand(admin, opts) + '` reads or changes secret values, and secret values never go to the AI model. ' + run(full);
+}
+
 /** The deny message for a read or write classified by classifyWord. */
 function denialOf(c, text, opts) {
-  if (c.kind === 'zn_state') return 'zn: ~/.zn is the local secret vault; agents may not read or change it.';
+  if (c.kind === 'zn_state') return vaultMessage(opts);
   if (c.kind === 'dotenv') return readDenial(text, opts);
   return credentialDenial(text, c);
 }
