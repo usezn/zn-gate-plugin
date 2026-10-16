@@ -101,7 +101,15 @@ async function plan(opts = {}) {
     const found = r.state !== 'not-set-up' || getAdapter(r.id).detect({ home, env });
     const item = { id: r.id, name: r.name, found, state: r.state, problem: r.problem || '', steps: [] };
     if (found && r.state !== 'protected') {
-      if (r.id === 'claude-code') {
+      // Claude Code set up with zn's own hooks is repaired with them, and with the plugin as well it drops them:
+      // installing the plugin on top would run both sets.
+      const hooksVerb = r.id !== 'claude-code' ? 'install' : r.via === 'hooks' ? 'install' : r.via === 'both' ? 'uninstall' : null;
+      if (!hooksVerb && r.pluginOff) {
+        // Installed but turned off: installing it again would not turn it on.
+        const claude = opts.claude !== undefined ? opts.claude : findProgram('claude', env);
+        if (claude) item.steps.push({ label: 'turn on the zn-gate plugin', run: [claude, ['plugin', 'enable', 'zn-gate@usezn']], manual: 'claude plugin enable zn-gate@usezn' });
+        else item.steps.push({ label: 'in Claude Code, type this command', run: null, manual: 'in Claude Code, type /plugin enable zn-gate@usezn' });
+      } else if (!hooksVerb) {
         const claude = opts.claude !== undefined ? opts.claude : findProgram('claude', env);
         if (claude) {
           item.steps.push({ label: 'add the usezn plugin marketplace', run: [claude, ['plugin', 'marketplace', 'add', 'usezn/zn']], manual: 'claude plugin marketplace add usezn/zn' });
@@ -113,8 +121,9 @@ async function plan(opts = {}) {
         needsZn = true;
         // This install's own CLI, or, from a temporary copy, the global one (by absolute path).
         const zn = temporary ? (glob.zn || null) : process.execPath;
-        const args = temporary ? ['hooks', 'install', r.id] : [path.join(PKG_ROOT, 'bin', 'cli.js'), 'hooks', 'install', r.id];
-        item.steps.push({ label: 'install zn\'s hooks for ' + r.name, run: zn ? [zn, args] : null, manual: 'zn hooks install ' + r.id, needsGlobal: temporary });
+        const args = temporary ? ['hooks', hooksVerb, r.id] : [path.join(PKG_ROOT, 'bin', 'cli.js'), 'hooks', hooksVerb, r.id];
+        const label = hooksVerb === 'uninstall' ? 'remove zn\'s own hooks for ' + r.name + ' (the zn-gate plugin stays)' : 'install zn\'s hooks for ' + r.name;
+        item.steps.push({ label, run: zn ? [zn, args] : null, manual: 'zn hooks ' + hooksVerb + ' ' + r.id, needsGlobal: temporary });
       }
     }
     items.push(item);

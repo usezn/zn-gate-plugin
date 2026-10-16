@@ -27,7 +27,7 @@
 
 // Version of the type catalogue (secret and PII patterns, validators). Bump it
 // when a pattern, validator or type name changes; see CONTRIBUTING.md.
-const SCRUB_RULES_VERSION = '2026-10-15.2';
+const SCRUB_RULES_VERSION = '2026-10-16.3';
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -465,11 +465,25 @@ const PATTERNS = [
       const scheme = m[1].toLowerCase();
       if (pw.length < 6) return false;
       if (isPlaceholder(pw) || pw === user || pw.toLowerCase() === scheme) return false;
+      // Not a literal secret, as in the Python package: a password that is only
+      // a reference (%NAME%; $NAME, ${NAME}, <name> and {{name}} are
+      // placeholders above), and GitHub's fixed "x-oauth-basic" password (the
+      // token is then the user, found by its own pattern). A reference as the
+      // user does not make a literal password safe.
+      if (/^%[A-Za-z0-9_]+%$/.test(pw) || pw.toLowerCase() === 'x-oauth-basic') return false;
       if (/^[A-Za-z]{1,8}$/.test(pw)) return false;           // short dictionary-like words in docs
       if (/^(?:%[0-9A-Fa-f]{2}){1,2}$/.test(pw)) return false;
       return true;
     },
     typeOf: (m) => (/^(?:https?|ftps?|wss?|sftp|ssh|git)$/i.test(m[1]) ? 'URL_PASSWORD' : 'DB_PASSWORD') },
+  /* Opaque token in an `Authorization: Bearer` header (curl -H, HTTP logs,
+   * .http files). Same form as secret:bearer_token in the Python package:
+   * 20 or more token characters; references ($TOKEN, ${TOKEN}) and
+   * placeholders are left alone, and so are zn's own __ZN_<NAME>__ markers.
+   * A JWT is also a JWT span. */
+  { type: 'BEARER_TOKEN', hints: null, prefilter: /authorization/i,
+    re: re('(Authorization[ \\t]*:[ \\t]*Bearer[ \\t]+)([A-Za-z0-9._~+/=-]{20,})', 'i'),
+    group: 2, check: (v) => !isPlaceholder(v) && !/^__ZN_[A-Z0-9_]+__$/.test(v) },
   /* Generic assignment: sensitive key = quoted high-entropy value. */
   { type: 'SECRET', hints: null, prefilter: /(?:pass|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth)/i,
     re: re('(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)[A-Za-z0-9_]{0,64}["\']?\\s*(?:=|:|=>|:=)\\s*["\'`]([^"\'`\\s\\\\]{12,200})["\'`]', 'i'),

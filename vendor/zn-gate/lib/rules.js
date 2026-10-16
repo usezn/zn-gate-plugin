@@ -5,10 +5,10 @@ const path = require('path');
 
 /**
  * zn deterministic rules engine - SINGLE SOURCE OF TRUTH.
- * RULES_VERSION: 2026-10-14.3
+ * RULES_VERSION: 2026-10-16.4
  */
 
-const RULES_VERSION = '2026-10-14.3';
+const RULES_VERSION = '2026-10-16.4';
 
 // Word boundaries are written as explicit ASCII lookarounds, not \b: JavaScript's
 // \b is ASCII-only without the u flag, while Python's is Unicode. A letter such
@@ -670,6 +670,25 @@ const SECRET_PATTERNS = [
   { id: 'secret:credential_default', pattern: /(\$\{(?:[A-Z0-9]+_)*(?:API_KEY|APIKEY|SECRET_ACCESS_KEY|ACCESS_KEY|SECRET_KEY|PRIVATE_KEY|CREDENTIALS|SECRET|TOKEN|PASSWORD|PASSWD|PASS|PWD):?[-=])([^\s'"{}$]{12,})(\})/gu, replacement: '$1[REDACTED_SECRET]$3', valueFilter: isNonSecretDefault, requires: '${' },
 ];
 
+// Extra credential forms that only `zn-gate scan` reports (files at rest, not
+// agent traffic). They run after SECRET_PATTERNS, on the text those already
+// redacted, so a value found by both is reported once.
+//   secret:cli_credential_flag   --api-key=..., --password=..., --token=... on
+//     a command line. A flag without a value, a reference ($TOKEN, ${X}) or a
+//     placeholder (<token>, changeme) is left alone.
+//   secret:credential_assignment a quoted value assigned to a name that ends
+//     in password, passwd, secret, token or api key, in lower or mixed case,
+//     with =, :, := or => (also $name = "..." in PHP, Perl and PowerShell).
+//     Only values that look machine-generated count, so labels and messages
+//     (i18n files, "password": "Contraseña") are not reported.
+const SCAN_FLAG_PREFILTER = /--(?:api|pass|token|secret|access|auth|client)/;
+const SCAN_ASSIGNMENT_PREFILTER = /[Pp][Aa][Ss][Ss][Ww]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Kk][Ee][Yy]/;
+const SCAN_SECRET_PATTERNS = [
+  { id: 'secret:cli_credential_flag', pattern: /(?<![A-Za-z0-9_-])(--(?:api[-_]?key|password|passwd|token|secret|access[-_]token|auth[-_]token|client[-_]secret)=["']?)([^\s'"]{8,512})[^\s'"]*(["']?)/gu, replacement: '$1[REDACTED_SECRET]$3', valueFilter: isNonSecretValue, prefilter: SCAN_FLAG_PREFILTER },
+  // The name is at most 40 characters before the keyword, so each start costs a bounded amount.
+  { id: 'secret:credential_assignment', pattern: /(?<![A-Za-z0-9_$])(\$?[A-Za-z0-9_]{0,40}?(?:[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy])["']?[ \t]*(?::=|=>|=|:)[ \t]*["'])([^\s'"]{8,512})(["'])/gu, replacement: '$1[REDACTED_SECRET]$3', valueFilter: isNonSecretDefault, prefilter: SCAN_ASSIGNMENT_PREFILTER },
+];
+
 // ---------------------------------------------------------------------------
 // Values of credential assignments that are not secrets. The checks run in
 // this order:
@@ -965,6 +984,23 @@ function mergeCandidates(cands) {
 // of what both find, so a secret split by a zero-width or tag character is
 // redacted whole. Texts without invisible characters are handled as before.
 function redactSecrets(text) {
+  return redactWith(text, SECRET_PATTERNS);
+}
+
+// SCAN_SECRET_PATTERNS alone (`zn-gate scan` runs them last, on text that
+// the other rules and the scrubber already redacted).
+function redactScanRules(text) {
+  return redactWith(text, SCAN_SECRET_PATTERNS);
+}
+
+// redactSecrets plus SCAN_SECRET_PATTERNS, for the lines `zn-gate scan` prints.
+function redactScanSecrets(text) {
+  const first = redactWith(text, SECRET_PATTERNS);
+  const second = redactWith(first.sanitized, SCAN_SECRET_PATTERNS);
+  return { sanitized: second.sanitized, detections: first.detections.concat(second.detections) };
+}
+
+function redactWith(text, patterns) {
   if (typeof text !== 'string' || !text) {
     return { sanitized: text, detections: [] };
   }
@@ -973,7 +1009,7 @@ function redactSecrets(text) {
   const budget = { left: MAX_FILTERED_CHARS };
   let view = null;
   let dirty = true;
-  for (const item of SECRET_PATTERNS) {
+  for (const item of patterns) {
     if (dirty) {
       view = invisibleView(sanitized);
       dirty = false;
@@ -1123,6 +1159,8 @@ module.exports = {
   analyzePrompt: evaluate,
   loadCustomConfig,
   redactSecrets,
+  redactScanSecrets,
+  redactScanRules,
   sanitizeToolResult,
   normalizeInput,
   invisibleView,
@@ -1146,6 +1184,7 @@ module.exports = {
     CREDENTIAL_DOTTED_WORDS_RE, CREDENTIAL_FILE_EXT_RE, CREDENTIAL_LETTERS_RE, CREDENTIAL_DESCRIPTIVE_WORDS, CREDENTIAL_HEX_RE, WORD_TOKEN_RE,
   },
   SECRET_PATTERNS,
+  SCAN_SECRET_PATTERNS,
   RULES_VERSION,
   INJECTION_RULES,
   INDIRECT_INJECTION_RULES,
