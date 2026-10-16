@@ -15,8 +15,9 @@ const { spawnSync } = require('child_process');
  */
 const AGENT_ENV_VARS = ['CLAUDECODE', 'CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED', 'CURSOR_AGENT', 'OPENCODE', 'ZN_AGENT'];
 
+// Present counts, also when empty: `CLAUDECODE= zn ...` is still run from inside an agent.
 function agentEnvDetected(env = process.env) {
-  return AGENT_ENV_VARS.find((k) => env[k] !== undefined && env[k] !== '') || null;
+  return AGENT_ENV_VARS.find((k) => env[k] !== undefined) || null;
 }
 
 /** Throws unless a person is at an interactive terminal. */

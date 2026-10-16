@@ -281,7 +281,7 @@ function installMcp(opts, report) {
     const data = readJson(file);
     data.mcpServers = data.mcpServers || {};
     const existing = data.mcpServers[MCP_SERVER_NAME];
-    if (existing && !JSON.stringify(existing).includes('secrets-mcp')) {
+    if (existing && !isZnSecretsServer(existing)) {
       report.warnings.push('an MCP server named "' + MCP_SERVER_NAME + '" already exists in ' + file + '; left unchanged');
       return;
     }
@@ -367,22 +367,60 @@ function uninstall(opts = {}) {
       if (fs.existsSync(mcpFile)) {
         const data = readJson(mcpFile);
         const s = data.mcpServers && data.mcpServers[MCP_SERVER_NAME];
-        if (s && JSON.stringify(s).includes('secrets-mcp')) {
+        if (s && isZnSecretsServer(s)) {
           backup(mcpFile);
           delete data.mcpServers[MCP_SERVER_NAME];
           writeFileAtomic(mcpFile, JSON.stringify(data, null, 2) + '\n', 0o644);
         }
       }
     } else {
-      const claude = opts.claudeBin !== undefined ? opts.claudeBin : whichSync('claude', process.env.PATH || '');
-      if (claude && /\.(?:cmd|bat)$/i.test(claude)) {
+      // Only zn's own server: a user MCP server that happens to be called "secrets" is left alone.
+      const ours = userMcpServerIsOurs(opts);
+      const claude = ours !== true ? null : opts.claudeBin !== undefined ? opts.claudeBin : whichSync('claude', process.env.PATH || '');
+      if (ours === false) {
+        report.warnings.push('left the MCP server named "' + MCP_SERVER_NAME + '" in place: it is not zn\'s');
+      } else if (ours === null) {
+        report.warnings.push('could not read your Claude Code MCP settings, so the MCP server named "' + MCP_SERVER_NAME + '" was left in place; if it is zn\'s, remove it with: claude mcp remove --scope user ' + MCP_SERVER_NAME);
+      } else if (claude && /\.(?:cmd|bat)$/i.test(claude)) {
         report.warnings.push('`claude` is a batch file (' + path.basename(claude) + '), which zn does not run through cmd.exe: remove the MCP server yourself with: claude mcp remove --scope user ' + MCP_SERVER_NAME);
       } else if (claude) {
         spawnSync(claude, ['mcp', 'remove', '--scope', 'user', MCP_SERVER_NAME], { encoding: 'utf8', windowsHide: true });
+      } else if (ours === true) {
+        report.warnings.push('`claude` is not on your PATH: remove zn\'s MCP server yourself with: claude mcp remove --scope user ' + MCP_SERVER_NAME);
       }
     }
   }
   return report;
+}
+
+/* zn's own "secrets" server: `secrets-mcp` as an argument of zn-gate's bin/cli.js, of `zn`/`zn-gate`, or of `npx zn-gate`.
+ * A server that only mentions the word (another package, a note in env) is someone else's. */
+function isZnSecretsServer(s) {
+  if (!s || typeof s !== 'object') return false;
+  const args = Array.isArray(s.args) ? s.args.map(String) : [];
+  const i = args.indexOf('secrets-mcp');
+  if (i < 0) return false;
+  const prev = i > 0 ? args[i - 1].replace(/\\/g, '/') : '';
+  const cmd = path.basename(String(s.command || '').replace(/\\/g, '/')).replace(/\.(?:cmd|exe|ps1)$/i, '').toLowerCase();
+  if (/(?:^|\/)zn-gate\/bin\/cli\.js$/i.test(prev)) return true;
+  if (i === 0 && (cmd === 'zn' || cmd === 'zn-gate')) return true;
+  return /^zn-gate(?:@[^\s]+)?$/i.test(prev) && (cmd === 'npx' || cmd === 'npm');
+}
+
+/* The user-scope MCP servers live in .claude.json (in CLAUDE_CONFIG_DIR when set): true when the "secrets"
+ * server there is zn's, false when it is someone else's, undefined when there is none, null when unreadable. */
+function userMcpServerIsOurs(opts = {}) {
+  const env = opts.env || process.env;
+  const file = env.CLAUDE_CONFIG_DIR ? path.join(configDir(opts), '.claude.json') : path.join(opts.home || os.homedir(), '.claude.json');
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+  } catch (err) {
+    return err.code === 'ENOENT' ? undefined : null;
+  }
+  const s = data && data.mcpServers && data.mcpServers[MCP_SERVER_NAME];
+  if (!s) return undefined;
+  return isZnSecretsServer(s);
 }
 
 function detect(opts = {}) {
@@ -392,6 +430,7 @@ function detect(opts = {}) {
 
 module.exports = {
   id,
+  isZnSecretsServer,
   detect,
   install,
   uninstall,

@@ -1,6 +1,25 @@
 #!/usr/bin/env node
 'use strict';
 
+// zn-gate needs Node.js 18 or later. This check is plain ES5 and runs before
+// any require, so an older Node.js gets a clear message instead of a stack trace.
+// What an agent starts (hooks, MCP servers, the `zn run` commands the hooks write)
+// keeps running with a warning: stopping a hook here would let the agent's call
+// through unchecked in Claude Code and Codex.
+(function () {
+  var major = parseInt(String(process.versions && process.versions.node).split('.')[0], 10);
+  if (major >= 18) return;
+  var msg = 'zn-gate needs Node.js 18 or later, and this is Node.js ' + process.version + '.\n' +
+    'Install the LTS version from https://nodejs.org/ (or run: nvm install --lts), then run the command again.\n';
+  var agentRun = { hook: 1, run: 1, mcp: 1, 'secrets-mcp': 1, 'mcp-shield': 1, shield: 1 };
+  if (agentRun.hasOwnProperty(process.argv[2])) {
+    process.stderr.write('Warning: ' + msg);
+    return;
+  }
+  process.stderr.write(msg);
+  process.exit(1);
+})();
+
 const fs = require('fs');
 const path = require('path');
 const { startMcpServer } = require('../lib/mcp');
@@ -8,7 +27,7 @@ const { startMcpShield } = require('../lib/shield');
 const { scanEnvironments, configureEnvironments } = require('../lib/init');
 const { logEvidence, verifyEvidenceLedger, getEvidenceStats, exportEvidenceLedger, startEvidenceUi, EVIDENCE_FILE } = require('../lib/evidence');
 const { analyze, analyzeLocal, isCloudEnabled, resolveEndpoint, RULES_VERSION } = require('../lib/client');
-const { evaluate, redactSecrets, SECRET_PATTERNS } = require('../lib/rules');
+const { evaluate, redactSecrets, redactScanSecrets, redactScanRules, SECRET_PATTERNS } = require('../lib/rules');
 const { SCRUB_RULES_VERSION } = require('../lib/scrub/patterns');
 const { AUDIT_RULES_VERSION } = require('../lib/audit/rules');
 
@@ -28,16 +47,86 @@ const KEY_BODY = /^(?:[A-Za-z0-9+/=]{16,}|[A-Za-z-]+: )/;
 const KEY_HEADER = /^[A-Za-z-]+: /;
 const TRUNCATED_KEY_REASON = 'Exposed credential detected by DLP filter (private key without an END marker)';
 // Private key files that usually have no extension.
-const KEY_FILE_NAMES = new Set(['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_ecdsa_sk', 'id_ed25519_sk']);
+const KEY_FILE_NAMES = new Set(['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_ecdsa_sk', 'id_ed25519_sk', 'id_xmss', 'identity']);
 // .key files with a NUL byte near the start (a Keynote document, not a key)
 // are not scanned.
 const BINARY_SNIFF = 8192;
 const SCAN_FORMATS = new Set(['text', 'json', 'github']);
 
+// Scrubber secret types that the scan reports, with the rule id the Python
+// package uses for the same format (its PROVIDER_SECRET_PATTERNS). The other
+// scrubber types are only redacted in the snippet.
+const SCRUB_SCAN_RULES = new Map([
+  'GITLAB_TOKEN', 'SLACK_TOKEN', 'SLACK_WEBHOOK', 'DISCORD_WEBHOOK', 'STRIPE_KEY', 'STRIPE_WEBHOOK_SECRET',
+  'GOOGLE_API_KEY', 'GOOGLE_OAUTH_SECRET', 'HF_TOKEN', 'NPM_TOKEN', 'PYPI_TOKEN', 'SENDGRID_KEY', 'TWILIO_KEY',
+  'MAILGUN_KEY', 'SHOPIFY_TOKEN', 'DIGITALOCEAN_TOKEN', 'LINEAR_KEY', 'TELEGRAM_BOT_TOKEN', 'AZURE_STORAGE_KEY',
+  'DATABRICKS_TOKEN', 'VAULT_TOKEN', 'DOPPLER_TOKEN', 'NEWRELIC_KEY', 'GROQ_KEY', 'XAI_KEY', 'DOCKERHUB_PAT',
+  'TAVILY_KEY', 'FIRECRAWL_KEY', 'POLAR_TOKEN', 'REPLICATE_TOKEN', 'SUPABASE_PAT', 'AZURE_AD_CLIENT_SECRET',
+  'BEARER_TOKEN',
+].map((t) => [t, 'secret:' + t.toLowerCase()]).concat([
+  ['AWS_KEY', 'secret:aws_key_id'],
+  ['URL_PASSWORD', 'secret:url_password'],
+  ['DB_PASSWORD', 'secret:url_password'],
+]));
+
+// Secrets in a line, as rule ids, in the order the Python package finds them:
+// the rules of lib/rules.js, then the scrubber formats above, then the
+// scan-only rules. Each step runs on the text the previous ones redacted, so
+// one value is reported once.
+function scanSecretRules(line) {
+  const first = redactSecrets(line);
+  const rules = first.detections.map((d) => d.rule);
+  const text = first.sanitized;
+  const spans = require('../lib/scrub/engine').scan(text, { exact: false, pii: false })
+    .filter((s) => SCRUB_SCAN_RULES.has(s.type))
+    .sort((a, b) => a.start - b.start || b.end - a.end);
+  let rest = '';
+  let last = 0;
+  for (const s of spans) {
+    if (s.start < last) continue;
+    rules.push(SCRUB_SCAN_RULES.get(s.type));
+    rest += text.slice(last, s.start) + `[REDACTED_${s.type}]`;
+    last = s.end;
+  }
+  rest += text.slice(last);
+  for (const d of redactScanRules(rest).detections) rules.push(d.rule);
+  return rules;
+}
+
+// File contents as text. UTF-16 files with a byte order mark (common on
+// Windows: PowerShell output, some editors) are decoded as UTF-16.
+function hasUtf16Bom(raw) {
+  return raw.length >= 2 && ((raw[0] === 0xff && raw[1] === 0xfe) || (raw[0] === 0xfe && raw[1] === 0xff));
+}
+function decodeScanText(raw) {
+  if (raw.length >= 2 && raw[0] === 0xff && raw[1] === 0xfe) return raw.subarray(2, raw.length - (raw.length % 2)).toString('utf16le');
+  if (raw.length >= 2 && raw[0] === 0xfe && raw[1] === 0xff) return Buffer.from(raw.subarray(2, raw.length - (raw.length % 2))).swap16().toString('utf16le');
+  return raw.toString('utf8');
+}
+
+// What to do about a secret found by the scan, in plain words. Never
+// includes the value. The same text as the Python package. A file name is
+// put in the suggested command only when it is made of plain characters and
+// does not start with "-": a name such as `.env$(cmd)` would otherwise turn
+// into a command the user may paste.
+const SAFE_FILE_ARG = /^[A-Za-z0-9._\/@+-]+$/;
+function secretNextStep(file, rule) {
+  if (rule === 'secret:private_key') {
+    return 'Next: move the key out of this file (for example to ~/.ssh or a secret manager) and replace it if the file was ever committed or shared.';
+  }
+  if (/^\.env/i.test(path.basename(file))) {
+    // On Windows the relative path uses backslashes; npx takes forward slashes there too.
+    const shown = process.platform === 'win32' ? file.split(path.sep).join('/') : file;
+    const arg = SAFE_FILE_ARG.test(shown) && !shown.startsWith('-') ? shown : '<file>';
+    return `Next: run npx -y zn-gate env shadow ${arg} to move the values into the local vault, and rotate any value that was ever committed or shared.`;
+  }
+  return 'Next: run npx -y zn-gate secret set NAME to store the value in the local vault, use the __ZN_NAME__ marker in its place, and rotate it if it was ever committed or shared.';
+}
+
 // The line shown with a scan finding: secrets found by the rules and by the
 // scrubber's secret patterns are replaced, so no matched value is printed.
 function scanSnippet(line) {
-  let out = redactSecrets(line).sanitized;
+  let out = redactScanSecrets(line).sanitized;
   // Overlapping spans are joined first, so no part of a value stays visible.
   const merged = [];
   for (const s of require('../lib/scrub/engine').scan(out, { exact: false, pii: false }).slice().sort((a, b) => a.start - b.start)) {
@@ -132,7 +221,7 @@ COMMANDS:
   init                Set up zn for the coding agents on this machine, one step at a time, then check it
   init --wrap-mcp     Find and wrap the MCP servers in known agent configs (Claude, Cursor, Codex, OpenCode...)
   shield, mcp-shield  Wrap and protect ANY external MCP server (uvx, npx, node, python)
-  scan <path>         Recursively audit prompt templates, markdown, skills, and configs for injection traps
+  scan <path>         Recursively audit prompt templates, markdown, skills, and configs for injection traps and secrets
                       [--format text|json|github] (matched values are never printed)
   audit [path]        Review a repository's agent configs before you open it: hooks, MCP servers,
                       endpoint overrides, permissions, instructions, planted executables
@@ -392,12 +481,12 @@ Files   : ${files.length} file(s) queued for audit\n
     let content = '';
     try {
       const raw = fs.readFileSync(filePath);
-      if (path.extname(filePath).toLowerCase() === '.key' && raw.subarray(0, BINARY_SNIFF).includes(0)) {
+      if (path.extname(filePath).toLowerCase() === '.key' && !hasUtf16Bom(raw) && raw.subarray(0, BINARY_SNIFF).includes(0)) {
         files.skipped.push({ file: filePath, reason: 'binary .key file, not a key' });
         notRead++;
         continue;
       }
-      content = raw.toString('utf8');
+      content = decodeScanText(raw);
     } catch (e) {
       files.skipped.push({ file: filePath, reason: 'cannot be read' });
       notRead++;
@@ -455,7 +544,7 @@ Files   : ${files.length} file(s) queued for audit\n
       if (!line || line.length < 8) continue;
 
       // Printed to the terminal and CI logs: never show a matched value.
-      const detections = redactSecrets(line).detections;
+      const secretRules = scanSecretRules(line);
       let sample = null;
       const sampleOf = () => {
         if (sample === null) sample = keyLines.has(lineIdx + 1) ? '[REDACTED_PRIVATE_KEY]' : scanSnippet(line);
@@ -468,10 +557,10 @@ Files   : ${files.length} file(s) queued for audit\n
         findings.push({ file: relPath, line: lineIdx + 1, rule: evalRes.rule, reason: evalRes.reason, type: 'injection', sample: sampleOf() });
       }
       // Secrets are reported too, once per rule and line.
-      for (const rule of new Set(detections.map((d) => d.rule))) {
+      for (const rule of new Set(secretRules)) {
         totalFindings++;
         seen.add((lineIdx + 1) + '\0' + rule);
-        findings.push({ file: relPath, line: lineIdx + 1, rule, reason: 'Exposed credential detected by DLP filter', type: 'secret_leak', sample: sampleOf() });
+        findings.push({ file: relPath, line: lineIdx + 1, rule, reason: 'Exposed credential detected by DLP filter', type: 'secret_leak', sample: sampleOf(), next_step: secretNextStep(relPath, rule) });
       }
     }
 
@@ -481,19 +570,26 @@ Files   : ${files.length} file(s) queued for audit\n
       seen.add(key);
       totalFindings++;
       // Only the BEGIN marker, never the key material.
-      findings.push({ file: relPath, line: b.line, rule: b.rule, reason: b.reason || 'Exposed credential detected by DLP filter', type: 'secret_leak', sample: b.header });
+      findings.push({ file: relPath, line: b.line, rule: b.rule, reason: b.reason || 'Exposed credential detected by DLP filter', type: 'secret_leak', sample: b.header, next_step: secretNextStep(relPath, b.rule) });
     }
   }
+
+  const totalSecrets = findings.filter((f) => f.type === 'secret_leak').length;
+  const totalThreats = totalFindings - totalSecrets;
 
   if (format === 'github') {
     // CI logs are public: rule, reason and location only, never the line.
     for (const f of findings) {
-      process.stdout.write(`::error file=${ghProperty(f.file)},line=${Number(f.line)},title=${ghProperty(`Security Threat (${f.rule})`)}::${ghMessage(f.reason || 'Security threat detected')}\n`);
+      if (f.type === 'secret_leak') {
+        process.stdout.write(`::error file=${ghProperty(f.file)},line=${Number(f.line)},title=${ghProperty(`Secret found (${f.rule})`)}::${ghMessage(f.next_step)}\n`);
+      } else {
+        process.stdout.write(`::error file=${ghProperty(f.file)},line=${Number(f.line)},title=${ghProperty(`Security Threat (${f.rule})`)}::${ghMessage(f.reason || 'Security threat detected')}\n`);
+      }
     }
     for (const s of files.skipped) {
       process.stdout.write(`::notice file=${ghProperty(path.relative(process.cwd(), s.file))},title=Not scanned::${ghMessage(s.reason)}\n`);
     }
-    process.stdout.write(`\n[zn-gate] Scanned ${files.length - notRead} files (${files.skipped.length} not scanned). Found ${totalFindings} security threats.\n`);
+    process.stdout.write(`\n[zn-gate] Scanned ${files.length - notRead} files (${files.skipped.length} not scanned). Found ${totalSecrets} secrets and ${totalThreats} security threats.\n`);
     if (totalFindings > 0) process.exitCode = 1;
     return;
   }
@@ -501,8 +597,14 @@ Files   : ${files.length} file(s) queued for audit\n
     process.stdout.write(JSON.stringify({
       total_files: files.length - notRead,
       total_skipped: files.skipped.length,
+      // Every finding, secrets included (as before); total_secrets counts the secrets alone.
       total_threats: totalFindings,
-      threats: findings.map((f) => ({ file: f.file, line: f.line, rule: f.rule, reason: f.reason, type: f.type, content: f.sample })),
+      total_secrets: totalSecrets,
+      threats: findings.map((f) => {
+        const out = { file: f.file, line: f.line, rule: f.rule, reason: f.reason, type: f.type, content: f.sample };
+        if (f.next_step) out.next_step = f.next_step;
+        return out;
+      }),
       skipped: files.skipped.map((s) => ({ file: path.relative(process.cwd(), s.file), reason: s.reason })),
     }, null, 2) + '\n');
     if (totalFindings > 0) process.exitCode = 1;
@@ -512,18 +614,27 @@ Files   : ${files.length} file(s) queued for audit\n
   if (findings.length > 0) {
     process.stdout.write(`Findings (${findings.length}):\n`);
     for (const f of findings) {
-      process.stdout.write(`  \x1b[31m✖\x1b[0m ${f.file}:${f.line}\n`);
+      const label = f.type === 'secret_leak' ? 'Secret found' : 'Threat';
+      process.stdout.write(`  \x1b[31m✖\x1b[0m ${f.file}:${f.line} ${label}\n`);
       process.stdout.write(`    \x1b[90mRule:\x1b[0m ${f.rule} (${f.reason || 'Security threat detected'})\n`);
-      process.stdout.write(`    \x1b[90mLine:\x1b[0m ${f.sample}\n\n`);
+      process.stdout.write(`    \x1b[90mLine:\x1b[0m ${f.sample}\n`);
+      if (f.next_step) process.stdout.write(`    ${f.next_step}\n`);
+      process.stdout.write('\n');
     }
   }
 
+  const resultParts = [];
+  if (totalSecrets) resultParts.push(`${totalSecrets} SECRET(S) FOUND`);
+  if (totalThreats) resultParts.push(`${totalThreats} THREAT(S) FOUND`);
+  let status = 'Clean workspace';
+  if (totalThreats) status = 'Review and neutralize detected vectors';
+  else if (totalSecrets) status = 'Move the secrets out of these files (see "Next" for each one)';
   process.stdout.write(`
 ─────────────────────────────────────────────────────────────────────────────
-Audit Result : ${totalFindings === 0 ? '\x1b[32mPASSED - NO THREATS DETECTED\x1b[0m' : `\x1b[31mFAILED - ${totalFindings} THREAT(S) FOUND\x1b[0m`}
+Audit Result : ${totalFindings === 0 ? '\x1b[32mPASSED - NO THREATS DETECTED\x1b[0m' : `\x1b[31mFAILED - ${resultParts.join(', ')}\x1b[0m`}
 Files Scanned: ${files.length - notRead}
 Files Skipped: ${files.skipped.length}${files.skipped.length ? ' (not read: see below)' : ''}
-Status       : ${totalFindings === 0 ? 'Clean workspace' : 'Review and neutralize detected vectors'}
+Status       : ${status}
 ─────────────────────────────────────────────────────────────────────────────\n
 `);
   if (files.skipped.length) {
@@ -672,6 +783,14 @@ async function main() {
 
   if (command === 'init' && !(args.includes('--wrap-mcp') || options.dryRun || options.revert || options.shadow)) {
     // Guided setup: one route per agent, run only by a person in a terminal, then zn-gate check.
+    // It takes no arguments: an unknown one (an option in capitals, or words the shell joined) is refused here, on the
+    // real argument list, instead of starting the guided setup.
+    if (args.length > 1) {
+      const shown = String(args[1]).replace(/[^\x20-\x7e]/g, '?').slice(0, 60);
+      process.stderr.write('zn-gate init: unknown argument "' + shown + '". Run `zn-gate init` with no arguments for the guided setup, or `zn-gate init --wrap-mcp` (with --dry-run, --shadow or --revert) to wrap MCP servers.\n');
+      process.exitCode = 2;
+      return;
+    }
     process.env.ZN_STATS = 'off';
     process.exitCode = await require('../lib/init-guide').guide({});
     return;
