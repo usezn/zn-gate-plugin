@@ -103,8 +103,24 @@ async function plan(opts = {}) {
     if (found && r.state !== 'protected') {
       // Claude Code set up with zn's own hooks is repaired with them, and with the plugin as well it drops them:
       // installing the plugin on top would run both sets.
-      const hooksVerb = r.id !== 'claude-code' ? 'install' : r.via === 'hooks' ? 'install' : r.via === 'both' ? 'uninstall' : null;
-      if (!hooksVerb && r.pluginOff) {
+      // A broken plugin next to zn's own hooks that do not work either: the hooks are repaired first (below).
+      const hooksVerb = r.id !== 'claude-code' ? 'install' : r.via === 'hooks' ? 'install'
+        : r.via === 'both' && r.duplicate ? 'uninstall' : r.via === 'both' && r.pluginBroken && r.hooksBroken ? 'install' : null;
+      const disablePlugin = () => {
+        const claude = opts.claude !== undefined ? opts.claude : findProgram('claude', env);
+        if (claude) return { label: 'turn off the zn-gate plugin (zn\'s own hooks stay)', run: [claude, ['plugin', 'disable', 'zn-gate@usezn']], manual: 'claude plugin disable zn-gate@usezn' };
+        return { label: 'in Claude Code, type this command', run: null, manual: 'in Claude Code, type /plugin disable zn-gate@usezn' };
+      };
+      if (r.rulesFault) {
+        // zn's own rules let the test .env through: zn-gate itself needs repair, whatever runs the hooks.
+        item.steps.push({ label: 'first do this yourself', run: null, manual: r.fix });
+      } else if (!hooksVerb && r.pluginBroken) {
+        // The plugin does not work next to zn's own hooks, which check found working: turn the plugin off and keep the hooks.
+        item.steps.push(disablePlugin());
+      } else if (!hooksVerb && r.via === 'both') {
+        // Something other than the plugin (a Claude Code setting that stops all hooks, zn's rules): neither set is touched.
+        item.steps.push({ label: 'first do this yourself', run: null, manual: r.fix });
+      } else if (!hooksVerb && r.pluginOff) {
         // Installed but turned off: installing it again would not turn it on.
         const claude = opts.claude !== undefined ? opts.claude : findProgram('claude', env);
         if (claude) item.steps.push({ label: 'turn on the zn-gate plugin', run: [claude, ['plugin', 'enable', 'zn-gate@usezn']], manual: 'claude plugin enable zn-gate@usezn' });
@@ -124,6 +140,12 @@ async function plan(opts = {}) {
         const args = temporary ? ['hooks', hooksVerb, r.id] : [path.join(PKG_ROOT, 'bin', 'cli.js'), 'hooks', hooksVerb, r.id];
         const label = hooksVerb === 'uninstall' ? 'remove zn\'s own hooks for ' + r.name + ' (the zn-gate plugin stays)' : 'install zn\'s hooks for ' + r.name;
         item.steps.push({ label, run: zn ? [zn, args] : null, manual: 'zn hooks ' + hooksVerb + ' ' + r.id, needsGlobal: temporary });
+        // Only after the hooks are repaired and seen to work: the steps stop at the first one that is skipped or fails,
+        // so the plugin is never turned off while the hooks still do not work.
+        if (r.pluginBroken) {
+          item.steps.push({ label: 'check that zn\'s hooks for ' + r.name + ' work now', manual: 'zn-gate check (go on only if it says the hooks work)', verify: () => hooksWorkNextToPlugin(opts, r.id) });
+          item.steps.push(disablePlugin());
+        }
       }
     }
     items.push(item);
@@ -139,6 +161,15 @@ async function plan(opts = {}) {
     }
   }
   return { items, setup, temporary };
+}
+
+/* After the hooks are repaired next to a broken plugin: '' when check now finds those hooks working, else why not. */
+async function hooksWorkNextToPlugin(opts, id) {
+  const { check } = require('./check');
+  const r = (await check({ home: opts.home, env: opts.env || process.env, cwd: opts.cwd })).results.find((x) => x.id === id);
+  if (!r) return 'zn-gate check did not report it';
+  if (r.state === 'protected' || (r.pluginBroken && !r.hooksBroken)) return '';
+  return r.problem || 'zn-gate check did not find them working';
 }
 
 /* Run one step in the user's terminal (inherits stdio). Absolute program path and fixed arguments only. */
@@ -157,7 +188,7 @@ async function guide(opts = {}) {
   const w = opts.write || ((s) => process.stdout.write(s));
   const tty = require('./broker/tty');
   const stdin = opts.stdin || process.stdin;
-  const agent = tty.agentEnvDetected(env);
+  const agent = tty.agentDetected(env, opts);
   const interactive = Boolean(stdin.isTTY) && !agent;
   const { items, setup } = await plan(opts);
 
@@ -212,6 +243,12 @@ async function guide(opts = {}) {
           glob = glob || globalInstall(env);
           step = glob.zn && fs.existsSync(glob.zn) ? { ...s, run: [glob.zn, ['hooks', 'install', i.id]] } : s;
         }
+      }
+      if (s.verify) {
+        const why = await s.verify();
+        if (why) { w(`  ${s.label}: not yet (${why}). The zn-gate plugin was left on.\n`); skipped++; break; }
+        w(`  ${s.label}: yes\n`);
+        continue;
       }
       if (!step.run) { w(`  ${s.label}: ${s.manual}\n`); skipped++; break; }
       if (!(await ask(`  ${s.label}: run \`${s.manual}\`?`))) { w(`  skipped. You can run it later: ${s.manual}\n`); skipped++; break; }

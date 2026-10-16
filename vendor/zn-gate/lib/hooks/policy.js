@@ -27,7 +27,7 @@ const { znCommand } = require('../zn-command');
 
 // Version of the policy rules (credential paths, zn home, secret commands,
 // command wrapping). Bump it when a rule changes; see CONTRIBUTING.md.
-const POLICY_RULES_VERSION = '2026-10-16.5';
+const POLICY_RULES_VERSION = '2026-10-16.6';
 
 /* ------------------------------ paths ------------------------------ */
 
@@ -877,6 +877,9 @@ function bashDenial(cmd, opts = {}) {
   if (/\$\(|`/.test(String(cmd))) {
     for (const t of String(cmd).split(/[\s'"`$(){};|&<>=,]+/)) if (t) words.push({ text: t, redirectTarget: false, head: '' });
   }
+  // A word is classified once per command: each classification resolves the path on disk, and a long command
+  // often repeats the same words.
+  const classified = new Map();
   for (const w of words) {
     // --flag=value carries a path too (--kubeconfig=~/.kube/config).
     let text = w.text;
@@ -887,7 +890,8 @@ function bashDenial(cmd, opts = {}) {
     }
     if (!text) continue;
     const writing = !READ_ONLY_CMDS.has(w.head);
-    const c = classifyWord(text, opts);
+    if (!classified.has(text)) classified.set(text, classifyWord(text, opts));
+    const c = classified.get(text);
     if (!c) {
       if (writing && AGENT_CONFIG_MENTION_RE.test(slash(text))) {
         return 'zn: this command would change agent hook or plugin settings, which is protected. Ask the user to make this change.';

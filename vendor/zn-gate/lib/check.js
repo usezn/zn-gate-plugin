@@ -158,6 +158,59 @@ function oneLine(s, n) {
   return String(s || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
 }
 
+/* A sentence without its final full stop, to quote it inside another one. */
+function bare(s) {
+  return String(s || '').replace(/[\s.]+$/, '');
+}
+
+const RULES_FIX = 'install zn-gate again: run `npm install -g zn-gate` in your own terminal, then run `zn-gate check` again';
+const REINSTALL = (id) => 'install zn-gate again for the Node.js you use now: run `npm install -g zn-gate`, then `zn hooks install ' + id + '`, in your own terminal';
+
+/*
+ * zn's own hooks in the user's hooks file (`zn hooks install <agent>`), not run yet:
+ * {installed, problem, fix, live, notes}. `live` is {file, args, env} when the read hook can be run as the agent runs it.
+ */
+function cliHooks(spec, ctx, userFile) {
+  const out = { installed: false, problem: '', fix: '', live: null, notes: [] };
+  const entries = hookEntries(readJson(userFile)).filter((e) => parseCommand(e.command, spec.id));
+  out.installed = entries.length > 0;
+  if (!out.installed) return out;
+  // Set up with `zn hooks install`, so that is also how to repair it (not the plugin: both would run).
+  out.fix = 'run `zn hooks install ' + spec.id + '` in your own terminal';
+  const read = entries.find((e) => e.event === spec.event && matcherCovers(e.matcher, spec.tool));
+  if (!read) {
+    out.problem = 'zn\'s hooks are there, but not the one that checks reading files (' + spec.event + ')';
+    return out;
+  }
+  const cmd = parseCommand(read.command, spec.id);
+  if (cmd.missing) {
+    out.problem = 'its hook cannot start: ' + (fs.existsSync(cmd.node) ? 'its zn-gate files (' + cmd.runner + ')' : 'its Node.js (' + cmd.node + ')') + ' is no longer there';
+    // Usually a Node.js version removed with nvm (or similar), which takes its global zn-gate with it.
+    out.fix = REINSTALL(spec.id);
+  } else if (cmd.onPath) {
+    // Only absolute PATH entries: a relative one (node_modules/.bin, .) depends on the folder check runs from.
+    const absPath = String((ctx.env || process.env).PATH || '').split(path.delimiter).filter((d) => d && path.isAbsolute(d)).join(path.delimiter);
+    const found = require('./exe').whichSync(process.platform === 'win32' ? 'zn.cmd' : 'zn', absPath);
+    const zn = found ? path.resolve(found) : null;
+    if (!zn) { out.problem = 'its hook runs `zn`, and there is no `zn` on your PATH'; out.fix = REINSTALL(spec.id); }
+    else if (process.platform !== 'win32') out.live = { file: zn, args: ['hook', spec.id], env: {} };
+    else out.notes.push('the installed hook runs `zn` from your PATH; zn\'s rules were checked directly');
+  } else {
+    out.live = { file: cmd.node, args: [cmd.runner, spec.id], env: {} };
+  }
+  return out;
+}
+
+/* Runs an installed hook with the two requests: '' when it blocks .env and allows the ordinary file, else the problem. */
+function runLive(spec, ctx, live) {
+  const a = spawnHook(live.file, live.args, spec.request(ctx.dir, ctx.envFile), live.env, ctx.dir);
+  const b = a.ran ? spawnHook(live.file, live.args, spec.request(ctx.dir, ctx.readme), live.env, ctx.dir) : a;
+  if (!a.ran) return 'its hook cannot start (' + a.why + ')';
+  if (a.decision !== 'deny') return 'the installed hook did not block the read of .env';
+  if (b.decision === 'deny') return 'the installed hook blocks everything, ordinary files too, so part of zn is missing or broken';
+  return '';
+}
+
 async function checkAgent(spec, ctx) {
   const { getAdapter } = require('./agents');
   const runner = require('./hooks/runner');
@@ -176,20 +229,17 @@ async function checkAgent(spec, ctx) {
   let installed = false;
   if (spec.id === 'claude-code') {
     const plugin = claudePlugin(ctx.home, ctx.env);
-    const cliHooks = hookEntries(readJson(userFile)).some((e) => parseCommand(e.command, spec.id));
+    const hasCliHooks = hookEntries(readJson(userFile)).some((e) => parseCommand(e.command, spec.id));
     // A plugin that is turned off runs nothing: with zn's own hooks next to it, those hooks are what protects
     // the agent, so they are checked as such (below) and never offered for removal.
-    if (plugin.root && plugin.off && cliHooks) res.notes.push('the zn-gate plugin is also installed, but turned off');
-    if (plugin.root && !(plugin.off && cliHooks)) {
+    if (plugin.root && plugin.off && hasCliHooks) res.notes.push('the zn-gate plugin is also installed, but turned off');
+    if (plugin.root && !(plugin.off && hasCliHooks)) {
       installed = true;
       res.where = 'the zn-gate plugin';
       res.via = 'plugin';
       // zn's own hooks left next to the plugin both run, and a broken prompt hook among them blocks every prompt.
-      if (cliHooks) {
-        res.via = 'both';
-        res.problem = 'the zn-gate plugin and the hooks of `zn hooks install claude-code` are both set up, so both run, and a broken one can block every prompt';
-        res.fix = 'remove the second set: run `zn hooks uninstall claude-code` in your own terminal';
-      }
+      // Which set to drop depends on whether the plugin works, so the plugin is checked first (below).
+      if (hasCliHooks) res.via = 'both';
       if (plugin.off) {
         res.pluginOff = true;
         res.problem = 'the zn-gate plugin is turned off in your Claude Code settings';
@@ -197,8 +247,9 @@ async function checkAgent(spec, ctx) {
       }
       const pre = spawnHook(process.execPath, [path.join(plugin.root, 'scripts', 'zn-launch.js'), 'check', 'claude-code'], {}, { CLAUDE_PLUGIN_ROOT: plugin.root }, ctx.dir);
       const sys = pre.ran && /"systemMessage"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(pre.stdout || '');
-      if (!res.problem && sys) res.problem = oneLine(JSON.parse('"' + sys[1] + '"'), 300);
-      live = { file: process.execPath, args: [path.join(plugin.root, 'scripts', 'zn-launch.js'), 'hook', 'claude-code'], env: { CLAUDE_PLUGIN_ROOT: plugin.root } };
+      // The launcher's own check message is about the plugin itself (for example a Node.js it does not support).
+      if (!res.problem && sys) { res.problem = bare(oneLine(JSON.parse('"' + sys[1] + '"'), 300)); res.pluginFault = true; }
+      live = { file: process.execPath, args: [path.join(plugin.root, 'scripts', 'zn-launch.js'), 'hook', 'claude-code'], env: { CLAUDE_PLUGIN_ROOT: plugin.root }, plugin: true };
     }
   }
   if (!installed && spec.id === 'opencode') {
@@ -207,41 +258,24 @@ async function checkAgent(spec, ctx) {
     installed = /\/zn-gate\/lib\/hooks\/runner\.js"|"hook", "opencode"/.test(src);
     res.where = userFile;
   } else if (!installed) {
-    const entries = hookEntries(readJson(userFile)).filter((e) => parseCommand(e.command, spec.id));
-    installed = entries.length > 0;
+    const h = cliHooks(spec, ctx, userFile);
+    installed = h.installed;
     res.where = userFile;
-    // Set up with `zn hooks install`, so that is also how to repair it (not the plugin: both would run).
-    if (installed) { res.fix = 'run `zn hooks install ' + spec.id + '` in your own terminal'; res.via = 'hooks'; }
-    const read = entries.find((e) => e.event === spec.event && matcherCovers(e.matcher, spec.tool));
-    if (installed && !read) {
-      res.problem = 'zn\'s hooks are there, but not the one that checks reading files (' + spec.event + ')';
-    } else if (read) {
-      const cmd = parseCommand(read.command, spec.id);
-      if (cmd.missing) {
-        res.problem = 'its hook cannot start: ' + (fs.existsSync(cmd.node) ? 'its zn-gate files (' + cmd.runner + ')' : 'its Node.js (' + cmd.node + ')') + ' is no longer there';
-        // Usually a Node.js version removed with nvm (or similar), which takes its global zn-gate with it.
-        res.fix = 'install zn-gate again for the Node.js you use now: run `npm install -g zn-gate`, then `zn hooks install ' + spec.id + '`, in your own terminal';
-      } else if (cmd.onPath) {
-        // Only absolute PATH entries: a relative one (node_modules/.bin, .) depends on the folder check runs from.
-        const absPath = String((ctx.env || process.env).PATH || '').split(path.delimiter).filter((d) => d && path.isAbsolute(d)).join(path.delimiter);
-        const found = require('./exe').whichSync(process.platform === 'win32' ? 'zn.cmd' : 'zn', absPath);
-        const zn = found ? path.resolve(found) : null;
-        if (!zn) { res.problem = 'its hook runs `zn`, and there is no `zn` on your PATH'; res.fix = 'install zn-gate again for the Node.js you use now: run `npm install -g zn-gate`, then `zn hooks install ' + spec.id + '`, in your own terminal'; }
-        else if (process.platform !== 'win32') live = { file: zn, args: ['hook', spec.id], env: {} };
-        else res.notes.push('the installed hook runs `zn` from your PATH; zn\'s rules were checked directly');
-      } else {
-        live = { file: cmd.node, args: [cmd.runner, spec.id], env: {} };
-      }
-    }
+    if (installed) { res.fix = h.fix; res.via = 'hooks'; res.problem = h.problem; live = h.live; res.notes.push(...h.notes); }
   }
   if (spec.id === 'claude-code' && installed && res.where === userFile) {
     // Without onFailure "block", a prompt hook that cannot run lets every prompt through (Claude Code 2.1.295 and later read it).
     const prompt = hookEntries(readJson(userFile)).find((e) => e.event === 'UserPromptSubmit' && parseCommand(e.command, spec.id));
     if (prompt && prompt.onFailure !== 'block') res.notes.push('its prompt hook lets prompts through when it cannot run; run `zn hooks install claude-code` again to have them blocked instead');
   }
-  if (spec.id === 'claude-code' && installed && !res.problem) {
+  if (spec.id === 'claude-code' && installed && (!res.problem || res.pluginFault)) {
     const p = claudePolicy(ctx.home, ctx.env);
-    if (p.length) res.problem = oneLine(p[0], 300);
+    // A Claude Code setting stops every hook, the plugin's and zn's own alike: that setting is the fix, not either set.
+    if (p.length) {
+      res.problem = bare(oneLine(p[0], 300));
+      res.fix = 'change that Claude Code setting as it says, then run `zn-gate check` again';
+      res.pluginFault = false;
+    }
   }
   if (spec.id === 'opencode' && installed) res.notes.push('zn\'s rules were checked; its plugin runs inside OpenCode, so it was not started here');
 
@@ -255,14 +289,53 @@ async function checkAgent(spec, ctx) {
     }
     return res;
   }
-  if (!res.problem && !rulesOk) res.problem = 'zn did not block the read of .env';
+  if (!res.problem && !rulesOk) {
+    // These are the rules of the copy that runs this command (with npx, its cached copy), not necessarily the
+    // installed one; reinstalling zn-gate globally is still the repair that fits most cases.
+    // zn's own rules, the ones this command runs, let the read through: the zn-gate install is what needs repair,
+    // whatever runs the hooks (installing the plugin again or reinstalling the hooks would not change it).
+    res.problem = 'zn did not block the read of .env';
+    res.fix = RULES_FIX;
+    res.rulesFault = true;
+  }
   if (!res.problem && live) {
-    const a = spawnHook(live.file, live.args, spec.request(ctx.dir, ctx.envFile), live.env, ctx.dir);
-    const b = a.ran ? spawnHook(live.file, live.args, spec.request(ctx.dir, ctx.readme), live.env, ctx.dir) : a;
-    if (!a.ran) res.problem = 'its hook cannot start (' + a.why + ')';
-    else if (a.decision !== 'deny') res.problem = 'the installed hook did not block the read of .env';
-    else if (b.decision === 'deny') res.problem = 'the installed hook blocks everything, ordinary files too, so part of zn is missing or broken';
-    else res.verified = true;
+    res.problem = runLive(spec, ctx, live);
+    if (res.problem && live.plugin) res.pluginFault = true;
+    else if (!res.problem) res.verified = true;
+  }
+  if (res.via === 'both') {
+    if (res.pluginFault) {
+      // The plugin does not work here. Which way out keeps the agent protected depends on zn's own hooks next to
+      // it, so they are checked now, also run as Claude Code runs them, before anything is said about them.
+      res.pluginBroken = true;
+      if (!rulesOk) {
+        // zn's own rules let the read through, so neither set can work until zn-gate is repaired.
+        res.problem = 'zn did not block the read of .env';
+        res.fix = RULES_FIX;
+        res.rulesFault = true;
+        res.state = 'not-protected';
+        return res;
+      }
+      const why = bare(res.problem);
+      const h = cliHooks(spec, ctx, userFile);
+      let hooksProblem = h.problem;
+      if (!hooksProblem && !rulesOk) hooksProblem = 'zn did not block the read of .env';
+      if (!hooksProblem && h.live) hooksProblem = runLive(spec, ctx, h.live);
+      res.hooksBroken = Boolean(hooksProblem);
+      if (!res.hooksBroken) {
+        res.problem = 'the zn-gate plugin does not work here (' + why + '), while the hooks of `zn hooks install claude-code` next to it do';
+        res.fix = 'turn the plugin off, which keeps those hooks: run `claude plugin disable zn-gate@usezn` in your own terminal, then run `zn-gate check` again';
+      } else {
+        // Repair the hooks first, and only then turn the plugin off: at no point does the agent have less than before.
+        res.problem = 'the zn-gate plugin does not work here (' + why + '), and the hooks of `zn hooks install claude-code` next to it do not work either (' + bare(hooksProblem) + ')';
+        res.fix = 'first repair the hooks: run `npm install -g zn-gate`, then `zn hooks install claude-code`; after that, turn the plugin off with `claude plugin disable zn-gate@usezn`; all in your own terminal, then run `zn-gate check` again';
+      }
+    } else if (!res.problem) {
+      res.duplicate = true;
+      res.verified = false;
+      res.problem = 'the zn-gate plugin and the hooks of `zn hooks install claude-code` are both set up, so both run, and a broken one can block every prompt';
+      res.fix = 'remove the second set: run `zn hooks uninstall claude-code` in your own terminal';
+    }
   }
   res.state = res.problem ? 'not-protected' : 'protected';
   return res;
