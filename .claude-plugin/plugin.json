@@ -1,7 +1,7 @@
 {
   "name": "zn-gate",
   "displayName": "zn-gate",
-  "version": "1.9.1",
+  "version": "1.11.0",
   "description": "Local security layer for Claude Code: keeps secret values out of what Claude sends to the model, adds a secrets MCP server that uses credentials without revealing them, and checks untrusted text for prompt injection with local rules.",
   "icon": "./icon.png",
   "author": {

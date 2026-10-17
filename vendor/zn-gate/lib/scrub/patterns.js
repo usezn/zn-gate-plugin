@@ -27,7 +27,7 @@
 
 // Version of the type catalogue (secret and PII patterns, validators). Bump it
 // when a pattern, validator or type name changes; see CONTRIBUTING.md.
-const SCRUB_RULES_VERSION = '2026-10-16.3';
+const SCRUB_RULES_VERSION = '2026-10-16.7';
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -70,6 +70,13 @@ function isPlaceholder(s) {
   if (/^(.)\1+$/.test(s)) return true;
   if (/^(?:0123456789|1234567890|abcdef|qwerty)/i.test(s)) return true;
   return false;
+}
+
+/* A provider token after its fixed prefix: the body must look random and
+ * must not be a placeholder such as `pnu_000...` or `sha256~abcdef...`. */
+function prefixedRandom(v, prefix) {
+  const body = v.replace(prefix, '');
+  return !isPlaceholder(body) && looksRandom(body, 2, 3.0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -442,11 +449,78 @@ const PATTERNS = [
    * digit is assumed. */
   { type: 'SUPABASE_PAT', hints: ['sbp_'], re: re(NB + 'sbp_[A-Za-z0-9_-]{30,}' + NA),
     check: (v) => /\d/.test(v.slice(4)) && looksRandom(v.slice(4), 2, 3.3) },
+  /* Square: production access tokens (`EAAA` + 60), and the legacy access token (`sq0atp-` + 22) and OAuth
+   * application secret (`sq0csp-` + 43). Same shapes as gitleaks square-access-token / square-secret. */
+  { type: 'SQUARE_TOKEN', hints: ['EAAA', 'sq0atp-', 'sq0csp-'],
+    re: re(NB + '(?:EAAA[A-Za-z0-9_-]{60}|sq0atp-[A-Za-z0-9_-]{22}|sq0csp-[A-Za-z0-9_-]{43})' + NA),
+    check: (v) => looksRandom(v.replace(/^(?:EAAA|sq0atp-|sq0csp-)/, ''), 2, 3.3) },
+  /* Discord bot token: base64url of the bot's numeric id, a 6-character timestamp and the HMAC. The first part
+   * must decode to a 17-20 digit id, so a dotted random string is not a token. */
+  { type: 'DISCORD_BOT_TOKEN', hints: ['.'],
+    re: re(NB + '[MNO][A-Za-z0-9_-]{22,26}\\.[A-Za-z0-9_-]{6}\\.[A-Za-z0-9_-]{27,38}' + NA),
+    check: (v) => {
+      const [id, , mac] = v.split('.');
+      // A length of 4n+1 is not base64; Buffer would drop the last character where Python refuses it.
+      if (id.length % 4 === 1) return false;
+      const digits = Buffer.from(id.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('latin1');
+      return /^\d{17,20}$/.test(digits) && looksRandom(mac, 2, 3.0);
+    } },
   /* Azure AD client secret, as in gitleaks' azure-ad-client-secret rule:
    * three characters, a digit, `Q~`, then 31-34 characters. The body may
    * hold dots but ends on a non-dot character, so a full stop that closes a
    * sentence is not part of the span; the trailing lookahead still rejects
    * a dotted continuation such as `.json`. */
+  /* From here to the end of this group: provider token formats taken from gitleaks v8.30.1
+   * (config/gitleaks.toml, MIT License, Copyright (c) 2019 Zachary Rice; full notice in THIRD_PARTY_NOTICES.md),
+   * one per rule, rewritten for these engines with the same random-body check as the others. */
+  { type: 'ONEPASSWORD_SA_TOKEN', hints: ['ops_eyJ'], re: re(NB + 'ops_eyJ[A-Za-z0-9+/]{250,}={0,3}' + NA),
+    check: (v) => prefixedRandom(v, /^ops_eyJ/) },
+  { type: 'AGE_SECRET_KEY', hints: ['AGE-SECRET-KEY-1'], re: re(NB + 'AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}' + NA),
+    check: (v) => prefixedRandom(v, /^AGE-SECRET-KEY-1/) },
+  { type: 'ALIBABA_KEY_ID', hints: ['LTAI'], re: re(NB + 'LTAI[A-Za-z0-9]{20}' + NA),
+    check: (v) => prefixedRandom(v, /^LTAI/) },
+  { type: 'ARTIFACTORY_KEY', hints: ['AKCp'], re: re(NB + 'AKCp[A-Za-z0-9]{69}' + NA),
+    check: (v) => prefixedRandom(v, /^AKCp/) },
+  { type: 'CLOUDFLARE_ORIGIN_CA_KEY', hints: ['v1.0-'], re: re(NB + 'v1\\.0-[a-f0-9]{24}-[a-f0-9]{146}' + NA),
+    check: (v) => prefixedRandom(v, /^v1\.0-/) },
+  { type: 'DYNATRACE_TOKEN', hints: ['dt0c01.'], re: re(NB + 'dt0c01\\.[A-Za-z0-9]{24}\\.[A-Za-z0-9]{64}' + NA),
+    check: (v) => prefixedRandom(v, /^dt0c01\./) },
+  { type: 'EASYPOST_KEY', hints: ['EZAK', 'EZTK'], re: re(NB + 'EZ(?:AK|TK)[A-Za-z0-9]{54}' + NA),
+    check: (v) => prefixedRandom(v, /^EZ(?:AK|TK)/) },
+  { type: 'FLYIO_TOKEN', hints: ['fo1_', 'fm1a_', 'fm1r_', 'fm2_'], re: re(NB + '(?:fo1_[A-Za-z0-9_-]{43}|fm1[ar]_[A-Za-z0-9+/]{100,}={0,3}|fm2_[A-Za-z0-9+/]{100,}={0,3})' + NA),
+    check: (v) => prefixedRandom(v, /^(?:fo1|fm1[ar]|fm2)_/) },
+  { type: 'GRAFANA_TOKEN', hints: ['glc_', 'glsa_'], re: re(NB + '(?:glc_[A-Za-z0-9+/]{32,400}={0,3}|glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8})' + NA),
+    check: (v) => prefixedRandom(v, /^gl(?:c|sa)_/) },
+  { type: 'TERRAFORM_CLOUD_TOKEN', hints: ['.atlasv1.'], re: re(NB + '[a-z0-9]{14}\\.atlasv1\\.[A-Za-z0-9_=-]{60,70}' + NA),
+    check: (v) => prefixedRandom(v, /^[a-z0-9]{14}\.atlasv1\./) },
+  { type: 'HEROKU_KEY_V2', hints: ['HRKU-AA'], re: re(NB + 'HRKU-AA[A-Za-z0-9_-]{58}' + NA),
+    check: (v) => prefixedRandom(v, /^HRKU-AA/) },
+  { type: 'NOTION_TOKEN', hints: ['ntn_'], re: re(NB + 'ntn_[0-9]{11}[A-Za-z0-9]{35}' + NA),
+    check: (v) => prefixedRandom(v, /^ntn_[0-9]{11}/) },
+  { type: 'PERPLEXITY_KEY', hints: ['pplx-'], re: re(NB + 'pplx-[A-Za-z0-9]{48}' + NA),
+    check: (v) => prefixedRandom(v, /^pplx-/) },
+  { type: 'PLANETSCALE_TOKEN', hints: ['pscale_'], re: re(NB + 'pscale_(?:tkn|oauth|pw)_[A-Za-z0-9_=.-]{32,64}' + NA),
+    check: (v) => prefixedRandom(v, /^pscale_(?:tkn|oauth|pw)_/) },
+  { type: 'POSTMAN_KEY', hints: ['PMAK-'], re: re(NB + 'PMAK-[A-Fa-f0-9]{24}-[A-Fa-f0-9]{34}' + NA),
+    check: (v) => prefixedRandom(v, /^PMAK-/) },
+  { type: 'PREFECT_KEY', hints: ['pnu_'], re: re(NB + 'pnu_[A-Za-z0-9]{36}' + NA),
+    check: (v) => prefixedRandom(v, /^pnu_/) },
+  { type: 'PULUMI_TOKEN', hints: ['pul-'], re: re(NB + 'pul-[a-f0-9]{40}' + NA),
+    check: (v) => prefixedRandom(v, /^pul-/) },
+  { type: 'README_KEY', hints: ['rdme_'], re: re(NB + 'rdme_[a-z0-9]{70}' + NA),
+    check: (v) => prefixedRandom(v, /^rdme_/) },
+  { type: 'RUBYGEMS_KEY', hints: ['rubygems_'], re: re(NB + 'rubygems_[a-f0-9]{48}' + NA),
+    check: (v) => prefixedRandom(v, /^rubygems_/) },
+  { type: 'BREVO_KEY', hints: ['xkeysib-'], re: re(NB + 'xkeysib-[a-f0-9]{64}-[A-Za-z0-9]{16}' + NA),
+    check: (v) => prefixedRandom(v, /^xkeysib-/) },
+  { type: 'SENTRY_USER_TOKEN', hints: ['sntryu_'], re: re(NB + 'sntryu_[a-f0-9]{64}' + NA),
+    check: (v) => prefixedRandom(v, /^sntryu_/) },
+  { type: 'SHIPPO_KEY', hints: ['shippo_'], re: re(NB + 'shippo_(?:live|test)_[a-fA-F0-9]{40}' + NA),
+    check: (v) => prefixedRandom(v, /^shippo_(?:live|test)_/) },
+  { type: 'OPENSHIFT_TOKEN', hints: ['sha256~'], re: re(NB + 'sha256~[A-Za-z0-9_-]{43}' + NA),
+    check: (v) => prefixedRandom(v, /^sha256~/) },
+  { type: 'TEAMS_WEBHOOK', hints: ['webhook.office.com'], re: re(NB + 'https://[a-z0-9]+\\.webhook\\.office\\.com/webhookb2/[a-z0-9]{8}-(?:[a-z0-9]{4}-){3}[a-z0-9]{12}@[a-z0-9]{8}-(?:[a-z0-9]{4}-){3}[a-z0-9]{12}/IncomingWebhook/[a-z0-9]{32}/[a-z0-9]{8}-(?:[a-z0-9]{4}-){3}[a-z0-9]{12}' + NA),
+    check: (v) => prefixedRandom(v, /^https:\/\/[a-z0-9]+\.webhook\.office\.com\/webhookb2\//) },
   { type: 'AZURE_AD_CLIENT_SECRET', hints: ['Q~'], re: re('(?<![A-Za-z0-9_~.-])[A-Za-z0-9_~.]{3}[0-9]Q~[A-Za-z0-9_~.-]{30,33}[A-Za-z0-9_~-](?![A-Za-z0-9_~-])(?!\\.[A-Za-z0-9_~-])'),
     check: (v) => looksRandom(v, 3, 3.5) },
   { type: 'JWT', hints: ['eyJ'], re: re(NB + 'eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{16,}' + NA) },

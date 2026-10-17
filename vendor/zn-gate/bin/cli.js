@@ -62,6 +62,8 @@ const SCRUB_SCAN_RULES = new Map([
   'MAILGUN_KEY', 'SHOPIFY_TOKEN', 'DIGITALOCEAN_TOKEN', 'LINEAR_KEY', 'TELEGRAM_BOT_TOKEN', 'AZURE_STORAGE_KEY',
   'DATABRICKS_TOKEN', 'VAULT_TOKEN', 'DOPPLER_TOKEN', 'NEWRELIC_KEY', 'GROQ_KEY', 'XAI_KEY', 'DOCKERHUB_PAT',
   'TAVILY_KEY', 'FIRECRAWL_KEY', 'POLAR_TOKEN', 'REPLICATE_TOKEN', 'SUPABASE_PAT', 'AZURE_AD_CLIENT_SECRET',
+  'SQUARE_TOKEN', 'DISCORD_BOT_TOKEN',
+  'ONEPASSWORD_SA_TOKEN', 'AGE_SECRET_KEY', 'ALIBABA_KEY_ID', 'ARTIFACTORY_KEY', 'CLOUDFLARE_ORIGIN_CA_KEY', 'DYNATRACE_TOKEN', 'EASYPOST_KEY', 'FLYIO_TOKEN', 'GRAFANA_TOKEN', 'TERRAFORM_CLOUD_TOKEN', 'HEROKU_KEY_V2', 'NOTION_TOKEN', 'PERPLEXITY_KEY', 'PLANETSCALE_TOKEN', 'POSTMAN_KEY', 'PREFECT_KEY', 'PULUMI_TOKEN', 'README_KEY', 'RUBYGEMS_KEY', 'BREVO_KEY', 'SENTRY_USER_TOKEN', 'SHIPPO_KEY', 'OPENSHIFT_TOKEN', 'TEAMS_WEBHOOK',
   'BEARER_TOKEN',
 ].map((t) => [t, 'secret:' + t.toLowerCase()]).concat([
   ['AWS_KEY', 'secret:aws_key_id'],
@@ -250,8 +252,9 @@ SECRETS (values stay on this machine; agents only see __ZN_<NAME>__ markers):
   run -- <command>    Run a command with markers replaced by values (allowed commands only)
                       and its output masked [--secrets A,B to set env vars]
   secret log          Show the local audit log of secret use [--since 1h] (same as vault log)
-  hooks install claude-code [--project]
-                      Install the Claude Code hooks and the "secrets" MCP server
+  hooks install <agent> [--project]
+                      Install zn's hooks for claude-code, codex, cursor or opencode
+                      (zn-gate init picks the right setup for each agent)
   check               Show that zn blocks your agent from reading a fake secret
                       (also: doctor). Safe: a temporary folder, nothing is sent
   secrets-mcp         Run the "secrets" MCP server (stdio)

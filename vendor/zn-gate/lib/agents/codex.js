@@ -226,7 +226,7 @@ function install(opts = {}) {
   cfg.writeJson(file, data);
   report.warnings.push('Codex runs new or changed hooks only after you trust them: open Codex and review them with /hooks.');
   if (opts.mcp !== false) {
-    report.warnings.push('to add the "secrets" MCP server, put this in ' + path.join(codexHome(opts), 'config.toml') + ':\n' + mcpSnippet(opts));
+    report.warnings.push('optional: to let Codex use the secrets kept in zn\'s vault, add the "secrets" MCP server by putting this in ' + path.join(codexHome(opts), 'config.toml') + ':\n' + mcpSnippet(opts));
   }
   return report;
 }

@@ -7,7 +7,8 @@
  *
  * <server> is the key that `zn-gate pins` prints. Approving is a decision for
  * you: it only runs in an interactive terminal and asks you to type the key
- * (or "all") again, and the agent hooks refuse the command from an agent.
+ * (or "all") again, refuses to run under an AI agent (its variables or its program among the parent
+ * processes), and the agent hooks refuse the command from an agent.
  */
 
 const readline = require('readline');
@@ -23,7 +24,7 @@ function ask(question) {
   });
 }
 
-async function run(args) {
+async function run(args, io = {}) {
   const [sub, which] = args;
   if (!sub || sub === 'list') {
     const servers = pins.list();
@@ -45,6 +46,12 @@ async function run(args) {
   if (sub === 'approve') {
     if (!which) {
       process.stderr.write('usage: zn-gate pins approve <server>|--all\n');
+      return 2;
+    }
+    const tty = require('./broker/tty');
+    const agent = tty.agentDetected(io.env || process.env, io);
+    if (agent) {
+      process.stderr.write('zn-gate pins approve must be run by you in your own terminal, not by an AI agent' + tty.agentNote(agent) + '\n');
       return 2;
     }
     if (!process.stdin.isTTY || !process.stderr.isTTY) {

@@ -253,7 +253,7 @@ function install(opts = {}) {
   writeFileAtomic(file, pluginSource(opts), 0o644);
   if (opts.mcp !== false) {
     const cli = path.resolve(__dirname, '..', '..', 'bin', 'cli.js').replace(/\\/g, '/');
-    report.warnings.push('to add the "secrets" MCP server, add to opencode.json under "mcp": "secrets": ' +
+    report.warnings.push('optional: to let OpenCode use the secrets kept in zn\'s vault, add the "secrets" MCP server to opencode.json under "mcp": "secrets": ' +
       JSON.stringify({ type: 'local', command: [(opts.nodePath || process.execPath).replace(/\\/g, '/'), cli, 'secrets-mcp', '--agent', 'opencode'] }));
   }
   return report;

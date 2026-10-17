@@ -264,7 +264,23 @@ function isInterpreterPath(file) {
   return INTERPRETER_BASES.has(programBase(file));
 }
 
+/*
+ * The system PowerShell (Windows PowerShell 5.1), from the kernel's \\SystemRoot link, as broker/run.js finds
+ * cmd.exe: never from SystemRoot, PATH or the current directory, which the agent that runs zn controls. It is
+ * resolved twice, so a drive letter remapped in this logon session is refused too. The path, or null (also on
+ * every other system).
+ */
+function systemPowerShell() {
+  if (process.platform !== 'win32') return null;
+  let ps;
+  try { ps = fs.realpathSync.native('\\\\?\\GLOBALROOT\\SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'); } catch (_) { return null; }
+  if (!/^[A-Za-z]:\\[^%!"]+\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe$/i.test(ps)) return null;
+  try { if (fs.realpathSync.native(ps).toLowerCase() !== ps.toLowerCase()) return null; } catch (_) { return null; }
+  return ps;
+}
+
 module.exports = {
+  systemPowerShell,
   commandWord,
   hasPathSeparator,
   resolveExecutable,

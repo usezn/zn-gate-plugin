@@ -28,7 +28,7 @@ const daemon = require('./daemon');
 const keychain = require('./keychain');
 const store = require('./store');
 const { createClient } = require('./client');
-const { agentEnvDetected } = require('../broker/tty');
+const { agentDetected, agentNote } = require('../broker/tty');
 const { CODES } = require('../errors');
 
 function parseDuration(s, fallback) {
@@ -164,8 +164,8 @@ function unlockedLine(meta, s) {
 }
 
 async function unlockCmd(args) {
-  const agent = agentEnvDetected(process.env);
-  if (agent) throw new Error('zn unlock must be run by you in your own terminal, not by an AI agent (detected ' + agent + ')');
+  const agent = agentDetected(process.env);
+  if (agent) throw new Error('zn unlock must be run by you in your own terminal, not by an AI agent' + agentNote(agent));
   const opts = {
     ttlMs: parseDuration(flag(args, '--ttl'), daemon.DEFAULT_TTL_MS),
     idleMs: parseDuration(flag(args, '--idle'), daemon.DEFAULT_IDLE_MS),
@@ -174,6 +174,9 @@ async function unlockCmd(args) {
   const backend = flag(args, '--backend') || (meta && meta.backend) || keychain.detectBackend();
   if (!keychain.BACKENDS.includes(backend)) throw new Error('unknown backend ' + backend);
   opts.backend = backend;
+  // The keychain unlocks without asking anything, so only a terminal tells a person from a detached process.
+  // (The passphrase backend needs the passphrase, which `--passphrase-stdin` reads from a pipe on purpose.)
+  if (backend !== 'passphrase' && !process.stdin.isTTY) throw new Error('zn unlock needs an interactive terminal: run it in your own terminal window');
   if (backend === 'passphrase') opts.passphrase = await getPassphrase(args, !meta);
   // An older vault still running: check the identity (passphrase or keychain)
   // before stopping it, then wait for it to exit.
