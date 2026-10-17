@@ -13,7 +13,7 @@
  *          type into this one.
  *   gui    a native dialog shown by the daemon:
  *            macOS    /usr/bin/osascript (display dialog)
- *            Windows  %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe
+ *            Windows  the system powershell.exe (found through the kernel's \SystemRoot link, never %SystemRoot%)
  *                     (WScript.Shell Popup, topmost, "No" is the default)
  *            Linux    /usr/bin/zenity or /usr/bin/kdialog, only with a
  *                     desktop session (DISPLAY or WAYLAND_DISPLAY)
@@ -30,7 +30,6 @@
  */
 
 const fs = require('fs');
-const path = require('path');
 const { spawn } = require('child_process');
 
 const DEFAULT_TIMEOUT_MS = 120000;
@@ -149,11 +148,6 @@ function exists(p) {
   try { return fs.statSync(p).isFile(); } catch (_) { return false; }
 }
 
-function windowsPowerShell(env) {
-  const root = (env || process.env).SystemRoot || (env || process.env).SYSTEMROOT || 'C:\\Windows';
-  return path.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-}
-
 // Popup type: 4 Yes/No + 48 warning icon + 256 second button (No) default + 4096 topmost.
 const WIN_SCRIPT = [
   '$s = New-Object -ComObject WScript.Shell',
@@ -182,8 +176,9 @@ function guiCommand(req, opts = {}) {
     return { file: '/usr/bin/osascript', args: args.concat([title, text]), env: {} };
   }
   if (platform === 'win32') {
-    const ps = windowsPowerShell(env);
-    if (!has(ps)) return null;
+    // The system PowerShell only (never SystemRoot or PATH): without it there is no dialog, and approvals are refused.
+    const ps = opts.powershell !== undefined ? opts.powershell : require('../exe').systemPowerShell();
+    if (!ps || !has(ps)) return null;
     const encoded = Buffer.from(WIN_SCRIPT, 'utf16le').toString('base64');
     return {
       file: ps,

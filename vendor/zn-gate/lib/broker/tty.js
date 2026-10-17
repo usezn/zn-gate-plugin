@@ -5,7 +5,6 @@
  * Values are read from a hidden TTY prompt or the clipboard, never from argv.
  */
 
-const path = require('path');
 const { spawnSync } = require('child_process');
 
 /**
@@ -20,13 +19,32 @@ function agentEnvDetected(env = process.env) {
   return AGENT_ENV_VARS.find((k) => env[k] !== undefined) || null;
 }
 
+/*
+ * The agent variables, then the parent processes (an agent can remove its variables, not its process).
+ * `io.ancestry` replaces the process check in tests. Returns what was detected, for the message, or null.
+ */
+function agentDetected(env = process.env, io = {}) {
+  const v = agentEnvDetected(env);
+  if (v) return v;
+  const a = (io.ancestry || require('./ancestry').agentAncestor)();
+  return a ? 'started from ' + a : null;
+}
+
+/* The end of a refusal, in words for someone who does not program. */
+function agentNote(agent) {
+  if (/^started from /.test(agent)) {
+    return ' (zn found it was ' + agent + '). If you are not using an AI agent, open a new terminal window and try again.';
+  }
+  return ' (detected ' + agent + ').';
+}
+
 /** Throws unless a person is at an interactive terminal. */
 function requireHuman(what, io = {}) {
   const stdin = io.stdin || process.stdin;
   const env = io.env || process.env;
-  const agent = agentEnvDetected(env);
+  const agent = agentDetected(env, io);
   if (agent) {
-    const err = new Error(what + ' must be run by you in your own terminal, not by an AI agent (detected ' + agent + ').');
+    const err = new Error(what + ' must be run by you in your own terminal, not by an AI agent' + agentNote(agent));
     err.code = 'ZN_POLICY_DENIED';
     throw err;
   }
@@ -91,20 +109,22 @@ function confirm(question, io = {}) {
 
 /** Read the clipboard with the platform tool. Returns a string or throws. */
 function readClipboard() {
-  // Absolute paths only: a clipboard tool planted on PATH would receive the value.
-  const ps = path.join(process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  // Absolute paths only: a clipboard tool planted on PATH would receive the value. On Windows, the system
+  // PowerShell from the kernel's \\SystemRoot link, never from SystemRoot (see exe.js).
+  const ps = process.platform === 'win32' ? require('../exe').systemPowerShell() : null;
   const candidates = process.platform === 'darwin'
     ? [['/usr/bin/pbpaste', []]]
     : process.platform === 'win32'
-      ? [[ps, ['-NoProfile', '-Command', 'Get-Clipboard -Raw']]]
+      ? (ps ? [[ps, ['-NoProfile', '-Command', 'Get-Clipboard -Raw']]] : [])
       : [['/usr/bin/wl-paste', ['--no-newline']], ['/usr/bin/xclip', ['-selection', 'clipboard', '-o']], ['/usr/bin/xsel', ['--clipboard', '--output']]];
   for (const [cmd, args] of candidates) {
     const r = spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true });
     if (!r.error && r.status === 0) return String(r.stdout || '').replace(/\r?\n$/, '');
   }
-  const err = new Error('could not read the clipboard (tried ' + candidates.map((c) => c[0]).join(', ') + ')');
+  const err = new Error(candidates.length ? 'could not read the clipboard (tried ' + candidates.map((c) => c[0]).join(', ') + ')'
+    : 'could not read the clipboard: the system PowerShell (Windows PowerShell 5.1) was not found');
   err.code = 'ZN_UNAVAILABLE';
   throw err;
 }
 
-module.exports = { AGENT_ENV_VARS, agentEnvDetected, requireHuman, readHidden, confirm, readClipboard };
+module.exports = { AGENT_ENV_VARS, agentEnvDetected, agentDetected, agentNote, requireHuman, readHidden, confirm, readClipboard };

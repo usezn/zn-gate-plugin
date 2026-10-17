@@ -182,7 +182,7 @@ function install(opts = {}) {
   report.warnings.push('Cursor cannot rewrite the output of shell commands or file reads: zn blocks reads of secret files and redacts MCP output only (see docs/compat.md).');
   if (opts.mcp !== false) {
     const cli = path.resolve(__dirname, '..', '..', 'bin', 'cli.js').replace(/\\/g, '/');
-    report.warnings.push('to add the "secrets" MCP server, add to ~/.cursor/mcp.json under "mcpServers": "secrets": ' +
+    report.warnings.push('optional: to let Cursor use the secrets kept in zn\'s vault, add the "secrets" MCP server to ~/.cursor/mcp.json under "mcpServers": "secrets": ' +
       JSON.stringify({ command: (opts.nodePath || process.execPath).replace(/\\/g, '/'), args: [cli, 'secrets-mcp', '--agent', 'cursor'] }));
   }
   return report;
