@@ -9,8 +9,10 @@ This repository is generated from [usezn/zn](https://github.com/usezn/zn) by its
    ```
    npm pack zn-gate@X.Y.Z --ignore-scripts
    gh attestation verify zn-gate-X.Y.Z.tgz --repo usezn/zn \
-     --signer-workflow usezn/zn/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z
+     --signer-workflow usezn/zn/.github/workflows/build-release.yml --source-ref refs/tags/vX.Y.Z
    ```
+
+   For zn-gate up to 1.11.x the signer workflow is `usezn/zn/.github/workflows/release.yml`.
 
    The sha512 integrity of the file must match `integrity` in `scripts/zn-gate.lock.json` and `npm view zn-gate@X.Y.Z dist.integrity`, and the commit the attestation names must be in the history of the `source` commit.
 

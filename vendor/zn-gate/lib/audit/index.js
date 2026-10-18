@@ -69,10 +69,52 @@ function redact(text) {
   // fragments, which often carry keys (?key=..., #access_token=...).
   s = s.replace(/(\b[a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/@'"]{1,256}@/gi, '$1[REDACTED]@');
   s = s.replace(/(\b[a-z][a-z0-9+.-]{1,15}:\/\/[^\s?#'"]{1,2048})[?#][^\s'"]{1,4096}/gi, '$1?[REDACTED]');
+  return redactByContext(s);
+}
+
+// Values in an unknown format, found by what precedes them: a credential flag (--token v, --api-key=v,
+// --pat v), user:password after -u, an auth header (Authorization: Bearer v, x-api-key: v), a bearer token,
+// or a name that ends in a secret word (API_TOKEN=v, "apiKey": "v", also inside escaped JSON).
+// The secret word must end the name, so MAX_TOKENS or author are not secrets.
+// References ($VAR, ${VAR}, %VAR%), zn markers and values already redacted are kept.
+const SECRET_WORD = '(?:token|secret|passw(?:or)?d|pwd|api[-_]?key|access[-_]?key|private[-_]?key|auth|credentials?)';
+// A quoted value runs to its closing quote, or to the end of the text when it has none; an unquoted one to
+// the next delimiter. No length limit, so a long token (a JWT) is hidden whole. A value opened with \" (JSON
+// inside a string) ends at the next \"; one opened with " may hold escaped quotes. Each alternative excludes
+// what the other takes, so matching stays linear for each place a lead matches.
+// Inside \"...\", a backslash arrives as \\\\ and an escaped quote as \\\": both stay in the value, the
+// backslash tried first so that a value ending in one (\\\\\") still ends at its own \".
+const QUOTED = String.raw`\\"(?:[^"\\\n]|\\\\\\\\|\\\\\\"|\\\\|\\[^"\\\n])+(?:\\")?|"(?:[^"\\\n]|\\.)+"?|'[^'\n]+'?`;
+const CONTEXT_RES = [
+  new RegExp('(--?[A-Za-z0-9]{0,40}(?:' + SECRET_WORD + '|pat|key)(?![a-z])[A-Za-z0-9-]{0,40}(?:=|\\s{1,8}))(' + QUOTED + '|[^\\s"\'`]+)', 'gi'),
+  // user:password after -u or --user; attached to -u (-uuser:pass) too, but there not a URL, because a flag
+  // such as -url:https://... is not a password.
+  new RegExp('((?:^|\\s)(?:-u|--user)(?:=|\\s{1,8})["\']?[^\\s:"\']{1,128}:)([^\\s"\'@]+)', 'g'),
+  new RegExp('((?:^|\\s)-u["\']?[^\\s:"\']{1,128}:)(?!//|[A-Za-z][A-Za-z0-9+.-]{0,15}://)([^\\s"\'@]+)', 'g'),
+  new RegExp('(\\b(?:authorization|proxy-authorization|x-api-key|api-key|x-auth-token|cookie)\\s{0,8}:\\s{0,8}(?:(?:bearer|basic|token)\\s{1,8})?)([^\\s"\'\\\\]+)', 'gi'),
+  new RegExp('(\\bbearer\\s{1,8})([A-Za-z0-9._~+/=-]{8,})', 'gi'),
+  // The flag and its value as two items of a JSON array (MCP server args): "--api-key", "v" (also escaped).
+  new RegExp(String.raw`(\\?"--?[A-Za-z0-9-]{0,40}(?:` + SECRET_WORD + String.raw`|pat|key)(?![a-z])[A-Za-z0-9-]{0,40}\\?"\s{0,8},\s{0,8})(` + QUOTED + ')', 'gi'),
+  new RegExp('(\\b[A-Za-z0-9_]{0,60}' + SECRET_WORD + '(?![A-Za-z0-9])\\\\?["\']?\\s{0,8}[=:]\\s{0,8})(' + QUOTED + '|[^\\s"\'\\\\,;`]+)', 'gi'),
+];
+function keepValue(v) {
+  const t = v.replace(/^\\?["']|\\?["']$/g, '');
+  return !t || /^(?:\$\{?[A-Za-z_]|%[A-Za-z_]|\[REDACTED|__ZN_|<)/.test(t);
+}
+function redactByContext(s) {
+  for (const re of CONTEXT_RES) s = s.replace(re, (m, lead, v) => (keepValue(v) ? m : lead + '[REDACTED]'));
   return s;
 }
 
-// Never clip before redacting: a value cut in half is no longer recognised.
+// Never clip before redacting: a value cut in half is no longer recognised. Only where far less than
+// REDACT_SPAN is shown afterwards, text is cut first, at a space, after its whitespace is collapsed as
+// clip() does: the word that the cut would split is dropped whole, so no part of a value reaches a finding.
+const REDACT_SPAN = 8192;
+function redactSpan(s) {
+  let t = String(s == null ? '' : s).replace(/\s+/g, ' ');
+  if (t.length > REDACT_SPAN) t = t.slice(0, REDACT_SPAN).replace(/\S*$/, '');
+  return t;
+}
 function clip(s, max) {
   const t = String(s).replace(/\s+/g, ' ').trim();
   return t.length > max ? t.slice(0, max - 3) + '...' : t;
@@ -100,7 +142,8 @@ class FileCtx {
   }
 
   redactedLine(ln) {
-    if (!this.redacted.has(ln)) this.redacted.set(ln, redact(this.lines[ln - 1] || ''));
+    // Only the start of a long line is ever shown, so only that much is redacted (well past what is shown).
+    if (!this.redacted.has(ln)) this.redacted.set(ln, redact(redactSpan(this.lines[ln - 1] || '')));
     return this.redacted.get(ln);
   }
 
@@ -169,7 +212,7 @@ class FileCtx {
       file: this.rec.display,
       line: ln,
       title: (extra && extra.title) || rule.title,
-      detail: clip(redact(detail), 600),
+      detail: clip(redact(redactSpan(detail)), 600),
       evidence: clip((extra && extra.evidence != null) ? redact(extra.evidence) : this.redactedLine(ln), EVIDENCE_MAX),
       fix: (extra && extra.fix) || rule.fix,
       references: (extra && extra.references) || rule.references.slice(),

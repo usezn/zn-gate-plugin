@@ -27,7 +27,7 @@ const { znCommand } = require('../zn-command');
 
 // Version of the policy rules (credential paths, zn home, secret commands,
 // command wrapping). Bump it when a rule changes; see CONTRIBUTING.md.
-const POLICY_RULES_VERSION = '2026-10-16.8';
+const POLICY_RULES_VERSION = '2026-10-17.8';
 
 /* ------------------------------ paths ------------------------------ */
 
@@ -51,6 +51,14 @@ function slash(p) {
 
 const DOTENV_BASENAME_RE = /^\.env(\.[A-Za-z0-9_.-]+)?$/;
 const DOTENV_SAFE_RE = /\.(example|sample|template|dist|defaults|schema)$/i;
+// Private keys kept outside ~/.ssh, for example in a project: an SSH key name is one wherever it is;
+// a key container (.p12, .pfx) holds one; a .pem or .key file may be a public certificate, so its content decides.
+const SSH_KEY_BASENAME_RE = /^id_(?:rsa|dsa|ecdsa|ed25519|xmss)(?:_sk)?$/;
+const KEY_CONTAINER_RE = /\.(?:p12|pfx|jks|keystore|ppk)$/i;
+const KEY_FILE_RE = /\.(?:pem|key|p8)$/i;
+const PRIVATE_KEY_RE = /-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----|PuTTY-User-Key-File-/;
+const KEY_SCAN_BYTES = 1024 * 1024;
+const DOTENV_SCAN_BYTES = 8 * 1024 * 1024;
 
 const CREDENTIAL_RES = [
   [/(^|\/)\.aws\/credentials$/, 'AWS credentials file'],
@@ -198,6 +206,9 @@ function classifyResolved(abs, ctx) {
   if (s === h + '/.npmrc' || s === h + '/.pypirc') return { kind: 'credential', reason: 'package registry token' };
   const base = path.basename(abs);
   if (ci(DOTENV_BASENAME_RE).test(base) && !ci(DOTENV_SAFE_RE).test(base)) return { kind: 'dotenv', reason: '.env file' };
+  if (ci(SSH_KEY_BASENAME_RE).test(base)) return { kind: 'credential', reason: 'SSH private key' };
+  if (KEY_CONTAINER_RE.test(base)) return { kind: 'credential', reason: 'key store, which holds private keys' };
+  if (KEY_FILE_RE.test(base)) return { kind: 'keyfile', reason: 'a private key file' };
   return null;
 }
 
@@ -210,7 +221,7 @@ function resolvedOf(p, opts = {}) {
 
 /**
  * Classify a path. Returns null or {kind, reason}:
- *   kind 'credential' | 'dotenv' | 'zn_state' | 'agent_config'
+ *   kind 'credential' | 'dotenv' | 'keyfile' | 'zn_state' | 'agent_config'
  * The path is checked as typed and where it really leads (symlinks resolved),
  * with ~, $HOME, %USERPROFILE%, $env:USERPROFILE and the credential variables
  * expanded, and case-insensitively on Windows and macOS.
@@ -511,7 +522,11 @@ function globOnDisk(abs) {
 
 /** A typed word: a path, or a glob that could name one. */
 function classifyWord(text, opts = {}) {
-  return classifyPath(text, opts) || globClass(text, opts);
+  const c = classifyPath(text, opts);
+  // A .env name behind a glob (app*/.env, src/*/.env): the shell expands it to real files, which cannot be read
+  // through the pattern to see whether they hold values, so the glob's own classification decides.
+  if (c && c.kind === 'dotenv' && GLOB_RE.test(String(text))) return globClass(text, opts) || c;
+  return c || globClass(text, opts);
 }
 
 /**
@@ -523,18 +538,64 @@ function readDenial(p, opts = {}) {
   if (!c || c.kind === 'agent_config') return null;
   if (c.kind === 'dotenv') {
     const abs = resolvedOf(p, opts);
-    let text;
-    try {
-      text = fs.readFileSync(abs, 'utf8');
-    } catch (_) {
-      return null; // missing file: nothing to protect
-    }
-    if (dotenv.isShadowed(text)) return null;
+    const head = readHead(abs, DOTENV_SCAN_BYTES);
+    if (head === null) return null; // missing file: nothing to protect
+    // Not a regular file (a FIFO), or too big to check whole: refused rather than read.
+    let text = head === NOT_A_FILE ? null : Buffer.from(head, 'latin1').toString('utf8');
+    if (text !== null && Buffer.byteLength(head, 'latin1') >= DOTENV_SCAN_BYTES) text = null;
+    if (text !== null && dotenv.isShadowed(text)) return null;
     return 'zn: ' + path.basename(abs) + ' holds plain-text secrets. Ask the user to run `' +
       znCommand('env shadow ' + path.basename(abs)) + '` in their terminal: it moves the values to the local vault and leaves __ZN_<NAME>__ markers you can read and use.';
   }
   if (c.kind === 'zn_state') return vaultMessage(opts);
+  if (c.kind === 'keyfile') return keyFileDenial(p, c, opts);
   return credentialDenial(p, c);
+}
+
+/* Spend `n` looks on disk from a command's budget; true once the time or the looks are used up. */
+function overBudget(budget, n) {
+  if (!budget) return false;
+  budget.disk -= n;
+  return budget.disk < 0 || Date.now() > budget.until;
+}
+
+/* The first `max` bytes of a file, as latin1 text. null when it does not exist; NOT_A_FILE for anything that is not
+   a regular file (a FIFO, a device, a directory): opening is non-blocking, so a FIFO cannot hold the hook until the
+   agent's timeout lets the command through. */
+const NOT_A_FILE = Symbol('not a regular file');
+function readHead(abs, max) {
+  let fd;
+  try {
+    fd = fs.openSync(abs, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0));
+  } catch (_) {
+    return null;
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (st.isDirectory()) return null; // a folder holds no values (a Python virtualenv named .env)
+    if (!st.isFile()) return NOT_A_FILE;
+    const n = Math.min(st.size, max);
+    const buf = Buffer.allocUnsafe(n);
+    let got = 0;
+    while (got < n) {
+      const r = fs.readSync(fd, buf, got, n - got, got);
+      if (r <= 0) break;
+      got += r;
+    }
+    return buf.toString('latin1', 0, got);
+  } catch (_) {
+    return NOT_A_FILE;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/* A .pem, .key or .p8 file: refused when it holds a private key, allowed when it is a certificate or a public key. */
+function keyFileDenial(p, c, opts) {
+  const text = readHead(resolvedOf(p, opts), KEY_SCAN_BYTES);
+  if (text === null) return null; // missing file: nothing to protect
+  if (text === NOT_A_FILE || PRIVATE_KEY_RE.test(text)) return credentialDenial(p, c);
+  return null;
 }
 
 /* Reads of credential files: what was refused, why, and how to use a value instead. */
@@ -631,21 +692,28 @@ function scanFirstCommand(cmd, posix = false) {
 }
 
 /** Every word of the whole command (rough), with a flag for > / >> targets and the command name of its segment. */
+// Enough simple commands for any command under SHELL_SCAN_CAP (each takes at least two characters).
+const SIMPLE_COMMANDS_MAX = 50000;
 function allWords(cmd, posix = false) {
   const out = [];
   let rest = String(cmd);
   let guard = 0;
-  while (rest.length && guard++ < 1000) {
+  while (rest.length && guard++ < SIMPLE_COMMANDS_MAX) {
     const scan = scanFirstCommand(rest, posix);
     const head = commandName(scan.words);
+    const sub = isGit(head) ? gitSubcommand(scan.words) : '';
+    const gitArgs = sub ? scan.words.map((x) => x.text) : null;
     for (let k = 0; k < scan.words.length; k++) {
       const w = scan.words[k];
       const prev = k > 0 ? scan.words[k - 1].text : '';
       const isRedirTarget = /^[0-9]*>>?$/.test(prev) || /^[0-9]*>>?./.test(w.text);
-      out.push({ text: w.text.replace(/^[0-9]*>>?/, '').replace(/^</, ''), redirectTarget: isRedirTarget, head });
+      // Input redirections: <file, 0<file, <>file (read and write), {fd}<file.
+      out.push({ text: w.text.replace(/^[0-9]*>>?/, '').replace(/^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?<>?/, ''), redirectTarget: isRedirTarget, head, seq: guard, sub, gitArgs });
     }
     rest = rest.slice(scan.end + 1);
   }
+  // Simple commands past the limit were not read: the caller refuses the command rather than check only part of it.
+  if (rest.length) out.truncated = true;
   return out;
 }
 
@@ -794,7 +862,8 @@ function wrapPowerShell(cmd, opts) {
   }
   const first = scan.words[0].text;
   const base = path.basename(first.replace(/\\/g, '/')).toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/, '');
-  if (/^[a-z]+-[a-z]+$/i.test(first) || PS_ALIASES.has(first.toLowerCase())) {
+  // zn-gate has the Verb-Noun shape of a cmdlet but is the zn program itself.
+  if ((/^[a-z]+-[a-z]+$/i.test(first) && base !== 'zn-gate') || PS_ALIASES.has(first.toLowerCase())) {
     return { ok: false, reason: 'zn: "' + first + '" is a PowerShell command, not a program, so zn cannot pass a secret to it.' + guidance };
   }
   if (/\.ps1$/i.test(first)) {
@@ -857,6 +926,12 @@ function vaultMessage(opts = {}) {
     znCommand('secret set NAME', opts) + '` in their own terminal.';
 }
 const TOO_LONG_MESSAGE = 'zn: this command is too long for zn to check (over 100 KB), so it was blocked. Next step: tell the user; do not resend it in parts.';
+// The agent runs a command unchecked when the hook times out (15 s in Claude Code), so checking a command has its
+// own limits, well below that: a time budget and a number of looks on disk. Past either, the command is refused.
+const CHECK_BUDGET_MS = 3000;
+const TOO_MANY_MESSAGE = 'zn: this command chains more commands than zn checks at once, so it was blocked. Next step: run it as several shorter commands, or tell the user.';
+const CHECK_BUDGET_DISK = 20000;
+const TOO_SLOW_MESSAGE = 'zn: this command has too many paths for zn to check in time, so it was blocked. Next step: run it as several shorter commands, or tell the user.';
 
 /**
  * Bash commands that read credential files or touch ~/.zn.
@@ -868,10 +943,14 @@ const TOO_LONG_MESSAGE = 'zn: this command is too long for zn to check (over 100
  * Only the message changes: the decision is the one bashDenial made.
  */
 const SHELL_PATCH_FILE_RE = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm;
+// Each file name is resolved on disk, so a long patch is named by its first files only; the decision is already made.
+const SHELL_PATCH_FILES_NAMED = 32;
 function shellPatchMessage(cmd, deny, opts) {
   // Only a refused command that is a patch (apply_patch with *** lines); a too-long command keeps its own message.
   if (!deny || deny === TOO_LONG_MESSAGE || !/^\s*apply_patch\b/.test(String(cmd)) || !/^\*\*\* /m.test(String(cmd))) return deny;
+  let seen = 0;
   for (const m of String(cmd).matchAll(SHELL_PATCH_FILE_RE)) {
+    if (++seen > SHELL_PATCH_FILES_NAMED) break;
     const f = m[1].trim();
     const c = classifyPath(f, opts);
     // The name comes from the agent: no control characters, and short, in a message the user reads.
@@ -896,32 +975,71 @@ function bashDenialOf(cmd, opts = {}) {
   if (admin) return adminDenial(admin, opts, cmd);
   // The context (home, project, agent directories) is built once per command.
   opts = { ...opts, ctx: contextOf(opts) };
+  opts.budget = { until: Date.now() + CHECK_BUDGET_MS, disk: CHECK_BUDGET_DISK };
   // The command is read three times: a backslash before a letter is a Windows
   // path separator or a bash escape, and a PowerShell backtick is an escape too.
   // A word protected in any reading is refused.
-  const words = [...allWords(cmd, false), ...allWords(cmd, true), ...allWords(String(cmd).replace(/`(.)/gs, '$1'), false)];
+  const readings = [allWords(cmd, false), allWords(cmd, true), allWords(String(cmd).replace(/`(.)/gs, '$1'), false)];
+  // Bash $'...' quoting spells characters as escapes ($'\x2eenv' is .env), and $"..." is a plain "...":
+  // a fourth reading with them decoded.
+  if (/\$['"]/.test(String(cmd))) readings.push(allWords(decodeAnsiC(String(cmd)), true));
+  // A reading that could not be split to the end is refused, not checked in part.
+  if (readings.some((r) => r.truncated)) return TOO_MANY_MESSAGE;
+  const words = readings.flat();
   // Inside $( ) or backticks the text is not split into simple commands, so
   // every word of it is checked on its own, as if it were a word of the command.
-  if (/\$\(|`/.test(String(cmd))) {
-    for (const t of String(cmd).split(/[\s'"`$(){};|&<>=,]+/)) if (t) words.push({ text: t, redirectTarget: false, head: '' });
+  // The same for the code an interpreter runs (python -c "open('.env')"), where a path sits inside quotes and brackets.
+  if (/\$\(|`/.test(String(cmd)) || words.some((w) => CODE_CMDS_RE.test(bareHead(w.head)))) {
+    const split = [];
+    for (const t of String(cmd).split(/[\s'"`$(){};|&<>=,]+/)) if (t) split.push({ text: t, redirectTarget: false, head: '', seq: 0 });
+    words.push(...split);
+    readings.push(split);
   }
+  // Where a relative .env path may be read from once the command has changed directory (cd app && cat .env).
+  // Each reading is followed on its own, so a cd counts once.
+  opts.cdBases = cdBasesOf(readings, opts);
+  opts.elsewhere = new Map();
+  if (overBudget(opts.budget, 0)) return TOO_SLOW_MESSAGE;
+  opts.cmdText = String(cmd);
   // A word is classified once per command: each classification resolves the path on disk, and a long command
   // often repeats the same words.
   const classified = new Map();
+  // And so is its verdict, which may read the file (a .env, a .pem).
+  const denied = new Map();
   // A word with * ? or [ can match a secret file; the message names a literal file when the command has one too.
+  // The command is refused either way, so after a glob only a few more words are resolved on disk to find that file.
+  const GLOB_NAME_LOOKAHEAD = 32;
   let globDeny = null;
+  let afterGlob = 0;
   for (const w of words) {
     // --flag=value carries a path too (--kubeconfig=~/.kube/config).
     let text = w.text;
     if (text.startsWith('-')) {
       const eq = text.indexOf('=');
-      if (eq < 0) continue;
-      text = text.slice(eq + 1);
+      // git log -L<range>:<file> names a file after the colon.
+      const lineRange = isGit(w.head) ? /^-L[^:]*:(.+)$/.exec(text) : null;
+      if (lineRange) text = lineRange[1];
+      else if (eq < 0) continue;
+      else text = text.slice(eq + 1);
+    } else if (NAME_VALUE_RE.test(text)) {
+      // name=value carries a path too (dd if=.env, ENV_FILE=.env).
+      text = text.slice(text.indexOf('=') + 1);
     }
     if (!text) continue;
     const writing = !READ_ONLY_CMDS.has(w.head);
-    if (!classified.has(text)) classified.set(text, classifyWord(text, opts));
+    if (!classified.has(text)) {
+      if (globDeny && ++afterGlob > GLOB_NAME_LOOKAHEAD) return globDeny;
+      if (overBudget(opts.budget, 1)) return TOO_SLOW_MESSAGE;
+      classified.set(text, classifyWord(text, opts));
+    }
     const c = classified.get(text);
+    if ((!c || c.kind === 'dotenv') && isGit(w.head)) {
+      // git show HEAD:.env, git cat-file -p :app/.env: a secret file read from the repository, not from disk.
+      const deny = gitObjectDenial(text, opts) ||
+        // git log -p -- .env, git checkout HEAD -- .env: its history, also once the file is gone from disk.
+        (c && gitReadsContent(w.sub, w.gitArgs) ? gitHistoryDenial(text) : null);
+      if (deny) return deny;
+    }
     if (!c) {
       if (writing && AGENT_CONFIG_MENTION_RE.test(slash(text))) {
         return 'zn: this command would change agent hook or plugin settings, which is protected. Ask the user to make this change.';
@@ -934,11 +1052,201 @@ function bashDenialOf(cmd, opts = {}) {
       continue; // reading the settings is allowed
     }
     if (w.redirectTarget) continue; // appending to .env is a write, not a read
-    const deny = denialOf(c, text, opts);
+    let deny;
+    if (denied.has(text)) deny = denied.get(text);
+    else { deny = denialOf(c, text, opts); denied.set(text, deny); }
+    if (!deny && c.kind === 'dotenv') deny = dotenvElsewhereDenial(text, opts);
     if (deny && /[*?[]/.test(text)) { globDeny = globDeny || deny; continue; }
     if (deny) return deny;
   }
   return globDeny;
+}
+
+const NAME_VALUE_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}=/;
+const ANSI_C_SIMPLE = { a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', '\\': '\\', "'": "'", '"': '"', '?': '?' };
+
+/* The command with each bash $'...' word decoded and quoted again as a plain '...' word, and $"..." read as "...". */
+function decodeAnsiC(cmd) {
+  return cmd.replace(/\$'((?:[^'\\]|\\[\s\S])*)'/g, (m, body) => {
+    const text = body.replace(/\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|c[\s\S]|[\s\S])/g, (e, x) => {
+      if (/^[xuU]/.test(x)) {
+        const n = parseInt(x.slice(1), 16);
+        return n <= 0x10ffff ? String.fromCodePoint(n) : '';
+      }
+      if (/^[0-7]/.test(x)) return String.fromCharCode(parseInt(x, 8) & 0xff);
+      if (x[0] === 'c' && x.length === 2) return String.fromCharCode(x.charCodeAt(1) & 0x1f);
+      return Object.prototype.hasOwnProperty.call(ANSI_C_SIMPLE, x) ? ANSI_C_SIMPLE[x] : '\\' + x;
+    });
+    // Bash ends the string at the first NUL character.
+    return "'" + text.split('\0')[0].replace(/'/g, "'\\''") + "'";
+  }).replace(/\$"/g, '"');
+}
+
+// <rev>:<path> and :<path> name a file as git stores it (HEAD:.env, main~2:app/.env, :0:.env).
+const GIT_OBJECT_RE = /^[^\s:]*:(?:[0-3]:)?([^:\s]\S*)$/;
+// git subcommands that print or restore a file's stored content or history.
+const GIT_READ_SUBCMDS = new Set(['show', 'log', 'diff', 'grep', 'archive', 'checkout', 'restore', 'blame', 'annotate', 'cat-file',
+  'whatchanged', 'format-patch', 'difftool', 'stash', 'cherry-pick', 'apply', 'am']);
+const GIT_VALUE_OPTS = new Set(['-c', '-C', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);
+
+function isGit(head) {
+  return String(head || '').replace(/\.exe$/, '') === 'git';
+}
+
+/* The subcommand of a git command: the first word after git that is not a global option (git -C app -c k=v log). */
+function gitSubcommand(words) {
+  let k = words.findIndex((x) => !ASSIGNMENT_RE.test(x.text));
+  for (k++; k < words.length; k++) {
+    const t = words[k].text;
+    if (GIT_VALUE_OPTS.has(t)) { k++; continue; }
+    if (t.startsWith('-')) continue;
+    return t.toLowerCase();
+  }
+  return '';
+}
+
+// log, diff and show print only names or counts with one of these options...
+const GIT_SUMMARY_OPTS = new Set(['--stat', '--shortstat', '--numstat', '--name-only', '--name-status', '--summary', '--dirstat', '--compact-summary']);
+// ...as long as every other option is one that cannot add file content (an allowlist: -U3, --binary or
+// --patch-with-stat bring the patch back, and git has many such options).
+const GIT_SAFE_OPTS_RE = /^(?:--(?:stat|shortstat|numstat|name-only|name-status|summary|dirstat|compact-summary)(?:=[\w,.%-]*)?|--oneline|--no-color|--color(?:=\w+)?|--decorate(?:=\w+)?|--no-decorate|--graph|--reverse|--all|--follow|--no-merges|--merges|--first-parent|--abbrev-commit|--no-abbrev-commit|--cached|--staged|--no-renames|--relative|--date=[\w:%.-]+|--(?:since|until|after|before|author|committer|grep)=[^\s]*|--max-count=\d+|-n|-\d+|--(?:format|pretty)=[^\s]*)$/;
+
+/* Whether a git command prints or brings back a file's stored content. Steps that only clean up stay allowed:
+   git restore --staged .env, git checkout -- .env (from the index to disk), git stash push -- .env, git log --stat -- .env. */
+function gitReadsContent(sub, args) {
+  if (!GIT_READ_SUBCMDS.has(sub)) return false;
+  const a = args || [];
+  const at = a.findIndex((x) => x.toLowerCase() === sub);
+  const rest = at >= 0 ? a.slice(at + 1) : a;
+  const dashdash = rest.indexOf('--');
+  const before = dashdash >= 0 ? rest.slice(0, dashdash) : rest;
+  const positional = before.filter((x) => !x.startsWith('-'));
+  if (sub === 'stash') return positional[0] === 'show';
+  if (sub === 'restore') return rest.some((x) => x.startsWith('-s') || x.startsWith('--source'));
+  // checkout <rev> -- <file> (or checkout <rev> <file>) brings back a stored copy; checkout -- <file> uses the index.
+  if (sub === 'checkout') return dashdash >= 0 ? positional.length > 0 : positional.length > 1;
+  if (['log', 'diff', 'show', 'whatchanged'].includes(sub)) {
+    const opts = before.filter((x) => x.startsWith('-'));
+    const summary = opts.some((x) => GIT_SUMMARY_OPTS.has(x.split('=')[0]));
+    // git log --oneline lists commits only; git show --oneline still prints the patch.
+    const listOnly = sub === 'log' && opts.includes('--oneline');
+    if ((summary || listOnly) && opts.every((x) => GIT_SAFE_OPTS_RE.test(x))) return false;
+  }
+  return true;
+}
+
+function gitHistoryDenial(text) {
+  return 'zn: this git command reads the stored content or history of ' + path.basename(text) + ', which zn treats as holding secrets, ' +
+    'so it was not run. If the repository holds real values in it, tell the user: they should be rotated and removed from the history.';
+}
+
+/* A git object word whose path is a .env or credential file. The stored copy cannot be checked for values without
+   running git, and a .env kept in the repository with values is the case to stop, so it is refused. */
+function gitObjectDenial(text, opts) {
+  const m = GIT_OBJECT_RE.exec(text);
+  if (!m || /^[a-z][a-z0-9+.-]*:\/\//i.test(text)) return null;
+  // git drops leading ./ from the path (HEAD:././.env is .env).
+  const file = m[1].replace(/^(?:\.\/)+/, '');
+  const c = classifyPath(file, opts) || classifyPath(path.basename(file), opts);
+  if (!c || c.kind === 'agent_config') return null;
+  return 'zn: ' + text + ' reads ' + path.basename(file) + ' from the git repository, and zn treats that file as holding secrets, ' +
+    'so it was not read. If the repository holds real values in it, tell the user: they should be rotated and removed from the history.';
+}
+
+// Commands that change the directory the rest of the command runs in.
+const CD_CMDS = new Set(['cd', 'chdir', 'pushd', 'sl', 'set-location', 'push-location']);
+// Interpreters and shells whose code argument can name a file inside quotes or brackets.
+const CODE_CMDS_RE = /^(?:python[0-9.]*|py|node|nodejs|deno|bun|ruby|perl|php|lua|osascript|pwsh|powershell|bash|sh|zsh|dash|ksh|fish|cmd)(?:\.exe)?$/;
+const CD_BASES_MAX = 16;
+
+function bareHead(h) {
+  return String(h || '').replace(/^\(+/, '');
+}
+
+/* The directories a relative path in the command may be read from: the working directory and every place a cd in it
+   may lead to (a cd that fails leaves the command where it was, so earlier places stay). `unknown` is set when a cd goes
+   somewhere zn cannot follow (cd -, cd $DIR, cd $(...)); `moved` when the command has any cd at all. */
+function cdBasesOf(readings, opts) {
+  const home = opts.home || os.homedir();
+  const env = opts.env || process.env;
+  const cwd = path.resolve(opts.cwd || process.cwd());
+  const all = new Set([cwd]);
+  let unknown = false;
+  let moved = false;
+  for (const words of readings) {
+    if (unknown) break;
+    let bases = [cwd];
+    for (let k = 0; k < words.length && !unknown; k++) {
+      // Found by its text, not by the command's head, so { cd x; ... } and if cd x; then ... count too.
+      if (!CD_CMDS.has(words[k].text.replace(/^[({]+/, '').toLowerCase())) continue;
+      moved = true;
+      // Each cd followed costs its new places; past the budget, the rest cannot be followed.
+      if (overBudget(opts.budget, bases.length)) { unknown = true; break; }
+      // The target: the next word of the same simple command that is not an option (cd -P dir, Set-Location -Path dir).
+      let t = '~';
+      for (let j = k + 1; j < words.length && words[j].seq === words[k].seq; j++) {
+        const x = words[j].text.replace(/^["']|["']$/g, '').replace(/[;)}]+$/, '');
+        if (!x || (x.startsWith('-') && x !== '-')) continue;
+        t = x;
+        break;
+      }
+      const target = t === '-' ? '-' : expandEnv(expandHome(t, home), env).text;
+      if (target === '-' || /[$`*?[{]/.test(target)) { unknown = true; continue; }
+      const next = new Set(bases);
+      for (const b of bases) next.add(path.resolve(b, target));
+      if (next.size > CD_BASES_MAX) { unknown = true; continue; }
+      bases = [...next];
+      for (const d of bases) all.add(d);
+    }
+  }
+  return { dirs: [...all], unknown, moved };
+}
+
+/* A .env path the working directory alone does not settle: one built while the command runs ($DIR/.env, $(...)/.env),
+   or one read after a cd. Refused when zn cannot rule out that it reaches a .env file with values.
+   The answer is kept per word: the places a cd leads to are the same for the whole command. */
+function dotenvElsewhereDenial(text, opts) {
+  if (opts.elsewhere && opts.elsewhere.has(text)) return opts.elsewhere.get(text);
+  const deny = dotenvElsewhereOf(text, opts);
+  if (opts.elsewhere) opts.elsewhere.set(text, deny);
+  return deny;
+}
+
+function dotenvElsewhereOf(text, opts) {
+  const home = opts.home || os.homedir();
+  const env = opts.env || process.env;
+  const expanded = expandEnv(expandHome(text, home), env).text;
+  const missing = !fs.existsSync(resolvedOf(text, opts));
+  // $DIR/.env with a variable zn does not know, or a path whose start is the output of another command
+  // (`cat $(echo app)/.env` leaves the word /.env right after the closing bracket).
+  const cmdText = opts.cmdText || '';
+  const afterSubstitution = /[()]/.test(text) || cmdText.includes(')' + text) || cmdText.includes('`' + text);
+  if (/[$`]/.test(expanded) || (missing && afterSubstitution)) {
+    return 'zn: this command builds the path of a .env file while it runs (' + text + '), so zn cannot check whether it holds secrets. ' +
+      'Name the file directly, for example `cat app/.env`; if it holds values, ask the user to run `' + znCommand('env shadow .env', opts) + '` in that folder.';
+  }
+  const bases = opts.cdBases || { dirs: [], unknown: false, moved: false };
+  if (!bases.moved) return null;
+  // $PWD follows the cd; any other absolute path does not.
+  const pwdRef = /\$\{?PWD\b/.test(text);
+  if (path.isAbsolute(expanded) && !pwdRef) return null;
+  const cwd = path.resolve(opts.cwd || process.cwd());
+  for (const dir of bases.dirs) {
+    if (dir === cwd) continue;
+    if (overBudget(opts.budget, 1)) return TOO_SLOW_MESSAGE;
+    const deny = readDenial(text, { ...opts, cwd: dir, env: pwdRef ? { ...env, PWD: dir } : env });
+    if (deny) {
+      // The folder as the user would type it: relative below the current folder, absolute above it.
+      const rel = path.relative(cwd, dir);
+      const where = slash(rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : dir);
+      return 'zn: this command changes to ' + where + ' first. ' + deny.replace(/^zn: /, '');
+    }
+  }
+  if (bases.unknown) {
+    return 'zn: this command changes to a folder zn cannot follow and then reads ' + text + ', so zn cannot check whether it holds secrets. ' +
+      'Give the path from the current folder instead, for example `cat app/.env`.';
+  }
+  return null;
 }
 
 /* zn commands only the user may run: what the command does, why an agent may not, and the next step. */
@@ -981,7 +1289,7 @@ function adminDenial(admin, opts = {}, cmd = '') {
 /** The deny message for a read or write classified by classifyWord. */
 function denialOf(c, text, opts) {
   if (c.kind === 'zn_state') return vaultMessage(opts);
-  if (c.kind === 'dotenv') return readDenial(text, opts);
+  if (c.kind === 'dotenv' || c.kind === 'keyfile') return readDenial(text, opts);
   return credentialDenial(text, c);
 }
 
@@ -992,6 +1300,7 @@ module.exports = {
   globClass,
   globRegExp,
   _globClassEnd: globClassEnd,
+  _decodeAnsiC: decodeAnsiC,
   _globClassSource: globClassSource,
   expandBraces,
   readDenial,

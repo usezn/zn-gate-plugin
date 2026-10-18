@@ -183,4 +183,103 @@ function claudeCodePolicyWarnings(opts = {}) {
   return warnings;
 }
 
-module.exports = { claudeCodePolicyWarnings, managedDir };
+/* ------------------------------ Codex CLI ------------------------------ */
+
+/*
+ * Codex settings that stop zn's hooks (read 2026-10-17):
+ *  https://developers.openai.com/codex/enterprise/managed-configuration (requirements.toml, managed_config.toml)
+ *  https://developers.openai.com/codex/hooks ([features] hooks, allow_managed_hooks_only)
+ * requirements.toml is enforced; managed_config.toml sets defaults again at every start; the user's config.toml
+ * can turn the user's own hooks off. Policy sent through MDM or the cloud is not seen here.
+ */
+function codexRequirementsFile(platform, env) {
+  if (platform === 'win32') return path.join(env.ProgramData || 'C:\\ProgramData', 'OpenAI', 'Codex', 'requirements.toml');
+  return '/etc/codex/requirements.toml';
+}
+
+function codexManagedConfigFile(platform, codexHome) {
+  return platform === 'win32' ? path.join(codexHome, 'managed_config.toml') : '/etc/codex/managed_config.toml';
+}
+
+/* {file, data} | {file, error} | null when the file does not exist. */
+function readToml(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
+    return { file, error: err.code || err.message };
+  }
+  try {
+    return { file, data: require('../audit/parse').parseToml(text).data };
+  } catch (err) {
+    return { file, error: 'invalid TOML' };
+  }
+}
+
+/* [features] hooks (or its older name codex_hooks): true, false or undefined. */
+function codexHooksFeature(data) {
+  const f = data && data.features;
+  if (!f || typeof f !== 'object') return undefined;
+  const v = f.hooks !== undefined ? f.hooks : f.codex_hooks;
+  return v === true || v === 'true' ? true : v === false || v === 'false' ? false : undefined;
+}
+
+/* Whether the managed hooks ([[hooks.<Event>]] with [[hooks.<Event>.hooks]]) include one of zn's own commands. */
+function codexManagesZn(hooks) {
+  const { isOurs } = require('./config-file');
+  if (!hooks || typeof hooks !== 'object') return false;
+  for (const groups of Object.values(hooks)) {
+    for (const g of Array.isArray(groups) ? groups : []) {
+      for (const h of g && Array.isArray(g.hooks) ? g.hooks : []) {
+        if (h && (isOurs(h.command, 'codex') || isOurs(h.command_windows, 'codex') || isOurs(h.commandWindows, 'codex'))) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * codexPolicyWarnings(opts) -> [string]
+ * opts: {platform, env, codexHome, requirementsFile, managedConfigFile, userConfig}
+ */
+function codexPolicyWarnings(opts = {}) {
+  const platform = opts.platform || process.platform;
+  const env = opts.env || process.env;
+  const home = opts.codexHome || path.join(require('os').homedir(), '.codex');
+  const reqFile = opts.requirementsFile || codexRequirementsFile(platform, env);
+  const managedFile = opts.managedConfigFile || codexManagedConfigFile(platform, home);
+  const userFile = opts.userConfig || path.join(home, 'config.toml');
+  const warnings = [];
+  const ask = 'Codex does not show this. Ask your administrator to allow zn\'s hooks.';
+
+  const req = readToml(reqFile);
+  if (req && req.error) warnings.push('could not read the Codex requirements ' + reqFile + ' (' + req.error + '), so zn cannot tell whether they turn off its hooks.');
+  const forced = req && req.data ? codexHooksFeature(req.data) : undefined;
+  if (forced === false) {
+    warnings.push('Your organization\'s Codex requirements (' + reqFile + ') turn hooks off ([features] hooks = false), so zn\'s hooks do not run. ' + ask);
+    return warnings;
+  }
+  if (req && req.data && (req.data.allow_managed_hooks_only === true || req.data.allow_managed_hooks_only === 'true')
+    && !codexManagesZn(req.data.hooks)) {
+    warnings.push('Your organization\'s Codex requirements (' + reqFile + ') run only the hooks they manage (allow_managed_hooks_only), so the zn hooks you install do not run. ' + ask);
+    return warnings;
+  }
+  if (forced === true) return warnings; // hooks are forced on: nothing below can turn them off.
+
+  const managed = readToml(managedFile);
+  if (managed && managed.error) warnings.push('could not read the Codex managed configuration ' + managedFile + ' (' + managed.error + ').');
+  const managedHooks = managed && managed.data ? codexHooksFeature(managed.data) : undefined;
+  if (managedHooks === false) {
+    warnings.push('Your organization\'s Codex managed configuration (' + managedFile + ') turns hooks off ([features] hooks = false) at every start, so zn\'s hooks do not run. ' + ask);
+    return warnings;
+  }
+  if (managedHooks === true) return warnings; // set again at every start, over the user's own config.toml
+  const user = readToml(userFile);
+  if (user && user.data && codexHooksFeature(user.data) === false) {
+    warnings.push(userFile + ' turns hooks off ([features] hooks = false), so no hooks you install run, zn\'s included. Remove that line, or set it to true, to turn them on.');
+  }
+  return warnings;
+}
+
+module.exports = { claudeCodePolicyWarnings, managedDir, codexPolicyWarnings, _internal: { codexRequirementsFile, codexManagedConfigFile } };
