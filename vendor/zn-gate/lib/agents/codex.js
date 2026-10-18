@@ -228,6 +228,13 @@ function install(opts = {}) {
   if (opts.mcp !== false) {
     report.warnings.push('optional: to let Codex use the secrets kept in zn\'s vault, add the "secrets" MCP server by putting this in ' + path.join(codexHome(opts), 'config.toml') + ':\n' + mcpSnippet(opts));
   }
+  // Organization requirements or the user's config.toml can turn these hooks off with no sign in Codex; say it here.
+  // Advisory only: a failure here never fails an install already written.
+  try {
+    report.warnings.push(...require('./managed-policy').codexPolicyWarnings({
+      env: opts.env, codexHome: codexHome(opts), requirementsFile: opts.codexRequirementsFile, managedConfigFile: opts.codexManagedConfigFile,
+    }));
+  } catch (_) { /* no policy note */ }
   return report;
 }
 

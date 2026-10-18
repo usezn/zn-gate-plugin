@@ -257,6 +257,9 @@ SECRETS (values stay on this machine; agents only see __ZN_<NAME>__ markers):
                       (zn-gate init picks the right setup for each agent)
   check               Show that zn blocks your agent from reading a fake secret
                       (also: doctor). Safe: a temporary folder, nothing is sent
+  reach [path]        Show what your coding agents can reach: secrets (names only),
+                      credential files, MCP servers [--json | --sarif]
+                      [--fail-on high|medium|low|none] [--remember]. Read only, nothing is sent
   secrets-mcp         Run the "secrets" MCP server (stdio)
   hook <agent>        Hook entry point used by agents (reads the event on stdin)
 
@@ -683,10 +686,66 @@ async function runBrokerCommand(command, rest) {
   process.exitCode = await require('../lib/broker/cli').dispatch(command, rest);
 }
 
+const REACH_USAGE = 'usage: zn-gate reach [path] [--json | --sarif] [--fail-on high|medium|low|none] [--remember]';
+
+/*
+ * zn-gate reach [path] [--json | --sarif] [--fail-on high|medium|low|none]: read only, nothing sent.
+ * Exit 0, 1 when --fail-on is met (default none: it is a report), 2 for a usage error or a failure.
+ */
+async function runReachCommand(rest) {
+  const zr = require('../lib/reach');
+  let target = null;
+  let format = 'text';
+  let failOn = 'none';
+  let remember = false;
+  const usage = (msg) => { process.stderr.write('zn-gate reach: ' + msg + '\n' + REACH_USAGE + '\n'); return 2; };
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '-h' || a === '--help') { process.stdout.write(REACH_USAGE + '\nShows what the coding agents on this machine can reach. Read only: nothing is changed or sent.\n'); return 0; }
+    // --remember keeps this run's counts in ~/.zn/reach-last.json for the next one; without it nothing is written.
+    if (a === '--remember') { remember = true; continue; }
+    if (a === '--json' || a === '--sarif') {
+      if (format !== 'text') return usage('choose one of --json and --sarif');
+      format = a.slice(2);
+      continue;
+    }
+    if (a === '--fail-on' || a.startsWith('--fail-on=')) {
+      const v = a === '--fail-on' ? rest[++i] : a.slice('--fail-on='.length);
+      if (!zr.FAIL_ON.includes(String(v).toLowerCase())) return usage('--fail-on must be one of ' + zr.FAIL_ON.join(', '));
+      failOn = String(v).toLowerCase();
+      continue;
+    }
+    if (a.startsWith('-') && a !== '-') return usage('unknown option ' + a);
+    if (target !== null) return usage('only one folder at a time');
+    target = a;
+  }
+  const root = path.resolve(target || '.');
+  let st = null;
+  try { st = fs.statSync(root); } catch (_) { st = null; }
+  if (!st || !st.isDirectory()) { process.stderr.write('zn-gate reach: ' + root + ' is not a folder\n'); return 2; }
+  process.env.ZN_STATS = 'off';
+  // A failure exits 2, never 1, so CI can tell it from findings that meet --fail-on.
+  let r;
+  try {
+    r = await zr.reach({ root, remember });
+  } catch (err) {
+    process.stderr.write('zn-gate reach: could not finish: ' + String((err && err.message) || err).slice(0, 300) + '\n');
+    return 2;
+  }
+  if (format === 'json') process.stdout.write(JSON.stringify(r, null, 2) + '\n');
+  else if (format === 'sarif') process.stdout.write(require('../lib/reach/sarif').toSarif(r, { toolVersion: VERSION }));
+  else zr.report(r);
+  return zr.failed(r, failOn) ? 1 : 0;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (args[0] === 'audit') {
     await runAuditCommand(args.slice(1));
+    return;
+  }
+  if (args[0] === 'reach') {
+    process.exitCode = await runReachCommand(args.slice(1));
     return;
   }
   // zn Team and the OpenTelemetry export of the audit log. exitCode (not

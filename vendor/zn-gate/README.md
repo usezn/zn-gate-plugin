@@ -18,7 +18,14 @@
 
 ## Install
 
-Everything runs on your machine; no account or API key is needed. You need Node.js 18 or later (the LTS version from [nodejs.org](https://nodejs.org/)). With an older Node.js, the `zn-gate` and `zn` commands stop and say how to install it.
+Everything runs on your machine; no account or API key is needed. You need Node.js 18 or later (the LTS version from [nodejs.org](https://nodejs.org/)). With an older Node.js, the `zn-gate` and `zn` commands stop and say how to install it. The Claude Code plugin needs Node.js 20.12 or later.
+
+**Getting started: four steps, one command each.** Run them in your own terminal.
+
+1. `npx -y zn-gate reach` shows what your coding agents can reach on this machine: secrets in your `.env` files (by name only), credential files and MCP servers. It is read only and sends nothing. Details in [docs/reach.md](https://github.com/usezn/zn/blob/main/docs/reach.md).
+2. `npx -y zn-gate init` sets up protection for the coding agents it finds, one step at a time, and asks before each change.
+3. `npx -y zn-gate check` tests that protection with a fake secret in a temporary folder. `init` runs it at the end too.
+4. `npx -y zn-gate env shadow .env` moves the real values of your `.env` into the local vault and leaves markers in the file. The first time, run `npx -y zn-gate unlock` to create the vault.
 
 **One command for the coding agents on your machine:**
 
