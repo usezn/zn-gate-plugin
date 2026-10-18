@@ -187,8 +187,12 @@ jobs:
           SOURCE: ${{ steps.meta.outputs.source }}
         run: |
           set -euo pipefail
+          # A release whose tag has the reusable build workflow is attested by it (SLSA Build Level 3);
+          # earlier releases by release.yml itself.
+          signer=release.yml
+          if git -C zn cat-file -e "refs/tags/v$VERSION:.github/workflows/build-release.yml" 2>/dev/null; then signer=build-release.yml; fi
           gh attestation verify "zn-gate-$VERSION.tgz" --repo usezn/zn \
-            --signer-workflow usezn/zn/.github/workflows/release.yml \
+            --signer-workflow "usezn/zn/.github/workflows/$signer" \
             --source-ref "refs/tags/v$VERSION" --format json > attestation.json
           # The package was built from a commit that the source commit contains.
           built="$(node -e "const a=JSON.parse(require('fs').readFileSync('attestation.json','utf8'));process.stdout.write(String(a[0].verificationResult.signature.certificate.sourceRepositoryDigest))")"
