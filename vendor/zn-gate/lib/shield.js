@@ -5,7 +5,9 @@ const readline = require('readline');
 // All shield inspections are local-only: tool arguments, tool descriptions and
 // tool results never leave the machine (see lib/client.js data-flow contract).
 const { analyzeLocal, checkToolResult } = require('./client');
-const { logEvidence } = require('./evidence');
+const evidence = require('./evidence');
+// The proxy waits at most half a second for the log lock, so a stuck lock never stalls requests for long.
+const logEvidence = (event) => evidence.logEvidence(event, undefined, { lockWaitMs: 500 });
 const pins = require('./mcp-pins');
 
 /**

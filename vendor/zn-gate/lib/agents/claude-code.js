@@ -37,6 +37,12 @@
  *    keeps the text out of the block message (it can still be in the local
  *    transcript and prompt history, which stay on this machine).
  *
+ *  UserPromptExpansion (read 2026-10-17): fires when a typed skill or command
+ *    expands into a prompt; input adds expansion_type, command_name,
+ *    command_args, command_source and prompt (the expanded text). It can block
+ *    ({decision: "block", reason}) but cannot rewrite the text. UserPromptSubmit
+ *    sees only what was typed, so this event is where the expansion is checked.
+ *
  *  Exit code 0 with JSON on stdout; any other non-2 code is a non-blocking
  *  error (the action proceeds), which is our fail-open behaviour.
  */
@@ -100,9 +106,11 @@ function normalize(raw) {
   const name = raw.hook_event_name;
   const event = name === 'PreToolUse' ? 'pre_tool'
     : name === 'PostToolUse' ? 'post_tool'
-      : name === 'UserPromptSubmit' ? 'user_prompt' : null;
+      : name === 'UserPromptSubmit' ? 'user_prompt'
+        : name === 'UserPromptExpansion' ? 'prompt_expansion' : null;
   const base = { event, cwd: raw.cwd || process.cwd(), sessionId: raw.session_id || null, raw };
   if (event === 'user_prompt') return { ...base, tool: null, input: { prompt: typeof raw.prompt === 'string' ? raw.prompt : '' }, output: undefined };
+  if (event === 'prompt_expansion') return { ...base, tool: null, input: { prompt: typeof raw.prompt === 'string' ? raw.prompt : '' }, output: undefined };
   if (!event) return base;
   const toolName = String(raw.tool_name || '');
   const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
@@ -193,6 +201,9 @@ function respondInner(d, ev) {
     }
     return null;
   }
+  if (ev.event === 'prompt_expansion') {
+    return d.decision === 'deny' ? { decision: 'block', reason: d.message || 'Blocked by zn' } : null;
+  }
   return null;
 }
 
@@ -267,6 +278,8 @@ function ourHooks(command) {
     // A prompt hook that cannot start or times out blocks the prompt
     // (Claude Code 2.1.295 and later; earlier versions ignore the field).
     UserPromptSubmit: { hooks: [{ ...h, onFailure: 'block' }] },
+    // A typed skill or command expands after UserPromptSubmit; this checks the expanded text.
+    UserPromptExpansion: { hooks: [{ ...h, onFailure: 'block' }] },
   };
 }
 

@@ -10,6 +10,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { colorEnabled } = require('../term');
 const { audit, AGENTS } = require('./index');
 const report = require('./report');
 
@@ -85,7 +86,7 @@ async function main(args, ioIn) {
       toolVersion,
       failOn: opts.failOn,
       displayRoot: opts.path || '.',
-      color: !opts.output && opts.format === 'text' && io.stdout.isTTY === true && !io.env.NO_COLOR,
+      color: !opts.output && opts.format === 'text' && colorEnabled(io.stdout, io.env),
     };
     const text = opts.format === 'json' ? report.toJson(result, meta) : opts.format === 'sarif' ? report.toSarif(result, meta) : report.toText(result, meta);
     if (opts.output) {

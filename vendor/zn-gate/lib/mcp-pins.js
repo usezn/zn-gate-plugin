@@ -227,7 +227,7 @@ function check(command, args, tools, session = {}) {
     session.corrupt = true;
   }
   if (!s || session.first) {
-    const base = s || { command: label(command, args), pinnedAt: now, tools: dict(), pending: dict() };
+    const base = s || { command: label(command, args), pinnedAt: now, firstPinnedAt: now, tools: dict(), pending: dict() };
     Object.assign(base.tools, current);
     saveServer(key, base);
     if (!s) session.first = true;
@@ -289,7 +289,7 @@ function list() {
   return servers().map((key) => {
     const s = loadServer(key);
     if (!s || s.corrupt) return { key, command: '(unreadable pins file)', pinnedAt: null, tools: 0, pending: [] };
-    return { key, command: s.command, pinnedAt: s.pinnedAt, tools: Object.keys(s.tools).length, pending: Object.keys(s.pending).map(displayName) };
+    return { key, command: s.command, pinnedAt: s.pinnedAt, firstPinnedAt: s.firstPinnedAt || null, tools: Object.keys(s.tools).length, pending: Object.keys(s.pending).map(displayName) };
   });
 }
 

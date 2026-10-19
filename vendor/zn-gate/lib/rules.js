@@ -5,10 +5,10 @@ const path = require('path');
 
 /**
  * zn deterministic rules engine - SINGLE SOURCE OF TRUTH.
- * RULES_VERSION: 2026-10-16.10
+ * RULES_VERSION: 2026-10-19.1
  */
 
-const RULES_VERSION = '2026-10-16.10';
+const RULES_VERSION = '2026-10-19.1';
 
 // Word boundaries are written as explicit ASCII lookarounds, not \b: JavaScript's
 // \b is ASCII-only without the u flag, while Python's is Unicode. A letter such
@@ -984,7 +984,47 @@ function mergeCandidates(cands) {
 // of what both find, so a secret split by a zero-width or tag character is
 // redacted whole. Texts without invisible characters are handled as before.
 function redactSecrets(text) {
-  return redactWith(text, SECRET_PATTERNS);
+  const first = redactWith(text, SECRET_PATTERNS);
+  if (typeof first.sanitized !== 'string' || !first.sanitized) return first;
+  const second = redactProviderFormats(first.sanitized);
+  if (second.detections.length === 0) return first;
+  return { sanitized: second.sanitized, detections: first.detections.concat(second.detections) };
+}
+
+// Scrubber secret types that count as provider formats, with the rule id the
+// Python package uses for the same format (its PROVIDER_SECRET_PATTERNS). The
+// other scrubber types are only redacted by the scrubber itself.
+const SCRUB_PROVIDER_RULES = new Map([
+  'GITLAB_TOKEN', 'SLACK_TOKEN', 'SLACK_WEBHOOK', 'DISCORD_WEBHOOK', 'STRIPE_KEY', 'STRIPE_WEBHOOK_SECRET',
+  'GOOGLE_API_KEY', 'GOOGLE_OAUTH_SECRET', 'HF_TOKEN', 'NPM_TOKEN', 'PYPI_TOKEN', 'SENDGRID_KEY', 'TWILIO_KEY',
+  'MAILGUN_KEY', 'SHOPIFY_TOKEN', 'DIGITALOCEAN_TOKEN', 'LINEAR_KEY', 'TELEGRAM_BOT_TOKEN', 'AZURE_STORAGE_KEY',
+  'DATABRICKS_TOKEN', 'VAULT_TOKEN', 'DOPPLER_TOKEN', 'NEWRELIC_KEY', 'GROQ_KEY', 'XAI_KEY', 'DOCKERHUB_PAT',
+  'ZN_API_KEY', 'TAVILY_KEY', 'FIRECRAWL_KEY', 'POLAR_TOKEN', 'REPLICATE_TOKEN', 'SUPABASE_PAT', 'AZURE_AD_CLIENT_SECRET',
+  'SQUARE_TOKEN', 'DISCORD_BOT_TOKEN',
+  'ONEPASSWORD_SA_TOKEN', 'AGE_SECRET_KEY', 'ALIBABA_KEY_ID', 'ARTIFACTORY_KEY', 'CLOUDFLARE_ORIGIN_CA_KEY', 'DYNATRACE_TOKEN', 'EASYPOST_KEY', 'FLYIO_TOKEN', 'GRAFANA_TOKEN', 'TERRAFORM_CLOUD_TOKEN', 'HEROKU_KEY_V2', 'NOTION_TOKEN', 'PERPLEXITY_KEY', 'PLANETSCALE_TOKEN', 'POSTMAN_KEY', 'PREFECT_KEY', 'PULUMI_TOKEN', 'README_KEY', 'RUBYGEMS_KEY', 'BREVO_KEY', 'SENTRY_USER_TOKEN', 'SHIPPO_KEY', 'OPENSHIFT_TOKEN', 'TEAMS_WEBHOOK',
+  'BEARER_TOKEN',
+].map((t) => [t, 'secret:' + t.toLowerCase()]).concat([
+  ['AWS_KEY', 'secret:aws_key_id'],
+  ['URL_PASSWORD', 'secret:url_password'],
+]));
+
+// The provider token formats of the scrubber engine (GitLab, Slack, Stripe,
+// Google, npm, ...), run on text the SECRET_PATTERNS already redacted. The
+// engine is required here, not at the top, because it requires this file.
+function redactProviderFormats(text) {
+  const spans = require('./scrub/engine').scan(text, { exact: false, pii: false })
+    .filter((s) => SCRUB_PROVIDER_RULES.has(s.type))
+    .sort((a, b) => a.start - b.start || b.end - a.end);
+  const detections = [];
+  let out = '';
+  let last = 0;
+  for (const s of spans) {
+    if (s.start < last) continue;
+    detections.push({ rule: SCRUB_PROVIDER_RULES.get(s.type), index: s.start });
+    out += text.slice(last, s.start) + `[REDACTED_${s.type}]`;
+    last = s.end;
+  }
+  return { sanitized: out + text.slice(last), detections };
 }
 
 // SCAN_SECRET_PATTERNS alone (`zn-gate scan` runs them last, on text that

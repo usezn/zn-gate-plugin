@@ -25,11 +25,14 @@ const path = require('path');
 const { startMcpServer } = require('../lib/mcp');
 const { startMcpShield } = require('../lib/shield');
 const { scanEnvironments, configureEnvironments } = require('../lib/init');
-const { logEvidence, verifyEvidenceLedger, getEvidenceStats, exportEvidenceLedger, startEvidenceUi, EVIDENCE_FILE } = require('../lib/evidence');
-const { analyze, analyzeLocal, isCloudEnabled, resolveEndpoint, RULES_VERSION } = require('../lib/client');
+const { logEvidence, verifyEvidenceLedger, getEvidenceStats, exportEvidenceLedger, startEvidenceUi, recoveryHint, EVIDENCE_FILE } = require('../lib/evidence');
+const { analyze, analyzeLocal, isCloudEnabled, resolveEndpoint, usesStoredKey, RULES_VERSION } = require('../lib/client');
 const { evaluate, redactSecrets, redactScanSecrets, redactScanRules, SECRET_PATTERNS } = require('../lib/rules');
 const { SCRUB_RULES_VERSION } = require('../lib/scrub/patterns');
 const { AUDIT_RULES_VERSION } = require('../lib/audit/rules');
+const { styles, sym, ruleLine } = require('../lib/term');
+// Colors are decided once per run: NO_COLOR, TERM=dumb or a stdout that is not a terminal turn them off.
+const col = styles(process.stdout, process.env);
 
 // Secrets that span several lines (a PEM private key block). The line-by-line
 // scan never sees BEGIN and END together, so these run on the whole file.
@@ -53,45 +56,14 @@ const KEY_FILE_NAMES = new Set(['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'i
 const BINARY_SNIFF = 8192;
 const SCAN_FORMATS = new Set(['text', 'json', 'github']);
 
-// Scrubber secret types that the scan reports, with the rule id the Python
-// package uses for the same format (its PROVIDER_SECRET_PATTERNS). The other
-// scrubber types are only redacted in the snippet.
-const SCRUB_SCAN_RULES = new Map([
-  'GITLAB_TOKEN', 'SLACK_TOKEN', 'SLACK_WEBHOOK', 'DISCORD_WEBHOOK', 'STRIPE_KEY', 'STRIPE_WEBHOOK_SECRET',
-  'GOOGLE_API_KEY', 'GOOGLE_OAUTH_SECRET', 'HF_TOKEN', 'NPM_TOKEN', 'PYPI_TOKEN', 'SENDGRID_KEY', 'TWILIO_KEY',
-  'MAILGUN_KEY', 'SHOPIFY_TOKEN', 'DIGITALOCEAN_TOKEN', 'LINEAR_KEY', 'TELEGRAM_BOT_TOKEN', 'AZURE_STORAGE_KEY',
-  'DATABRICKS_TOKEN', 'VAULT_TOKEN', 'DOPPLER_TOKEN', 'NEWRELIC_KEY', 'GROQ_KEY', 'XAI_KEY', 'DOCKERHUB_PAT',
-  'TAVILY_KEY', 'FIRECRAWL_KEY', 'POLAR_TOKEN', 'REPLICATE_TOKEN', 'SUPABASE_PAT', 'AZURE_AD_CLIENT_SECRET',
-  'SQUARE_TOKEN', 'DISCORD_BOT_TOKEN',
-  'ONEPASSWORD_SA_TOKEN', 'AGE_SECRET_KEY', 'ALIBABA_KEY_ID', 'ARTIFACTORY_KEY', 'CLOUDFLARE_ORIGIN_CA_KEY', 'DYNATRACE_TOKEN', 'EASYPOST_KEY', 'FLYIO_TOKEN', 'GRAFANA_TOKEN', 'TERRAFORM_CLOUD_TOKEN', 'HEROKU_KEY_V2', 'NOTION_TOKEN', 'PERPLEXITY_KEY', 'PLANETSCALE_TOKEN', 'POSTMAN_KEY', 'PREFECT_KEY', 'PULUMI_TOKEN', 'README_KEY', 'RUBYGEMS_KEY', 'BREVO_KEY', 'SENTRY_USER_TOKEN', 'SHIPPO_KEY', 'OPENSHIFT_TOKEN', 'TEAMS_WEBHOOK',
-  'BEARER_TOKEN',
-].map((t) => [t, 'secret:' + t.toLowerCase()]).concat([
-  ['AWS_KEY', 'secret:aws_key_id'],
-  ['URL_PASSWORD', 'secret:url_password'],
-  ['DB_PASSWORD', 'secret:url_password'],
-]));
-
 // Secrets in a line, as rule ids, in the order the Python package finds them:
-// the rules of lib/rules.js, then the scrubber formats above, then the
-// scan-only rules. Each step runs on the text the previous ones redacted, so
-// one value is reported once.
+// the rules of lib/rules.js and the scrubber provider formats (both done by
+// redactSecrets), then the scan-only rules. Each step runs on the text the
+// previous ones redacted, so one value is reported once.
 function scanSecretRules(line) {
   const first = redactSecrets(line);
   const rules = first.detections.map((d) => d.rule);
-  const text = first.sanitized;
-  const spans = require('../lib/scrub/engine').scan(text, { exact: false, pii: false })
-    .filter((s) => SCRUB_SCAN_RULES.has(s.type))
-    .sort((a, b) => a.start - b.start || b.end - a.end);
-  let rest = '';
-  let last = 0;
-  for (const s of spans) {
-    if (s.start < last) continue;
-    rules.push(SCRUB_SCAN_RULES.get(s.type));
-    rest += text.slice(last, s.start) + `[REDACTED_${s.type}]`;
-    last = s.end;
-  }
-  rest += text.slice(last);
-  for (const d of redactScanRules(rest).detections) rules.push(d.rule);
+  for (const d of redactScanRules(first.sanitized).detections) rules.push(d.rule);
   return rules;
 }
 
@@ -214,7 +186,7 @@ const TEST_VECTORS = [
 
 function printHelp() {
   process.stdout.write(`
-🛡️  zn-gate v${VERSION} - Zero-Trust Security Gate for AI Agents & MCP
+${sym(process.env, '🛡️', undefined, '  ')}zn-gate v${VERSION} - Zero-Trust Security Gate for AI Agents & MCP
 
 USAGE:
   zn-gate <command> [options]
@@ -235,6 +207,7 @@ COMMANDS:
   analyze <text>      Inspect a prompt from the CLI (local; cloud only with ZN_CLOUD=1 + key)
   test                Run the local self-test (51 curated vectors: 26 attacks, 25 benign)
   stats               What zn-gate did on this machine (local counts; --days N, --json; "stats share" to opt in)
+  report              Weekly report of what zn-gate did on this machine (--since Nd, --json, --no-team-line; nothing is sent)
   pins                Tool pins of the MCP servers that shield wraps ("pins approve <server>|--all" accepts changes)
   status              Show engine configuration and gateway connectivity
   version, -V         Show package version
@@ -257,6 +230,11 @@ SECRETS (values stay on this machine; agents only see __ZN_<NAME>__ markers):
                       (zn-gate init picks the right setup for each agent)
   check               Show that zn blocks your agent from reading a fake secret
                       (also: doctor). Safe: a temporary folder, nothing is sent
+  connect             Optional: turn on the cloud check for analyze_prompt. Opens usezn.com,
+                      you paste an analysis-only API key at a hidden prompt; it is kept in your system
+                      keychain or the zn vault, never in a file. Your own terminal only
+  disconnect          Remove that key from this computer, and ask whether to revoke it on
+                      usezn.com too (default no) [--revoke | --no-revoke]. Your own terminal only
   reach [path]        Show what your coding agents can reach: secrets (names only),
                       credential files, MCP servers [--json | --sarif]
                       [--fail-on high|medium|low|none] [--remember]. Read only, nothing is sent
@@ -265,7 +243,8 @@ SECRETS (values stay on this machine; agents only see __ZN_<NAME>__ markers):
 
 OPTIONS:
   --key <api_key>     API key for the optional cloud gate (or ZN_API_KEY). Used only
-                      by 'analyze' / analyze_prompt, and only if ZN_CLOUD=1 is set.
+                      by 'analyze' / analyze_prompt, and only if ZN_CLOUD=1 is set
+                      (or you ran zn-gate connect).
   --stage <v30|prod>  Cloud gateway stage (default: v30, the current production API)
   --url <custom_url>  Override gateway endpoint URL
   --local-only        Never use the cloud, even if ZN_CLOUD=1 is set
@@ -335,7 +314,7 @@ Learn more & documentation at https://usezn.com · GitHub: https://github.com/us
 
 async function runTestSuite(options) {
   process.stdout.write(`
-🛡️  Running zn-gate v${VERSION} Self-Test Suite
+${sym(process.env, '🛡️', undefined, '  ')}Running zn-gate v${VERSION} Self-Test Suite
 Engine: Local rules (the self-test never uses the network) · Rules: ${RULES_VERSION}
 Evaluating ${TEST_VECTORS.length} curated test vectors (${TEST_VECTORS.filter(v => v.type === 'attack').length} attacks + ${TEST_VECTORS.filter(v => v.type === 'benign').length} benign developer scenarios)...\n
 `);
@@ -361,9 +340,9 @@ Evaluating ${TEST_VECTORS.length} curated test vectors (${TEST_VECTORS.filter(v 
 
     if (isPass) {
       passed++;
-      const verdictTag = isBlock ? `\x1b[31mBLOCKED\x1b[0m` : (result.advisory ? `\x1b[33mADVISORY\x1b[0m` : `\x1b[32mALLOWED\x1b[0m`);
+      const verdictTag = isBlock ? col.red('BLOCKED') : (result.advisory ? col.yellow('ADVISORY') : col.green('ALLOWED'));
       const ruleDetail = result.reason ? `(${result.reason})` : (isBlock ? `(${result.rule})` : (result.advisory ? `(${result.advisory.reason})` : ''));
-      process.stdout.write(`  \x1b[32m✔\x1b[0m [${elapsedMs}ms] ${verdictTag} ${vec.label} \x1b[90m${ruleDetail}\x1b[0m\n`);
+      process.stdout.write(`  ${sym(process.env, '✔', col.green)}[${elapsedMs}ms] ${verdictTag} ${vec.label} ${col.gray(ruleDetail)}\n`);
     } else {
       failed++;
       if (vec.type === 'benign' && isBlock) {
@@ -371,18 +350,18 @@ Evaluating ${TEST_VECTORS.length} curated test vectors (${TEST_VECTORS.filter(v 
       }
       const expectedTag = vec.type === 'attack' ? 'BLOCK' : 'ALLOW';
       const gotTag = isBlock ? 'BLOCKED' : (result.advisory ? 'ADVISORY' : 'ALLOWED');
-      process.stdout.write(`  \x1b[31m✖\x1b[0m [${elapsedMs}ms] FAILED ${vec.label} (Expected: ${expectedTag}, Got: ${gotTag})\n`);
+      process.stdout.write(`  ${sym(process.env, '✖', col.red)}[${elapsedMs}ms] FAILED ${vec.label} (Expected: ${expectedTag}, Got: ${gotTag})\n`);
     }
   }
 
   const avgMs = (Number(totalTimeNs / BigInt(TEST_VECTORS.length)) / 1e6).toFixed(3);
   process.stdout.write(`
-─────────────────────────────────────────────────────────────────────────────
+${ruleLine(process.env, 77)}
 Summary         : ${passed}/${TEST_VECTORS.length} vectors passed (${((passed / TEST_VECTORS.length) * 100).toFixed(1)}%)
 False Positives : ${falsePositives} of ${TEST_VECTORS.filter(v => v.type === 'benign').length} curated benign vectors (not a general false-positive rate)
 Average Latency : ${avgMs} ms per decision
-Status          : ${failed === 0 ? '\x1b[32mALL TESTS PASSED (100%)\x1b[0m' : '\x1b[31mFAILURES DETECTED\x1b[0m'}
-─────────────────────────────────────────────────────────────────────────────\n
+Status          : ${failed === 0 ? col.green('ALL TESTS PASSED (100%)') : col.red('FAILURES DETECTED')}
+${ruleLine(process.env, 77)}\n
 `);
 
   if (failed > 0) {
@@ -471,7 +450,7 @@ async function handleScan(targetPath, options) {
 
   const files = scanDirectory(resolved, options.includeCode, options);
   if (format === 'text') process.stdout.write(`
-🛡️  zn-gate Static Security Audit
+${sym(process.env, '🛡️', undefined, '  ')}zn-gate Static Security Audit
 Target  : ${resolved}
 Scope   : ${options.includeCode ? 'All files (prompts + code)' : 'Prompt templates, docs, configs (use --code to scan source)'}
 Files   : ${files.length} file(s) queued for audit\n
@@ -621,9 +600,9 @@ Files   : ${files.length} file(s) queued for audit\n
     process.stdout.write(`Findings (${findings.length}):\n`);
     for (const f of findings) {
       const label = f.type === 'secret_leak' ? 'Secret found' : 'Threat';
-      process.stdout.write(`  \x1b[31m✖\x1b[0m ${f.file}:${f.line} ${label}\n`);
-      process.stdout.write(`    \x1b[90mRule:\x1b[0m ${f.rule} (${f.reason || 'Security threat detected'})\n`);
-      process.stdout.write(`    \x1b[90mLine:\x1b[0m ${f.sample}\n`);
+      process.stdout.write(`  ${sym(process.env, '✖', col.red)}${f.file}:${f.line} ${label}\n`);
+      process.stdout.write(`    ${col.gray('Rule:')} ${f.rule} (${f.reason || 'Security threat detected'})\n`);
+      process.stdout.write(`    ${col.gray('Line:')} ${f.sample}\n`);
       if (f.next_step) process.stdout.write(`    ${f.next_step}\n`);
       process.stdout.write('\n');
     }
@@ -636,12 +615,12 @@ Files   : ${files.length} file(s) queued for audit\n
   if (totalThreats) status = 'Review and neutralize detected vectors';
   else if (totalSecrets) status = 'Move the secrets out of these files (see "Next" for each one)';
   process.stdout.write(`
-─────────────────────────────────────────────────────────────────────────────
-Audit Result : ${totalFindings === 0 ? '\x1b[32mPASSED - NO THREATS DETECTED\x1b[0m' : `\x1b[31mFAILED - ${resultParts.join(', ')}\x1b[0m`}
+${ruleLine(process.env, 77)}
+Audit Result : ${totalFindings === 0 ? col.green('PASSED - NO THREATS DETECTED') : col.red(`FAILED - ${resultParts.join(', ')}`)}
 Files Scanned: ${files.length - notRead}
 Files Skipped: ${files.skipped.length}${files.skipped.length ? ' (not read: see below)' : ''}
 Status       : ${status}
-─────────────────────────────────────────────────────────────────────────────\n
+${ruleLine(process.env, 77)}\n
 `);
   if (files.skipped.length) {
     process.stdout.write(`Not scanned (${files.skipped.length}):\n`);
@@ -860,8 +839,8 @@ async function main() {
 
   if (command === 'init') {
     process.stdout.write(`
-🛡️  zn-gate init - Zero-Touch MCP Auto-Discovery & Shielding
-────────────────────────────────────────────────────────────\n`);
+${sym(process.env, '🛡️', undefined, '  ')}zn-gate init - Zero-Touch MCP Auto-Discovery & Shielding
+${ruleLine(process.env, 60)}\n`);
     const { scanned, actions } = configureEnvironments({
       dryRun: options.dryRun,
       shadow: options.shadow,
@@ -869,22 +848,22 @@ async function main() {
     });
 
     for (const act of actions) {
-      const mark = act.status === 'error' ? '\x1b[31m✖\x1b[0m' : act.status === 'manual_required' ? '\x1b[33m!\x1b[0m' : '\x1b[32m✔\x1b[0m';
-      process.stdout.write(`  ${mark} ${act.env.padEnd(20)} [${act.status}] ${act.serversCount ? act.serversCount + ' servers' : ''}${act.shadow ? ' (shadow mode)' : ''}\n`);
+      const mark = act.status === 'error' ? sym(process.env, '✖', col.red) : act.status === 'manual_required' ? sym(process.env, '!', col.yellow) : sym(process.env, '✔', col.green);
+      process.stdout.write(`  ${mark}${act.env.padEnd(20)} [${act.status}] ${act.serversCount ? act.serversCount + ' servers' : ''}${act.shadow ? ' (shadow mode)' : ''}\n`);
       if (act.backup) {
-        process.stdout.write(`    \x1b[90m↳ backup: ${act.backup}\x1b[0m\n`);
+        process.stdout.write(`    ${sym(process.env, '↳', col.gray)}${col.gray('backup: ' + act.backup)}\n`);
       }
       if (act.error) {
-        process.stdout.write(`    \x1b[33m↳ ${act.error}\x1b[0m\n`);
+        process.stdout.write(`    ${sym(process.env, '↳', col.yellow)}${col.yellow(act.error)}\n`);
       }
       for (const m of act.manual || []) {
-        process.stdout.write(`    \x1b[33m↳ wrap manually: ${m}\x1b[0m\n`);
+        process.stdout.write(`    ${sym(process.env, '↳', col.yellow)}${col.yellow('wrap manually: ' + m)}\n`);
       }
     }
 
     const notFound = scanned.filter(e => !e.exists);
     for (const nf of notFound) {
-      process.stdout.write(`  \x1b[90m○\x1b[0m ${nf.name.padEnd(20)} [Not installed/configured]\n`);
+      process.stdout.write(`  ${sym(process.env, '○', col.gray)}${nf.name.padEnd(20)} [Not installed/configured]\n`);
     }
 
     const totalModified = actions.filter(a => a.status === 'shielded' || a.status === 'reverted').length;
@@ -902,6 +881,7 @@ async function main() {
     if (command === 'export' || options.export) {
       const format = (options.format || 'jsonl').toLowerCase();
       const res = exportEvidenceLedger(EVIDENCE_FILE, format);
+      if (!res.valid) process.stderr.write(`Tamper detected: ${res.error}\n${recoveryHint()}\n`);
       if (options.output) {
         fs.writeFileSync(options.output, res.content, 'utf8');
         process.stdout.write(`Exported ${res.total} audit records to ${options.output} (Integrity: ${res.valid ? 'VALID' : 'TAMPERED'}).\n`);
@@ -919,13 +899,13 @@ async function main() {
     if (options.verify) {
       const verification = verifyEvidenceLedger();
       process.stdout.write(`
-🔒 Cryptographic Evidence Ledger Verification:
+${sym(process.env, '🔒')}Cryptographic Evidence Ledger Verification:
   Ledger Path   : ${EVIDENCE_FILE}
   Total Records : ${verification.total}
-  Integrity     : ${verification.valid ? '\x1b[32m✔ ALL SHA-256 HASHES VERIFIED (IMMUTABLE)\x1b[0m' : '\x1b[31m✖ TAMPER DETECTED AT RECORD ' + verification.broken_index + '\x1b[0m'}
+  Integrity     : ${verification.valid ? sym(process.env, '✔', col.green) + col.green('ALL SHA-256 HASHES VERIFIED (IMMUTABLE)') : sym(process.env, '✖', col.red) + col.red('TAMPER DETECTED AT RECORD ' + verification.broken_index)}
 \n`);
       if (!verification.valid) {
-        process.stdout.write(`  Details: ${verification.error}\n\n`);
+        process.stdout.write(`  Details: ${verification.error}\n  ${recoveryHint()}\n\n`);
         process.exit(1);
       }
       return;
@@ -933,14 +913,14 @@ async function main() {
 
     const stats = getEvidenceStats();
     process.stdout.write(`
-🛡️  zn Evidence Ledger Stats (${EVIDENCE_FILE})
-───────────────────────────────────────────────────
+${sym(process.env, '🛡️', undefined, '  ')}zn Evidence Ledger Stats (${EVIDENCE_FILE})
+${ruleLine(process.env, 51)}
   Total Events  : ${stats.total}
   Blocked Drops : ${stats.blocks}
   Allowed Passes: ${stats.allows}
   Shadow Alerts : ${stats.shadows || 0}
-  Integrity     : ${stats.valid ? '\x1b[32mVALID\x1b[0m' : '\x1b[31mCORRUPTED\x1b[0m'}
-───────────────────────────────────────────────────
+  Integrity     : ${stats.valid ? col.green('VALID') : col.red('CORRUPTED')}${stats.valid ? '' : '\n  Details       : ' + stats.error + '\n  Recovery      : ' + recoveryHint()}
+${ruleLine(process.env, 51)}
 Recent Events (last ${Math.min(options.tail, stats.total)}):
 `);
     if (!stats.recent || stats.recent.length === 0) {
@@ -948,7 +928,7 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
     } else {
       for (const rec of stats.recent.slice(-options.tail)) {
         const isBlock = rec.verdict === 'block';
-        const vTag = isBlock ? '\x1b[31mBLOCK\x1b[0m' : (rec.verdict === 'shadow' ? '\x1b[33mSHADOW\x1b[0m' : '\x1b[32mALLOW\x1b[0m');
+        const vTag = isBlock ? col.red('BLOCK') : (rec.verdict === 'shadow' ? col.yellow('SHADOW') : col.green('ALLOW'));
         process.stdout.write(`  ${(rec.timestamp || '').slice(11, 19)} [${vTag}] tool=${rec.tool_name || 'call'} rule=${rec.rule || 'none'} hash=${(rec.record_hash || '').slice(0, 10)}...\n`);
       }
       process.stdout.write(`\nTip: Run 'zn-gate evidence --ui' to open interactive dashboard.\n\n`);
@@ -997,8 +977,18 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
     return;
   }
 
+  if (command === 'report') {
+    process.exitCode = require('../lib/report').run(args.slice(1));
+    return;
+  }
+
   if (command === 'stats') {
     process.exitCode = await require('../lib/stats-cli').run(args.slice(1));
+    return;
+  }
+
+  if (command === 'connect' || command === 'disconnect') {
+    process.exitCode = await require('../lib/connect-cli')[command](args.slice(1));
     return;
   }
 
@@ -1022,15 +1012,20 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
   }
 
   if (command === 'status') {
-    const hasKey = Boolean(require('../lib/client').usableApiKey(options.apiKey));
+    const cloudKey = require('../lib/cloud-key');
+    const found = await cloudKey.resolveApiKey(options);
+    const marker = cloudKey.readMarker();
+    const hasKey = Boolean(found);
     const cloud = isCloudEnabled(options);
+    const keyWhere = found ? ({ environment: 'ZN_API_KEY', flag: '--key', keychain: 'saved by zn-gate connect, in your system keychain', vault: 'saved by zn-gate connect, in the zn vault' })[found.source] : null;
     process.stdout.write(`
-🛡️  zn-gate Status:
+${sym(process.env, '🛡️', undefined, '  ')}zn-gate Status:
   Package Version : ${VERSION}
   Rules Version   : ${RULES_VERSION} (scrub ${SCRUB_RULES_VERSION}, audit ${AUDIT_RULES_VERSION})
   Active Engine   : ${cloud ? 'Local rules + cloud for analyze_prompt (ZN_CLOUD=1)' : 'Local rules only'}
-  Endpoint        : ${cloud ? resolveEndpoint(options) : 'None (nothing leaves this machine)'}
-  API key         : ${hasKey ? 'Set' + (cloud ? '' : ' (unused: cloud requires ZN_CLOUD=1)') : 'Not set'}
+  Endpoint        : ${cloud ? resolveEndpoint(options, { stored: usesStoredKey(options) }) : 'None (nothing leaves this machine)'}
+  API key         : ${hasKey ? 'Set (' + keyWhere + ')' + (cloud ? '' : ' (unused: cloud requires ZN_CLOUD=1)') : 'Not set'}${marker ? `
+  Connected       : yes, key ...${marker.last4 || '????'}${hasKey ? '' : ' (not found in ' + (marker.store === 'vault' ? 'the zn vault: run zn unlock' : 'your system keychain') + '; cloud check falls back to local rules)'}. Turn off: zn-gate disconnect` : ''}
   Leaves machine  : ${cloud ? 'analyze_prompt text only, secrets redacted locally first' : 'Nothing'}
 
 `);

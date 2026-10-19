@@ -18,12 +18,23 @@ try {
  *  - The only code path that can reach the network is analyze() — the
  *    prompt-analysis API used by the `analyze_prompt` MCP tool and the
  *    `zn-gate analyze` CLI command — and only when BOTH ZN_API_KEY and
- *    ZN_CLOUD=1 are set (and ZN_LOCAL_ONLY is not "true"). Secrets are
- *    redacted locally with redactSecrets() before the request is built.
+ *    ZN_CLOUD=1 are set, or the user ran `zn-gate connect` (and
+ *    ZN_LOCAL_ONLY is not "true"). Secrets are redacted locally with
+ *    redactSecrets() before the request is built. `connect` and `disconnect`
+ *    (lib/connect-cli.js) are the only other code that contacts the network
+ *    here, only on the person's command, and only to https://api.usezn.com.
  */
 
-function resolveEndpoint(options = {}) {
-  if (options.apiUrl || process.env.ZN_API_URL) {
+const FIXED_API_ORIGIN = 'https://api.usezn.com';
+
+/**
+ * The gateway URL. A key that `zn-gate connect` stored (keychain or vault) is
+ * only ever sent to https://api.usezn.com: --url and ZN_API_URL are ignored
+ * for it (`stored: true`). A custom URL works only with a key the caller gave
+ * explicitly (--key or ZN_API_KEY).
+ */
+function resolveEndpoint(options = {}, { stored = false } = {}) {
+  if (!stored && (options.apiUrl || process.env.ZN_API_URL)) {
     return options.apiUrl || process.env.ZN_API_URL;
   }
   const stage = options.stage || process.env.ZN_STAGE || 'v30';
@@ -33,28 +44,44 @@ function resolveEndpoint(options = {}) {
   return 'https://api.usezn.com/v30/analyze';
 }
 
+const cloudKey = require('./cloud-key');
+const { usableApiKey } = cloudKey;
+
 /**
- * The API key to use, or null. zn keys and tokens are letters, digits, `_`,
- * `-` and `.` only; anything else counts as unset: blank, too short, or a
- * placeholder a launcher did not expand (for example a plugin option left
- * empty, `${user_config.api_key}`, or `%ZN_API_KEY%`). Sending text to the
- * cloud with such a value would only get a 401.
+ * True only when the user explicitly opted in to cloud prompt analysis, and
+ * not under a local-only override. Two ways to opt in:
+ *   - an API key in ZN_API_KEY / --key AND ZN_CLOUD=1 (a key alone enables nothing);
+ *   - `zn-gate connect`, which stores the key in the system keychain or the
+ *     zn vault and leaves a marker (no key) in ~/.zn/config.json.
+ * This check reads one small file at most; it never touches the keychain.
+ * analyze() then looks the key up and falls back to local rules without one.
  */
-function usableApiKey(value) {
-  if (typeof value !== 'string') return null;
-  const k = value.trim();
-  return /^[A-Za-z0-9._-]{16,256}$/.test(k) ? k : null;
+function isCloudEnabled(options = {}) {
+  const forceLocal = Boolean(options.localOnly) || process.env.ZN_LOCAL_ONLY === 'true';
+  if (forceLocal) return false;
+  if (explicitOptIn(options)) return true;
+  return cloudKey.isConnected();
+}
+
+/** A usable key from --key / ZN_API_KEY together with ZN_CLOUD=1: the person's own, explicit opt-in. */
+function explicitOptIn(options = {}) {
+  return Boolean(usableApiKey(options.apiKey || process.env.ZN_API_KEY)) && process.env.ZN_CLOUD === '1';
 }
 
 /**
- * True only when the user explicitly opted in to cloud prompt analysis:
- * an API key AND ZN_CLOUD=1, and no local-only override.
+ * True when the key analyze() would use is the one `connect` stored: the cloud is on because of the marker
+ * and not because of an explicit key plus ZN_CLOUD=1. A key in ZN_API_KEY or --key never takes part in that
+ * case, so a marker written by hand cannot make zn-gate send text with an environment key or to another URL.
  */
-function isCloudEnabled(options = {}) {
-  const apiKey = usableApiKey(options.apiKey || process.env.ZN_API_KEY);
-  const optedIn = process.env.ZN_CLOUD === '1';
-  const forceLocal = Boolean(options.localOnly) || process.env.ZN_LOCAL_ONLY === 'true';
-  return Boolean(apiKey) && optedIn && !forceLocal;
+function usesStoredKey(options = {}) {
+  return !explicitOptIn(options) && cloudKey.isConnected();
+}
+
+let notedNoStoredKey = false;
+function noteNoStoredKey() {
+  if (notedNoStoredKey) return;
+  notedNoStoredKey = true;
+  try { process.stderr.write('[zn-gate] Connected, but the saved key is not readable (or does not match the marker), so prompts are checked locally only. Run zn-gate status.\n'); } catch (_) { /* no stderr */ }
 }
 
 /*
@@ -92,6 +119,8 @@ function analyzeCloud(input, apiKey, endpointUrl, timeoutMs = 4000, extra = {}) 
           'User-Agent': `zn-gate/${PKG_VERSION} (mcp-client)`,
         },
         timeout: timeoutMs,
+        // Always verify the certificate: NODE_TLS_REJECT_UNAUTHORIZED=0 must not let the key travel unverified.
+        ...(isHttps ? { rejectUnauthorized: true } : {}),
       },
       (res) => {
         let body = '';
@@ -137,7 +166,7 @@ function analyzeLocal(input, options = {}) {
 
 /**
  * Prompt analysis. Local rules first; optional cloud second opinion only when
- * the user opted in (ZN_API_KEY + ZN_CLOUD=1). The text is secret-redacted
+ * the user opted in (ZN_API_KEY + ZN_CLOUD=1, or `zn-gate connect`). The text is secret-redacted
  * locally before it is sent.
  */
 async function analyze(input, options = {}) {
@@ -156,9 +185,29 @@ async function analyze(input, options = {}) {
     };
   }
 
-  const apiKey = usableApiKey(options.apiKey || process.env.ZN_API_KEY);
+  // Only the marker turns the cloud on: use the key `connect` stored, never ZN_API_KEY or --key.
+  const markerOnly = !explicitOptIn(options);
+  const found = markerOnly
+    ? await cloudKey.loadStoredKey().then((s) => (s ? { key: s.key, source: s.store } : null))
+    : await cloudKey.resolveApiKey(options);
+  if (!found) {
+    // Connected, but the key is not readable now (empty keychain, vault locked, marker not matching): local rules only.
+    if (markerOnly) noteNoStoredKey();
+    return { ...local, mode: 'oss-local', fallback: true, cloud_error: 'no API key available (run zn-gate status)' };
+  }
+  const apiKey = found.key;
   const { sanitized, detections } = redactSecrets(typeof input === 'string' ? input : String(input ?? ''));
-  const endpoint = resolveEndpoint(options);
+  const storedKey = found.source === 'keychain' || found.source === 'vault';
+  const tlsWhy = storedKey ? cloudKey.tlsRefusal() : null;
+  if (tlsWhy) {
+    // The saved key is never sent over a connection that is not checked against the system's authorities.
+    return { ...local, mode: 'oss-local', fallback: true, cloud_error: tlsWhy };
+  }
+  const endpoint = resolveEndpoint(options, { stored: storedKey });
+  if (storedKey && endpoint.indexOf(FIXED_API_ORIGIN + '/') !== 0) {
+    return { ...local, mode: 'oss-local', fallback: true, cloud_error: 'the saved key is only sent to ' + FIXED_API_ORIGIN };
+  }
+  const urlIgnored = storedKey && Boolean(options.apiUrl || process.env.ZN_API_URL);
   const windows = longInputMode(options) === 'windows' && sanitized.length > LONG_INPUT_MIN_CHARS;
   try {
     const cloudRes = await analyzeCloud(sanitized, apiKey, endpoint,
@@ -168,6 +217,7 @@ async function analyze(input, options = {}) {
       mode: 'hybrid-cloud',
       secrets_redacted_before_upload: detections.length,
     };
+    if (urlIgnored) out.note = 'The saved key is only sent to api.usezn.com, so the custom URL was ignored. Use --key or ZN_API_KEY to send to another URL.';
     if (cloudRes.long_input && cloudRes.long_input.capped) {
       out.warning = 'The text is longer than the cloud gate checks (' + cloudRes.long_input.windows + ' windows of 512 tokens): the end was not analyzed.';
     } else if (windows && cloudRes.long_input && cloudRes.long_input.mode === 'truncate') {
@@ -223,6 +273,7 @@ module.exports = {
   longInputMode,
   LONG_INPUT_MIN_CHARS,
   resolveEndpoint,
+  usesStoredKey,
   evaluate,
   RULES_VERSION,
 };

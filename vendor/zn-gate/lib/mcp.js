@@ -1,7 +1,7 @@
 'use strict';
 
 const readline = require('readline');
-const { analyze, analyzeLocal, checkToolResult, isCloudEnabled, RULES_VERSION, resolveEndpoint } = require('./client');
+const { analyze, analyzeLocal, checkToolResult, isCloudEnabled, RULES_VERSION, resolveEndpoint, usesStoredKey } = require('./client');
 const { sanitizeToolResult } = require('./rules');
 
 const SERVER_NAME = 'zn-gate';
@@ -39,7 +39,7 @@ const TOOLS = [
   {
     name: 'analyze_prompt',
     annotations: { title: 'Check text for prompt injection', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    description: 'Analyze text, prompt, or agent messages for security threats (prompt injection, jailbreak, credential exfiltration, role hijacking). Runs locally; only if the user set ZN_CLOUD=1 and ZN_API_KEY is the text, with secrets redacted, also sent to the zn cloud gate. Returns threat assessment, confidence score, and matched rule.',
+    description: 'Analyze text, prompt, or agent messages for security threats (prompt injection, jailbreak, credential exfiltration, role hijacking). Runs locally; only if the user opted in (ZN_CLOUD=1 with ZN_API_KEY, or zn-gate connect) is the text, with secrets redacted, also sent to the zn cloud gate. Returns threat assessment, confidence score, and matched rule.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -251,7 +251,7 @@ async function handleRequest(message, options) {
         const status = {
           package: `${SERVER_NAME}@${SERVER_VERSION}`,
           engine: cloud ? 'local-rules + cloud (analyze_prompt only)' : 'local-rules',
-          endpoint: cloud ? resolveEndpoint(options) : 'none (local only)',
+          endpoint: cloud ? resolveEndpoint(options, { stored: usesStoredKey(options) }) : 'none (local only)',
           rules_version: RULES_VERSION,
           cloud_enabled: cloud,
           leaves_machine: cloud

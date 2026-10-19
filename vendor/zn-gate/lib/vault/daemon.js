@@ -52,6 +52,8 @@ const NAME_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const TOKEN_RE = /^__ZN_([A-Z0-9](?:[A-Z0-9_]*[A-Z0-9])?)__$/;
 const HOST_RE = /^(?:\*\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*(?::\d{1,5})?$/;
 const COMMAND_RE = /^[A-Za-z0-9_.+\-/ *]{1,128}$/;
+const CLOUD_KEY_SECRET = 'ZN_CLOUD_API_KEY';
+const CLOUD_KEY_PURPOSE = 'zn-cloud-key';
 const DENIED_RESOLVE = new Set(['bash_network', 'mcp_input', 'write_tracked']);
 /* What this vault does beyond the protocol. resolve-policy: resolve() with
  * {withPolicy: true} applies the organization policy and answers
@@ -320,6 +322,13 @@ function makeOps(state, ctl) {
       if (o.destination && DENIED_RESOLVE.has(o.destination)) {
         await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'deny', reason: 'policy:' + o.destination });
         throw znError(CODES.POLICY_DENIED, 'destination ' + o.destination + ' does not receive real values. Next step: send the request to a host this secret is allowed for, or use a placeholder instead.');
+      }
+      // The key `zn-gate connect` keeps here is not handed to hooks, the secrets broker or zn run, so writing its marker
+      // in a file or a command never gets the real key back. A program running as the user can still ask for it.
+      if (inner === CLOUD_KEY_SECRET && o.purpose !== CLOUD_KEY_PURPOSE) {
+        await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'deny', reason: 'policy:zn_cloud_key' });
+        if (o.withPolicy === true) return { value: null, policy: RESOLVE_POLICY_VERSION };
+        throw znError(CODES.POLICY_DENIED, 'this secret is the key of zn-gate connect and is never put into a file or a command. Next step: ask the user to run zn-gate disconnect if it should stop working.');
       }
       let value = null;
       let org = null;
