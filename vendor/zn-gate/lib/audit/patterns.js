@@ -222,7 +222,7 @@ function classifyEnv(key, value) {
   const up = k.toUpperCase();
   if (CONFIG_DIR_ENV.has(up)) return { kind: 'confdir' };
   if (CODE_ENV.has(up)) {
-    if (up === 'NODE_OPTIONS' && !/(?:^|\s)(?:-r|--require|--import|--loader|--experimental-loader|--experimental-policy)\b/.test(v)) return null;
+    if (up === 'NODE_OPTIONS' && !/(?:^|\s)(?:-r|--require|--import|--loader|--experimental[-_]loader|--experimental[-_]policy)\b/.test(v)) return null;
     if ((up === 'NODE_TLS_REJECT_UNAUTHORIZED' || up === 'PYTHONHTTPSVERIFY') && v.trim() !== '0') return null;
     if (up === 'GIT_SSL_NO_VERIFY' && !/^(?:1|true|yes)$/i.test(v.trim())) return null;
     return { kind: 'code' };

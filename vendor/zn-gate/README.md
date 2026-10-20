@@ -33,9 +33,24 @@ Everything runs on your machine; no account or API key is needed. You need Node.
 npx -y zn-gate init
 ```
 
-It finds Claude Code, Codex CLI, Cursor and OpenCode, shows the setup for each one that is not protected yet (the zn-gate plugin for Claude Code, zn's hooks for the others), runs each step after you confirm it, and ends with `zn-gate check`. Run it yourself in your own terminal: when an AI agent or a script runs it, it only prints the steps.
+`init` does this:
+
+- It finds Claude Code, Codex CLI, Cursor and OpenCode on your machine.
+- For each one that is not protected yet, it shows the setup: the zn-gate plugin for Claude Code (or zn's hooks when your Node.js is older than 20.12), and zn's hooks for the others.
+- It runs each step only after you confirm it.
+- It ends with `zn-gate check`.
+
+Run it yourself, in your own terminal. When an AI agent or a script runs it, it only prints the steps.
 
 > **Windows PowerShell:** `npm` and `npx` can fail with "running scripts is disabled on this system", because the default execution policy blocks `npm.ps1`. Use `npm.cmd`, `npx.cmd` and `zn.cmd` instead (for example `npm.cmd install -g zn-gate`), run the commands from Command Prompt, or allow local scripts for your account with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+**If something fails:**
+
+- `npx: command not found`, or a message about the Node.js version: install the LTS version of [Node.js](https://nodejs.org/), open a new terminal and run the command again.
+- "running scripts is disabled on this system" on Windows: see the PowerShell note above.
+- `init` only prints steps and changes nothing: an AI agent or a script ran it. Run it yourself in your own terminal.
+- `check` shows **NOT protected**: that line says why and what to run. [What the output means](https://github.com/usezn/zn/blob/main/docs/check.md).
+- You want to undo what `init` changed: `npx -y zn-gate init --revert`.
 
 **Then keep your `.env` values in the vault.** With the plugin or the hooks, the agent cannot read `.env` files with real values; move them into zn-gate's encrypted vault, and the file keeps markers such as `__ZN_STRIPE_KEY__`:
 
@@ -46,14 +61,14 @@ npx -y zn-gate env shadow .env
 
 After this, your own app also reads the markers in `.env`: start it with zn-gate's `run` command once you allow it ([docs/secrets.md](https://github.com/usezn/zn/blob/main/docs/secrets.md)). `env shadow` tells you how to undo it.
 
-Five-minute walkthrough: [docs/secrets.md](https://github.com/usezn/zn/blob/main/docs/secrets.md). Limits: [docs/threat-model.md](https://github.com/usezn/zn/blob/main/docs/threat-model.md).
+Five-minute walkthrough: [docs/secrets.md](https://github.com/usezn/zn/blob/main/docs/secrets.md). Limits: [docs/threat-model.md](https://github.com/usezn/zn/blob/main/docs/threat-model.md). Words you do not know: [glossary](https://github.com/usezn/zn/blob/main/docs/glossary.md).
 
 <details>
 <summary><strong>Other ways to install</strong>: one agent at a time, other editors, Python, MCP server only</summary>
 
 **One agent at a time** (the same steps `init` runs):
 
-**Claude Code: the plugin.** You also need Git and Claude Code 2.1.295 or later.
+**Claude Code: the plugin.** You also need Git and Claude Code 2.1.295 or later. The plugin needs Node.js 20.12 or later. With an older Node.js, `npx -y zn-gate init` skips the plugin and sets up zn's hooks for Claude Code instead (`zn-gate check` says so if the plugin is installed); update Node.js to use the plugin.
 
 ```bash
 claude plugin marketplace add usezn/zn
@@ -123,6 +138,22 @@ npx -y zn-gate shield -- uvx mcp-server-fetch
 
 ---
 
+## See what zn-gate did
+
+```bash
+npx -y zn-gate report
+```
+
+A short summary of the last 7 days on this computer: blocked actions, secrets hidden, new protected MCP servers and tool changes waiting for your approval. It reads only local files, needs no account and sends nothing. `--since 30d` changes the period, `--json` prints it for scripts. [What it shows](https://github.com/usezn/zn/blob/main/docs/report.md).
+
+## Turn on the optional cloud check
+
+```bash
+npx -y zn-gate connect
+```
+
+Optional, and you do it yourself in your own terminal (an agent cannot). It opens usezn.com so you can create an analysis-only API key (it cannot read your usage or manage keys), then asks you to paste it at a hidden prompt. A full-access key is refused. The key is kept in your system keychain (or the zn vault when there is no keychain), never written to a file, and zn's hooks refuse the direct ways for your agent to read it. After that, the text you or your agent send through `analyze_prompt`, with detected secrets removed first, is also checked by the Galvanize 2 classifier at usezn.com. Until you run it, nothing is sent. `zn-gate disconnect` removes the key from this computer and asks whether to revoke it on usezn.com too (default no). [How it works](https://github.com/usezn/zn/blob/main/docs/connect.md).
+
 ## Check that it works
 
 ```bash
@@ -183,9 +214,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"c
 | Tool-call arguments (`check_tool_call`, `shield`) | Locally | **Never**, in any configuration |
 | MCP tool and parameter descriptions (`shield`) | Locally | **Never**, in any configuration |
 | Counts of what zn-gate did (`zn-gate stats`: checks, blocks, secrets replaced, per secret type) | Written locally to `~/.zn/stats.json` | **Never**, unless you turn on `zn-gate stats share on`: then one report a day with a random installation id, the day, the zn-gate, OS and Node.js versions, the agent and part of zn-gate used most, and the number of secrets found per built-in type (never values, prompts, variable or secret names, paths, hosts or emails). `zn-gate stats share show` shows it first. |
-| Prompts (`analyze_prompt`, `zn-gate analyze`) | Locally | Only if you set **both** `ZN_CLOUD=1` and `ZN_API_KEY`. Secrets are redacted locally before sending. |
+| Prompts (`analyze_prompt`, `zn-gate analyze`) | Locally | Only if you set **both** `ZN_CLOUD=1` and `ZN_API_KEY`, or run `zn-gate connect` yourself. Secrets are redacted locally before sending. |
 
-`ZN_API_KEY` alone enables nothing. `ZN_LOCAL_ONLY=true` (or `--local-only`) overrides `ZN_CLOUD=1`. `npx -y zn-gate status` prints what your configuration sends. Data-flow diagrams: [repository README](https://github.com/usezn/zn#what-leaves-your-machine).
+`ZN_API_KEY` alone enables nothing. `zn-gate connect` is the other way to opt in: you run it, in your own terminal, and it keeps the key in your system keychain or the zn vault, never in a file (`zn-gate disconnect` undoes it and can revoke the key on usezn.com when you say yes; [details](https://github.com/usezn/zn/blob/main/docs/connect.md)). `ZN_LOCAL_ONLY=true` (or `--local-only`) overrides `ZN_CLOUD=1` and a connected key. `npx -y zn-gate status` shows the active detection engine and whether the optional cloud check is on. Sharing of usage statistics is off by default and has its own status: `npx -y zn-gate stats share status`. Data-flow diagrams: [repository README](https://github.com/usezn/zn#what-leaves-your-machine).
 
 > **1.4.0 and earlier:** with `ZN_API_KEY` set, tool output and tool-call arguments not blocked locally were sent to `api.usezn.com` without redaction. 1.4.1 removes that path. See the [CHANGELOG](https://github.com/usezn/zn/blob/main/CHANGELOG.md).
 
@@ -218,11 +249,12 @@ The local engine is a deterministic signature and normalization layer. It is fas
 ## Configuration
 
 - `ZN_CLOUD`: `1` lets `analyze_prompt` / `zn-gate analyze` also query the cloud classifier. Requires `ZN_API_KEY`. Off by default.
-- `ZN_API_KEY`: API key from [usezn.com/dashboard](https://usezn.com/dashboard/). No effect without `ZN_CLOUD=1`.
+- `ZN_API_KEY`: API key from [usezn.com/dashboard](https://usezn.com/dashboard/). No effect without `ZN_CLOUD=1`. (`zn-gate connect` keeps a key for you instead and turns the cloud check on.)
 - `ZN_LOCAL_ONLY`: `true` forces local-only, even with `ZN_CLOUD=1`.
 - `ZN_STRICT`: `1` also blocks the rules that only warn by default (see below).
 - `ZN_LONG_INPUT`: how a long text (over 1,000 characters) is sent to the cloud classifier. `windows` (default) asks it to check overlapping 512-token windows, up to 20, so an injection in the middle or at the end of a long document is not missed; `off` checks only the first 512 tokens. Also `--long-input windows|off`. Windows are slower and slightly more likely to flag a long benign text, and cloud checks are billed by text size with or without windows, so `off` does not lower the count (1 call up to 2,000 characters, 1 more per further 1,000; `billed_calls` in the result); see the [changelog](https://github.com/usezn/zn/blob/main/CHANGELOG.md).
 - `ZN_STAGE`: `v30` (default, current production API) or `prod` (legacy endpoint). `ZN_API_URL` overrides both.
+- `NO_COLOR` (any non-empty value) or `TERM=dumb`: command output has no colors, symbols or box-drawing lines; the status words (ALLOWED, BLOCKED, PASSED, ...) stay. Colors are also off when the output is not a terminal.
 
 To enable the cloud check for one MCP server, add to its entry: `"env": { "ZN_CLOUD": "1", "ZN_API_KEY": "zn_live_..." }`.
 

@@ -31,6 +31,7 @@ const { createMasker } = require('./mask');
 const { gitStatusOf, realTargetOf } = require('./files');
 const policy = require('../hooks/policy');
 const deps = require('../deps');
+const CLOUD_KEY_SECRET = require('../cloud-key').VAULT_SECRET;
 const { pickOpening, warnNotice, WARN_REASON } = require('../team/effective');
 
 // Not available on Windows: 0 there, and the path checks still run.
@@ -220,6 +221,12 @@ function createSecretsServer(opts = {}) {
       if (s.deny) {
         await audit({ secret: m.name, mode: s.mode, tool: 'mcp:secrets_http_request', argv0: null, host, decision: 'deny', reason: 'policy:org_deny' });
         return denied(m.marker + ' is blocked for this agent by your organization policy. No request was made.');
+      }
+      // The key `zn-gate connect` keeps in the vault is for zn-gate's own analysis calls only. An agent could use it
+      // here to revoke the key (DELETE) or spend its quota, so this tool never fills it in, whatever its allowHosts.
+      if (m.name === CLOUD_KEY_SECRET) {
+        await audit({ secret: m.name, mode: s.mode, tool: 'mcp:secrets_http_request', argv0: null, host, decision: 'deny', reason: 'zn cloud key' });
+        return denied(m.marker + ' is the key of `zn-gate connect`. Only zn-gate uses it, and revoking it is done in your own terminal (zn-gate disconnect). No request was made.');
       }
       if (!markers.hostAllowed(s.allowHosts, host)) {
         await audit({ secret: m.name, mode: s.mode, tool: 'mcp:secrets_http_request', argv0: null, host, decision: 'deny', reason: 'host not in allowHosts' });

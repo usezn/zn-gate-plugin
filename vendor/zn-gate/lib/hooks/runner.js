@@ -21,6 +21,9 @@
  *               resources), keeping the output's shape.
  *   user_prompt block prompts that contain a secret and suggest
  *               `zn secret set`.
+ *   prompt_expansion  (Claude Code) a typed skill or command, expanded: block
+ *               the expansion when it would show the model a secret value,
+ *               a private key or the lines of a .env file.
  *
  * Vault locked (or its daemon unreachable): the engine still runs without
  * it and replaces values with irreversible __ZN_REDACTED_<TYPE>__ markers;
@@ -491,7 +494,47 @@ function lockedNotice() {
 /* --------------------------- user_prompt -------------------------- */
 
 async function decidePrompt(ev, d, agentId) {
+  return decidePromptText(ev, d, agentId, false);
+}
+
+// The expanded text of a skill or command: the same checks as a typed prompt,
+// plus private keys, and a size cap so the check fits in the hook's time.
+const EXPANSION_CAP = 1000000;
+const PRIVATE_KEY_HEADER_RE = /-----BEGIN (?:[A-Z0-9]+ ){0,4}PRIVATE KEY(?: BLOCK)?-----/g;
+const PRIVATE_KEY_BODY_RE = /^\s*(?:[ \t]*[A-Za-z0-9+\/=]{8,}[ \t]*\r?\n){2}|^\s*[A-Za-z0-9+\/=]{64,}/;
+
+// A key, not a line that names one: the header must be followed by a base64 body.
+function hasPrivateKey(text) {
+  if (/PuTTY-User-Key-File-/.test(text)) return true;
+  PRIVATE_KEY_HEADER_RE.lastIndex = 0;
+  let m;
+  while ((m = PRIVATE_KEY_HEADER_RE.exec(text)) !== null) {
+    if (PRIVATE_KEY_BODY_RE.test(text.slice(m.index + m[0].length, m.index + m[0].length + 4096))) return true;
+  }
+  return false;
+}
+
+async function decideExpansion(ev, d, agentId) {
+  return decidePromptText(ev, d, agentId, true);
+}
+
+async function decidePromptText(ev, d, agentId, expansion) {
   const prompt = String((ev.input && ev.input.prompt) || '');
+  if (expansion && prompt.length > EXPANSION_CAP) {
+    return {
+      decision: 'deny',
+      message: 'zn: this command was not run because its expanded text is too long to check for secrets in time. ' +
+        'Use a shorter skill or command, or point it at a file the agent reads (zn checks that read).',
+    };
+  }
+  if (expansion && hasPrivateKey(prompt)) {
+    return {
+      decision: 'deny',
+      stats: { detections: { PRIVATE_KEY: 1 } },
+      message: 'zn: this command was not run because it would put a private key in front of the model. ' +
+        'Remove the key from the skill or command (or from the file it includes), then run it again.',
+    };
+  }
   if (prompt.length < 8) return { decision: 'allow' };
   const engine = d.engine();
   let ctx = await ctxFor(ev, d, agentId, 'assistant');
@@ -509,9 +552,19 @@ async function decidePrompt(ev, d, agentId) {
   const names = secrets.map(nameOf);
   const shown = [...new Set(secrets.map((s, i) => names[i] || kindLabel(s.type)))];
   const suggestion = names[0] || suggestedName(secrets[0]);
+  const stats = { detections: Object.fromEntries([...new Set(secrets.map((s) => s.type || 'SECRET'))].map((k) => [k, 1])) };
+  if (expansion) {
+    return {
+      decision: 'deny',
+      stats,
+      message: 'zn: this command was not run because its expanded text contains a secret value (' + shown.join(', ') + '). ' +
+        'Remove the value from the skill or command, or from the file it includes (a .env with values, a credential file). ' +
+        'To use the secret, save it in your vault: ' + znCommand('secret set ' + suggestion) + ', and refer to it as __ZN_' + suggestion + '__.',
+    };
+  }
   return {
     decision: 'deny',
-    stats: { detections: Object.fromEntries([...new Set(secrets.map((s) => s.type || 'SECRET'))].map((k) => [k, 1])) },
+    stats,
     message: 'zn: this prompt was not sent because it contains a secret (' + shown.join(', ') + '). ' +
       'Save it in your vault instead: ' + znCommand('secret set ' + suggestion) +
       ', then ask your agent to use it (as __ZN_' + suggestion + '__).',
@@ -598,6 +651,7 @@ async function handle(adapter, rawEvent, opts = {}) {
     else if (ev.event === 'pre_tool') decision = await decidePre(ev, d, adapter.id, opts);
     else if (ev.event === 'post_tool') decision = await decidePost(ev, d, adapter.id);
     else if (ev.event === 'user_prompt') decision = await decidePrompt(ev, d, adapter.id);
+    else if (ev.event === 'prompt_expansion') decision = await decideExpansion(ev, d, adapter.id);
     else decision = { decision: 'allow' };
   } catch (err) {
     decision = failDecision(ev, err, mode);
@@ -702,7 +756,7 @@ async function handleEvent(args) {
   if (res.output !== null && res.output !== undefined) process.stdout.write(JSON.stringify(res.output));
 }
 
-module.exports = { handle, main, mapStrings, decidePre, decidePost, decidePrompt };
+module.exports = { handle, main, mapStrings, decidePre, decidePost, decidePrompt, decideExpansion };
 
 // Direct entry (`node lib/hooks/runner.js <agent>`): what installed hooks call,
 // so a hook does not pay for loading the rest of the CLI.

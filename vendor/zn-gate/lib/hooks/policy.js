@@ -27,7 +27,7 @@ const { znCommand } = require('../zn-command');
 
 // Version of the policy rules (credential paths, zn home, secret commands,
 // command wrapping). Bump it when a rule changes; see CONTRIBUTING.md.
-const POLICY_RULES_VERSION = '2026-10-17.8';
+const POLICY_RULES_VERSION = '2026-10-18.31';
 
 /* ------------------------------ paths ------------------------------ */
 
@@ -204,7 +204,8 @@ function classifyResolved(abs, ctx) {
   for (const d of creds.dirs) if (s === d || s.startsWith(d + '/')) return { kind: 'credential', reason: 'a directory named by a credential environment variable' };
   for (const [re, reason] of CREDENTIAL_RES) if (ci(re).test(s)) return { kind: 'credential', reason };
   if (s === h + '/.npmrc' || s === h + '/.pypirc') return { kind: 'credential', reason: 'package registry token' };
-  const base = path.basename(abs);
+  // With "\" a separator too, so a Windows spelling names the same file on every platform.
+  const base = path.basename(s);
   if (ci(DOTENV_BASENAME_RE).test(base) && !ci(DOTENV_SAFE_RE).test(base)) return { kind: 'dotenv', reason: '.env file' };
   if (ci(SSH_KEY_BASENAME_RE).test(base)) return { kind: 'credential', reason: 'SSH private key' };
   if (KEY_CONTAINER_RE.test(base)) return { kind: 'credential', reason: 'key store, which holds private keys' };
@@ -457,6 +458,7 @@ function globClass(word, opts = {}) {
   // Each alternative is resolved and matched in full: past this much work the
   // pattern is refused as too broad instead of being checked.
   if (alts.length * word.length > GLOB_WORK_MAX) return { kind: 'credential', reason: 'a pattern too broad to check' };
+  let keyHit = null;
   const examples = [...GLOB_EXAMPLES.map((e) => path.join(ctx.home, e)), ...PROJECT_EXAMPLES.map((e) => path.join(ctx.cwd, e))];
   for (const alt of alts) {
     const e = expandEnv(expandHome(alt, ctx.home), ctx.env);
@@ -474,16 +476,18 @@ function globClass(word, opts = {}) {
       }
     }
     // What the pattern matches on the disk now, read with a limit.
-    const hits = globOnDisk(abs);
-    if (hits === 'too-broad') return { kind: 'credential', reason: 'a pattern too broad to check' };
+    const hits = globOnDisk(abs, opts.budget);
+    if (hits === 'too-broad' || hits === 'too-slow') return { kind: 'credential', reason: 'a pattern too broad to check' };
     for (const hit of hits || []) {
       for (const cand of new Set([hit, realTargetOf(hit)])) {
         const c = classifyResolved(cand, ctx);
+        // A key file match is judged by its content (keyFileGlobDenial); a protected file found later still wins.
+        if (c && c.kind === 'keyfile') { keyHit = keyHit || c; continue; }
         if (c) return c.kind === 'dotenv' ? { kind: 'credential', reason: 'a pattern that matches a .env file' } : c;
       }
     }
   }
-  return null;
+  return keyHit;
 }
 
 /**
@@ -491,7 +495,7 @@ function globClass(word, opts = {}) {
  * each glob component is matched against the names in its directory.
  * Returns the matches, 'too-broad' past GLOB_DISK_LIMIT entries, or null.
  */
-function globOnDisk(abs) {
+function globOnDisk(abs, cmdBudget) {
   const parts = abs.split('/');
   let i = 0;
   while (i < parts.length && !GLOB_RE.test(parts[i])) i++;
@@ -511,6 +515,8 @@ function globOnDisk(abs) {
         try { names = fs.readdirSync(d); } catch (_) { continue; }
         budget -= names.length;
         if (budget < 0) return 'too-broad';
+        // Reading the names of a folder also spends the command's own budget (an over-budget command is refused).
+        if (cmdBudget && overBudget(cmdBudget, names.length)) return 'too-slow';
         for (const n of names) if (segRe.test(keyOf(n))) next.push(join(d, n));
       }
     }
@@ -592,9 +598,35 @@ function readHead(abs, max) {
 
 /* A .pem, .key or .p8 file: refused when it holds a private key, allowed when it is a certificate or a public key. */
 function keyFileDenial(p, c, opts) {
+  if (GLOB_RE.test(p)) return keyFileGlobDenial(p, c, opts);
   const text = readHead(resolvedOf(p, opts), KEY_SCAN_BYTES);
   if (text === null) return null; // missing file: nothing to protect
   if (text === NOT_A_FILE || PRIVATE_KEY_RE.test(text)) return credentialDenial(p, c);
+  return null;
+}
+
+/* A glob or brace word that can name a key file: what it matches on the disk now is read with the command's budget,
+   and the word is refused when any match holds a private key (or is not a regular file). */
+function keyFileGlobDenial(p, c, opts) {
+  const ctx = contextOf(opts);
+  const broad = { kind: 'keyfile', reason: 'a pattern too broad to check' };
+  const alts = expandBraces(p);
+  if (alts === null) return credentialDenial(p, broad);
+  if (alts.length * p.length > GLOB_WORK_MAX) return credentialDenial(p, broad);
+  for (const alt of alts) {
+    if (overBudget(opts.budget, 1)) return TOO_SLOW_MESSAGE;
+    const abs = slash(path.resolve(opts.cwd || ctx.cwd, expandEnv(expandHome(alt, ctx.home), opts.env || ctx.env).text));
+    const hits = globOnDisk(abs, opts.budget);
+    if (hits === 'too-slow') return TOO_SLOW_MESSAGE;
+    if (hits === 'too-broad') return credentialDenial(p, broad);
+    for (const hit of hits || []) {
+      const hc = classifyPath(hit, { ...opts, ctx });
+      if (!hc || hc.kind !== 'keyfile') continue;
+      if (overBudget(opts.budget, 1)) return TOO_SLOW_MESSAGE;
+      const text = readHead(hit, KEY_SCAN_BYTES);
+      if (text !== null && (text === NOT_A_FILE || PRIVATE_KEY_RE.test(text))) return credentialDenial(p, hc);
+    }
+  }
   return null;
 }
 
@@ -701,14 +733,16 @@ function allWords(cmd, posix = false) {
   while (rest.length && guard++ < SIMPLE_COMMANDS_MAX) {
     const scan = scanFirstCommand(rest, posix);
     const head = commandName(scan.words);
-    const sub = isGit(head) ? gitSubcommand(scan.words) : '';
+    // git also runs behind sudo, env, command, xargs and the like.
+    const gi = gitStart(scan.words);
+    const sub = gi >= 0 ? gitSubcommand(scan.words.slice(gi)) : '';
     const gitArgs = sub ? scan.words.map((x) => x.text) : null;
     for (let k = 0; k < scan.words.length; k++) {
       const w = scan.words[k];
       const prev = k > 0 ? scan.words[k - 1].text : '';
       const isRedirTarget = /^[0-9]*>>?$/.test(prev) || /^[0-9]*>>?./.test(w.text);
       // Input redirections: <file, 0<file, <>file (read and write), {fd}<file.
-      out.push({ text: w.text.replace(/^[0-9]*>>?/, '').replace(/^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?<>?/, ''), redirectTarget: isRedirTarget, head, seq: guard, sub, gitArgs });
+      out.push({ text: w.text.replace(/^[0-9]*>>?/, '').replace(/^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?<>?/, ''), redirectTarget: isRedirTarget, head, seq: guard, sub, gitArgs, git: gi >= 0 });
     }
     rest = rest.slice(scan.end + 1);
   }
@@ -890,7 +924,7 @@ function hasNetworkSignals(cmd) {
 }
 
 // The program is zn, zn-gate (also with a version: npx -y zn-gate@1.6.0, pnpm dlx zn-gate@latest) or the bin file.
-const ZN_ADMIN_RE = /(^|[\s;&|(`$'"\\\/])((?:zn|zn-gate(?:@[^\s"'`;&|]+)?|cli\.js))(\.cmd|\.js|\.ps1)?["']?\s+(?:--\s+)?(secret\s+(set|get|rm|remove|import|adopt|approve|allow|reveal|link)|env\s+(shadow|unshadow)|unlock|lock|hooks\s+(install|uninstall)|init(?![^\n;&|#`$()'"<>\\]{0,512}[ \t]--(?:wrap-mcp|dry-run|revert|shadow)(?=[ \t\n]|$))|stats(?:\s+(?:-{1,2}[^\s-]\S*|\d+))*\s+share\s+on|["']?pins["']?\s+["']?approve)\b/i;
+const ZN_ADMIN_RE = /(^|[\s;&|(`$'"\\\/])((?:zn|zn-gate(?:@[^\s"'`;&|]+)?|cli\.js))(\.cmd|\.js|\.ps1)?["']?\s+(?:--\s+)?(secret\s+(set|get|rm|remove|import|adopt|approve|allow|reveal|link)|env\s+(shadow|unshadow)|unlock|lock|connect|disconnect|hooks\s+(install|uninstall)|init(?![^\n;&|#`$()'"<>\\]{0,512}[ \t]--(?:wrap-mcp|dry-run|revert|shadow)(?=[ \t\n]|$))|stats(?:\s+(?:-{1,2}[^\s-]\S*|\d+))*\s+share\s+on|["']?pins["']?\s+["']?approve)\b/i;
 
 // `npm exec` (and `npm x`) keeps the options after the package for itself unless a `--` comes first, so
 // `npm exec zn-gate init --dry-run` runs the guided init: the options do not count there. Checked per simple
@@ -965,6 +999,610 @@ function shellPatchMessage(cmd, deny, opts) {
     '(its *** lines look like file patterns that can match secret files). Next step: use the apply_patch tool, or write the file another way.';
 }
 
+// How deep sh -c "sh -c '...'" is followed; deeper is refused.
+const SHELL_CODE_DEPTH = 3;
+const TOO_NESTED_MESSAGE = 'zn: this command nests shell code (sh -c "sh -c ...") deeper than zn checks, so it was blocked. Next step: run the inner command directly, or tell the user.';
+const SHELL_NAMES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'mksh', 'fish', 'csh', 'tcsh', 'rbash']);
+const SHELL_C_FLAG_RE = /^-[A-Za-z]*c[A-Za-z]*$/;
+
+function programName(text) {
+  return String(text).replace(/^\(+/, '').split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, '');
+}
+
+/* The code strings that programs which run code from a string would run: sh -c, bash -lc, su -c, flock -c, env -S,
+   pwsh -Command, cmd /c, eval, watch, and "git <args>" for PowerShell's Start-Process git -ArgumentList. Only these
+   launchers (found through sudo, env, xargs and the other wrappers) are read this way: the -c of psql or grep is not code. */
+function shellCodesOf(words, out = new Set()) {
+  let start = 0;
+  while (start < words.length) {
+    let end = start;
+    while (end < words.length && words[end].seq === words[start].seq) end++;
+    codesOfCommand(words.slice(start, end), out);
+    start = end;
+  }
+  return out;
+}
+
+// Shells, PowerShell and cmd: when a wrapper chain does not resolve, the first of these words followed by code still counts.
+const FALLBACK_LAUNCHERS = new Set([...SHELL_NAMES, 'busybox', 'pwsh', 'powershell', 'cmd', 'su', 'sg', 'runuser', 'script', 'flock']);
+// Options of bash and zsh that take a value, which may sit between the shell and -c.
+const SHELL_VALUE_OPTS = new Set(['-O', '+O', '-o', '+o', '--rcfile', '--init-file', '--init-command']);
+const FALLBACK_HEAVY_MAX = 16;
+const POWERSHELL_PARAM_RE = /^[-\/]([A-Za-z]+)$/;
+
+/* The code strings a launcher at w[k] runs from a string; true when `name` is a launcher that was read (the rest of the
+   command is then what it runs). env only reports its -S string and lets the wrapper chain go on. */
+function launcherCodes(w, k, name, out) {
+  const join = (from) => w.slice(from).map((x) => x.text).join(' ');
+  if (name === 'eval' || name === 'iex' || name === 'invoke-expression') { out.add(join(k + 1)); return true; }
+  if (name === 'watch') {
+    let j = k + 1;
+    while (j < w.length && w[j].text.startsWith('-')) j += w[j].text === '-n' || w[j].text === '--interval' ? 2 : 1;
+    if (j < w.length) out.add(join(j));
+    return true;
+  }
+  if (SHELL_NAMES.has(name)) {
+    for (let j = k + 1; j < w.length; j++) {
+      const t = w[j].text;
+      if (t === '--' || !/^[-+]/.test(t)) break;
+      if (SHELL_VALUE_OPTS.has(t)) { j++; continue; }
+      if (name === 'fish' && (t === '-C' || t === '--init-command') && w[j + 1]) { out.add(w[j + 1].text); j++; continue; }
+      if (SHELL_C_FLAG_RE.test(t)) { if (w[j + 1]) out.add(w[j + 1].text); break; }
+    }
+    return true;
+  }
+  if (name === 'su' || name === 'sg' || name === 'runuser' || name === 'script' || name === 'flock') {
+    for (let j = k + 1; j < w.length; j++) {
+      const t = w[j].text;
+      if (t.startsWith('--command=')) out.add(t.slice(10));
+      else if (t === '--command' || t === '-c' || (name !== 'flock' && SHELL_C_FLAG_RE.test(t))) { if (w[j + 1]) out.add(w[j + 1].text); }
+    }
+    // runuser -u user -- command goes on through the wrapper chain; the others are done.
+    return name !== 'runuser';
+  }
+  if (name === 'pwsh' || name === 'powershell') {
+    let first = -1;
+    for (let j = k + 1; j < w.length; j++) {
+      const t = w[j].text;
+      const m = POWERSHELL_PARAM_RE.exec(t);
+      if (!m) { if (first < 0) first = j; continue; }
+      // Any unambiguous prefix of the parameter name works in PowerShell (-c, -com, /Command, -en, -EncodedCom).
+      const n = m[1].toLowerCase();
+      if ('command'.startsWith(n)) { out.add(join(j + 1)); return true; }
+      if (n === 'e' || n === 'ec' || 'encodedcommand'.startsWith(n)) {
+        // Base64 of UTF-16 text: decoded and read as code.
+        if (w[j + 1]) out.add(Buffer.from(w[j + 1].text, 'base64').toString('utf16le'));
+        return true;
+      }
+    }
+    // Windows PowerShell reads the first argument that is not a parameter as the command.
+    if (first >= 0) out.add(join(first));
+    return true;
+  }
+  if (name === 'cmd') {
+    for (let j = k + 1; j < w.length; j++) if (/^\/[ckr]$/i.test(w[j].text)) { out.add(join(j + 1)); return true; }
+    return true;
+  }
+  if (name === 'env') {
+    for (let j = k + 1; j < w.length && w[j].text.startsWith('-'); j++) {
+      const t = w[j].text;
+      if (t === '-S' || t === '--split-string') { if (w[j + 1]) out.add(w[j + 1].text); }
+      else if (t.startsWith('--split-string=')) out.add(t.slice(15));
+      else if (t.startsWith('-S')) out.add(t.slice(2));
+    }
+  }
+  return false;
+}
+
+function codesOfCommand(w, out) {
+  for (let j = 1; j < w.length; j++) {
+    if (!/^-arg/i.test(w[j - 1].text) || !w[j].text) continue;
+    for (let i = j - 2; i >= 0; i--) if (wordIsGit(w[i].text)) { out.add('git ' + w[j].text.replace(/,/g, ' ')); break; }
+  }
+  const first = w.findIndex((x) => !ASSIGNMENT_RE.test(x.text));
+  let k = first;
+  let resolved = false;
+  for (let guard = 0; k >= 0 && k < w.length && guard < 16; guard++) {
+    const name = programName(w[k].text);
+    if (launcherCodes(w, k, name, out)) { resolved = true; break; }
+    if (!Object.prototype.hasOwnProperty.call(GIT_WRAPPERS, name)) break;
+    k = skipWrapper(w, k, name);
+  }
+  // The chain did not reach a launcher (an unknown wrapper, odd options): the first shell word counts as the launcher.
+  if (!resolved && first >= 0) {
+    // A shell word costs a look at the next few words; the launchers that read the whole rest are limited, and past
+    // the limit the rest of the command is read as code (never skipped).
+    let heavy = 0;
+    for (let j = first; j < w.length; j++) {
+      const name = programName(w[j].text);
+      if (!FALLBACK_LAUNCHERS.has(name)) continue;
+      if (!SHELL_NAMES.has(name) && ++heavy > FALLBACK_HEAVY_MAX) { out.add(w.slice(j).map((x) => x.text).join(' ')); break; }
+      launcherCodes(w, j, name, out);
+    }
+  }
+}
+
+/* --------------------------- here-documents --------------------------- */
+
+/*
+ * The body of a here-document (`cat > f <<'EOF' ... EOF`) is data the shell
+ * writes to a file or feeds to a program that reads it as data, not words of
+ * the command line: a `*` in it names no file and a path in it is not read.
+ * Such a body is dropped before the command is read, which also keeps a 100 KB
+ * write cheap to check. A quoted delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`)
+ * turns the expansions off, so the body is dropped whole. A bare delimiter
+ * (`<<EOF`) still expands the body first, so its `$( )`, backticks and `$VAR`
+ * are put back as words; dropping them would hide a substitution that reads a
+ * secret file.
+ *
+ * Only the body of a plain data command is dropped: the command that holds the
+ * operator must be a plain simple one (no pipe, no process substitution, no
+ * group closed before it), its program must be a known data program (`cat`,
+ * `tee`, `dd`, ...) and not empty, and the command must not run code after the
+ * here-document. Every other body keeps the check it had, which is the safe side.
+ */
+
+// A here-document operator starts a redirect. `<<` glued to the end of a word
+// (`x<<y`, an arithmetic shift) is left alone: missing one only means its body
+// is checked as if it were code, which is the safe side.
+const HEREDOC_START_RE = /[\s;&|(\n]/;
+// Characters that end a run and are read by stripHeredocs: quotes, escapes, a
+// comment, a line break, and every separator or group bracket of the command.
+const HEREDOC_SPECIAL_RE = /[<>(){};&|`'"\\#\n]/g;
+
+/** The here-document operator at `from` (`<<`, `<<-`) with its delimiter, or null. */
+function heredocAt(s, from) {
+  if (s[from] !== '<' || s[from + 1] !== '<' || s[from + 2] === '<') return null;
+  if (from > 0 && !HEREDOC_START_RE.test(s[from - 1])) return null;
+  let j = from + 2;
+  const stripTabs = s[j] === '-';
+  if (stripTabs) j++;
+  let quoted = false;
+  let delimiter = '';
+  while (j < s.length) {
+    const c = s[j];
+    if (c === "'" || c === '"') {
+      const close = s.indexOf(c, j + 1);
+      if (close === -1) return null;
+      quoted = true;
+      delimiter += s.slice(j + 1, close);
+      j = close + 1;
+      continue;
+    }
+    if (c === '\\') {
+      if (j + 1 >= s.length) return null;
+      quoted = true;
+      delimiter += s[j + 1];
+      j += 2;
+      continue;
+    }
+    if (/[\s;&|()<>]/.test(c)) break;
+    delimiter += c;
+    j++;
+  }
+  if (!delimiter) return null;
+  return { doc: { delimiter, quoted, stripTabs }, end: j };
+}
+
+/** What an unquoted here-document body still runs, as words: its `$( )`, backticks and `$VAR`. */
+function heredocExpansions(body) {
+  let out = '';
+  const add = (text) => { out += (out && !/\s$/.test(out) ? ' ' : '') + text; };
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === '\\') { i++; continue; }
+    if (ch === '`') {
+      const end = body.indexOf('`', i + 1);
+      const stop = end === -1 ? body.length : end + 1;
+      add(body.slice(i, stop));
+      i = stop - 1;
+      continue;
+    }
+    if (ch !== '$') continue;
+    const n = body[i + 1];
+    if (n === '(') {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < body.length; j++) {
+        if (body[j] === '(') depth++;
+        else if (body[j] === ')' && --depth === 0) { j++; break; }
+      }
+      add(body.slice(i, j));
+      i = j - 1;
+    } else if (n === '{') {
+      const end = body.indexOf('}', i + 2);
+      const stop = end === -1 ? body.length : end + 1;
+      add(body.slice(i, stop));
+      i = stop - 1;
+    } else {
+      const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(body.slice(i + 1));
+      if (name) { add('$' + name[0]); i += name[0].length; }
+    }
+  }
+  return out;
+}
+
+/*
+ * Drop the bodies of the pending here-documents from `s`, starting at the line
+ * after their operator, and return the index to read on from. `keep` receives
+ * what is left of each unquoted body. A delimiter with no closing line makes
+ * the shell feed the rest of the input as the body (it is not run), so the rest
+ * is dropped too.
+ */
+function skipHeredocBodies(s, from, pending, keep) {
+  let cursor = from;
+  for (const doc of pending) {
+    const bodyStart = cursor;
+    let termStart = -1;
+    let pos = cursor;
+    for (;;) {
+      const nl = s.indexOf('\n', pos);
+      const lineEnd = nl === -1 ? s.length : nl;
+      let line = s.slice(pos, lineEnd);
+      if (doc.stripTabs) line = line.replace(/^\t+/, '');
+      if (line.replace(/\r$/, '') === doc.delimiter) { termStart = pos; break; }
+      if (nl === -1) break;
+      pos = nl + 1;
+    }
+    const bodyEnd = termStart === -1 ? s.length : termStart;
+    if (!doc.quoted) keep(heredocExpansions(s.slice(bodyStart, bodyEnd)));
+    if (termStart === -1) return s.length;
+    const nl = s.indexOf('\n', termStart);
+    cursor = nl === -1 ? s.length : nl + 1;
+  }
+  return cursor;
+}
+
+/**
+ * The command with the bodies of its data here-documents removed (see above).
+ * A body is kept when its command is not a plain simple command with a known
+ * data program: a pipe, a process substitution or an open group (also one opened
+ * on an earlier line) makes that command not simple, a command that writes a
+ * file and then runs it or that redefines how a name resolves keeps the check,
+ * and so does a program that runs code after the here-document. `budget` bounds
+ * the work; past it the command is left whole.
+ */
+function stripHeredocs(cmd, budget) {
+  const s = String(cmd);
+  if (s.indexOf('<<') === -1) return s;
+  const parts = [];
+  let outLen = 0;
+  const keep = (t) => { if (t) { parts.push(t); outLen += t.length; } };
+  let quote = null;
+  let pending = [];
+  // State of the simple command that holds the operator. A body is data only in
+  // a plain simple command: no pipe or process substitution, no group closed
+  // before it, and a non-empty known data program.
+  let segStart = 0;
+  let segProgram; // the program of the segment, computed once
+  let segPipe = false;
+  let segClose = false;
+  let parens = 0; // `(` and `)` open here; a `)` with no `(` is a `case` pattern
+  let braces = 0; // `{` and `}` open here; both are kept across lines
+  let hasData = false;
+  let tailStart = -1; // output length just before the first data operator
+  let i = 0;
+  let ticks = 0;
+  // A separator ends the command: the next one starts after it, plain again.
+  const reset = (at) => { segStart = at; segProgram = undefined; segPipe = false; segClose = false; };
+  // A pipe, a process substitution or a group after an operator makes its body code.
+  const drop = () => { if (pending.length) pending = []; };
+  while (i < s.length) {
+    if ((++ticks & 4095) === 0 && overBudget(budget, 0)) return s;
+    if (quote === "'") {
+      const end = s.indexOf("'", i + 1);
+      keep(s.slice(i, end === -1 ? s.length : end + 1));
+      i = end === -1 ? s.length : end + 1;
+      if (end !== -1) quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      let j = i;
+      while (j < s.length && s[j] !== '"') j += s[j] === '\\' ? 2 : 1;
+      const stop = Math.min(j + 1, s.length);
+      keep(s.slice(i, stop));
+      i = stop;
+      if (j < s.length) quote = null;
+      continue;
+    }
+    HEREDOC_SPECIAL_RE.lastIndex = i;
+    const m = HEREDOC_SPECIAL_RE.exec(s);
+    if (!m) { keep(s.slice(i)); break; }
+    if (m.index > i) { keep(s.slice(i, m.index)); i = m.index; }
+    const ch = s[i];
+    if (ch === "'" || ch === '"') { quote = ch; keep(ch); i++; continue; }
+    if (ch === '\\') { keep(s.slice(i, i + 2)); i += 2; continue; }
+    if (ch === '#' && (i === 0 || HEREDOC_START_RE.test(s[i - 1]))) {
+      const nl = s.indexOf('\n', i);
+      if (nl === -1) { keep(s.slice(i)); break; }
+      keep(s.slice(i, nl));
+      i = nl;
+      continue;
+    }
+    if (ch === '\n') {
+      keep('\n');
+      i++;
+      if (pending.length) { i = skipHeredocBodies(s, i, pending, keep); pending = []; }
+      reset(i);
+      continue;
+    }
+    if (ch === ';') { keep(ch); i++; reset(i); continue; }
+    if (ch === '&') {
+      // &> and &>> are redirects, as are >& and <& (a file-descriptor copy).
+      if (s[i + 1] === '>' || s[i - 1] === '>' || s[i - 1] === '<') { keep(ch); i++; continue; }
+      keep(ch); i++;
+      if (s[i] === '&') { keep('&'); i++; } // && or the & of |&
+      reset(i);
+      continue;
+    }
+    if (ch === '|') {
+      if (s[i + 1] === '|') { keep('||'); i += 2; reset(i); continue; } // || separates commands
+      segPipe = true; drop(); // | or |&: a pipeline, not a simple command
+      keep(ch); i++;
+      if (s[i] === '&') { keep('&'); i++; }
+      continue;
+    }
+    // A group or a substitution keeps the check on its bodies. The depth is kept
+    // across lines, and each bracket only closes its own kind, so the `)` of a
+    // `case` pattern does not close an open `{` group.
+    if (ch === '{') { braces++; segClose = true; drop(); keep(ch); i++; continue; }
+    if (ch === '}') { if (braces > 0) braces--; segClose = true; drop(); keep(ch); i++; continue; }
+    if (ch === ')') { if (parens > 0) parens--; segClose = true; drop(); keep(ch); i++; continue; }
+    if (ch === '<') {
+      const h = heredocAt(s, i);
+      if (h) {
+        if (segProgram === undefined) segProgram = heredocConsumer(s.slice(segStart, Math.min(i, segStart + 512)));
+        if (parens === 0 && braces === 0 && !segPipe && !segClose && segProgram && HEREDOC_DATA_CMDS.has(segProgram)) {
+          if (tailStart === -1) tailStart = outLen;
+          hasData = true;
+          pending.push(h.doc);
+        }
+        keep(s.slice(i, h.end));
+        i = h.end;
+        continue;
+      }
+      if (s[i + 1] === '(') { segPipe = true; drop(); keep(ch); i++; continue; } // <( process substitution
+      keep(ch); i++;
+      continue;
+    }
+    if (ch === '>') {
+      if (s[i + 1] === '(') { segPipe = true; drop(); keep(ch); i++; continue; } // >( process substitution
+      keep(ch); i++;
+      continue;
+    }
+    // Arithmetic (`$(( ))`, `(( ))`): a `<<` inside it is a shift, not a
+    // here-document. The run is read once: closed it is kept whole, and unclosed
+    // it is read to the end of its line, so a run of `(` stays linear.
+    if (ch === '(' && s[i + 1] === '(') {
+      let nesting = 0;
+      let j = i;
+      for (; j < s.length && s[j] !== '\n'; j++) {
+        if ((++ticks & 4095) === 0 && overBudget(budget, 0)) return s;
+        if (s[j] === '(') nesting++;
+        else if (s[j] === ')' && --nesting === 0) { j++; break; }
+      }
+      keep(s.slice(i, j));
+      i = j;
+      segClose = true;
+      drop();
+      continue;
+    }
+    if (ch === '(') { parens++; segClose = true; drop(); keep(ch); i++; continue; }
+    keep(ch);
+    i++;
+  }
+  const out = parts.join('');
+  if (!hasData) return out;
+  const tail = out.slice(tailStart);
+  // A command that writes a file and then runs it, redefines how a name resolves,
+  // or pipes it on a later line, keeps the old check: the body is code that runs.
+  if (HEREDOC_RUN_AFTER_RE.test(tail) || HEREDOC_DEFINES_RE.test(out) || runsCodeAfter(tail, writtenFiles(out))) return s;
+  return out;
+}
+
+/*
+ * A here-document whose body a program reads as plain data (`cat > f`, `tee`,
+ * `dd`) cannot leak a secret by reading it, so its body is dropped before the
+ * command is checked. A body a program runs as code (a shell, an interpreter,
+ * apply_patch) still holds a command or a file pattern, so it keeps the check
+ * it had. Only the data programs are listed: an unknown program keeps the
+ * check, which is the safe side.
+ */
+const HEREDOC_DATA_CMDS = new Set(['cat', 'tac', 'tee', 'dd', 'tr', 'uniq', 'wc', 'head', 'tail', 'cut', 'paste',
+  'join', 'grep', 'egrep', 'fgrep', 'rg', 'diff', 'cmp', 'comm', 'jq', 'base64', 'nl', 'od', 'xxd', 'hexdump',
+  'sha256sum', 'sha1sum', 'sha512sum', 'md5sum', 'shasum', 'cksum', 'gzip', 'gunzip', 'zcat', 'bzip2', 'bunzip2',
+  'xz', 'unxz', 'zstd', 'fold', 'expand', 'unexpand', 'fmt', 'column', 'rev']);
+
+// `sort --compress-program` and `split --filter` run a program on the data, so
+// neither is a plain data program. A command that defines a function or changes
+// how a name resolves (`PATH`, `alias`, `hash`, `enable`) can do the same to any
+// data program, so no body of it is data either.
+const HEREDOC_DEFINES_RE = /(?:^|[^A-Za-z0-9_])(?:function\s+[A-Za-z_]|[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{|PATH\s*=|alias\s|hash\s|enable\s)/;
+
+// A pipe or a process substitution that appears after the first data body can
+// run that body when a group or a substitution was opened on an earlier line
+// (`( case x in a) ... ) | awk '{system($0)}'`), where the walk cannot tell a
+// `case` pattern from a group close. A `||` is not a pipe.
+const HEREDOC_RUN_AFTER_RE = /(?<!\|)\|&?(?!\|)|>\(|<\(/;
+
+// A redirect operator and its target (`> f`, `2>> f`, `<< EOF`) and the glued
+// forms (`>f`, `2>f`, `<<EOF`). Read by runsCodeAfter so a target is not read as
+// the command.
+const REDIRECT_OP_RE = /^[0-9]*(?:>>?\|?|<<?-?|<>|<&|>&|&>>?|<|>)$/;
+const REDIRECT_GLUED_RE = /^[0-9]*(?:>>?|<<?-?|<>|<&|>&|&>>?|<|>)[^<>&\s]+$/;
+
+// Wrappers that turn their input into arguments or commands: their body is code,
+// not data, so they are not read through like `sudo` or `env`.
+const HEREDOC_RUNS_STDIN = new Set(['xargs', 'parallel']);
+
+/** The program a here-document feeds, read through assignments, reserved words and wrappers (`sudo cat`). */
+function heredocConsumer(segment) {
+  const words = segment.split(/\s+/).filter(Boolean).map((text) => ({ text }));
+  let k = 0;
+  while (k < words.length && (ASSIGNMENT_RE.test(words[k].text) || RESERVED_WORDS.has(words[k].text))) {
+    const name = programName(words[k].text);
+    if (HEREDOC_RUNS_STDIN.has(name)) return name; // xargs turns its input into a command
+    k++;
+  }
+  for (let guard = 0; k < words.length && guard < 16; guard++) {
+    const name = programName(words[k].text);
+    if (HEREDOC_RUNS_STDIN.has(name)) return name;
+    if (!Object.prototype.hasOwnProperty.call(GIT_WRAPPERS, name)) return name;
+    k = skipWrapper(words, k, name);
+  }
+  return k < words.length ? programName(words[k].text) : '';
+}
+
+/**
+ * The files a command line writes: the target of a `>` or `>>` redirect, the
+ * positional arguments of `tee`, and the `of=` of `dd`. Used to keep the body
+ * when the same command later runs the file it writes, also by an absolute path.
+ */
+function writtenFiles(text) {
+  const files = new Set();
+  const words = text.split(/\s+/).filter(Boolean);
+  const unquote = (w) => w.replace(/^["']+|["']+$/g, '');
+  for (let k = 0; k < words.length; k++) {
+    const w = words[k];
+    if (w === '>' || w === '>>' || w === '>|') { if (words[k + 1]) { files.add(unquote(words[k + 1])); k++; } continue; }
+    if (/^>>?[^>]/.test(w)) { files.add(unquote(w.replace(/^>>?/, ''))); continue; }
+    if (/^of=/.test(w)) files.add(unquote(w.slice(3)));
+  }
+  const tee = words.indexOf('tee');
+  if (tee !== -1) {
+    for (let k = tee + 1; k < words.length && !/[;&|]/.test(words[k]); k++) {
+      if (!words[k].startsWith('-') && !/^[<>]/.test(words[k])) files.add(unquote(words[k]));
+    }
+  }
+  return files;
+}
+
+/**
+ * Whether the command runs code: a shell, an interpreter, `source`, a program
+ * that turns its input into a command, a path run directly (`./x.sh`), or a
+ * command that names a file the same command writes. Used to keep the body of a
+ * here-document a command then runs.
+ */
+function runsCodeAfter(text, targets) {
+  // Any word that is a shell, an interpreter or a stdin-to-command wrapper keeps
+  // the check, wherever it sits (the safe side).
+  for (const token of text.split(/[\s;&|(){}<>`"']+/)) {
+    if (!token) continue;
+    const name = programName(token);
+    if (CODE_CMDS_RE.test(name) || name === 'source' || name === 'eval' || name === '.' || HEREDOC_RUNS_STDIN.has(name)) return true;
+    if (token.startsWith('./') || token.startsWith('../')) return true;
+  }
+  if (!targets || !targets.size) return false;
+  // A file the command writes and then runs is named in command position, also
+  // behind a wrapper (`nohup x.sh`, `timeout 5 x.sh`, `exec x.sh`, `sudo x.sh`).
+  // A redirect and its target are skipped (`cat <<EOF > f`), so the target is not
+  // read as the command.
+  for (const segment of text.split(/[\n;|&(){}`"']+/)) {
+    const words = segment.split(/\s+/).filter(Boolean).map((text) => ({ text }));
+    let k = 0;
+    for (let guard = 0; k < words.length && guard < 32; guard++) {
+      const w = words[k].text;
+      if (ASSIGNMENT_RE.test(w)) { k++; continue; }
+      if (REDIRECT_OP_RE.test(w)) { k += 2; continue; }
+      if (REDIRECT_GLUED_RE.test(w)) { k++; continue; }
+      const name = programName(w);
+      if (!Object.prototype.hasOwnProperty.call(GIT_WRAPPERS, name)) break;
+      k = skipWrapper(words, k, name);
+    }
+    if (k < words.length && targets.has(words[k].text.replace(/^["']+|["']+$/g, ''))) return true;
+  }
+  return false;
+}
+
+/*
+ * zn keeps the API key of `zn-gate connect` and the vault identity in the
+ * system keychain, under zn's own service name. A command that asks the
+ * keychain for that entry is refused; the same tools stay free for any other
+ * entry. The tools: macOS `security find-generic-password` /
+ * `find-internet-password`, Linux `secret-tool lookup` / `search`, Windows
+ * `cmdkey /list:` and PowerShell `Get-StoredCredential` / CredRead.
+ */
+const KEYCHAIN_MESSAGE = 'zn: this command would read a zn secret (the API key or the vault key) from the system keychain, which is protected. Ask the user to do it.';
+// A command is refused when it holds BOTH a word that reads a keychain AND one of zn's own entry names (or loads
+// zn's key code). No wrapper, quoting, interpreter or heredoc has to be understood: the words are enough, and
+// searching for the names with rg, grep or git grep (no keychain word) stays allowed.
+const KEYCHAIN_WORD_RE = /(?:(?<![A-Za-z0-9_.-])(?:security(?:\.exe)?(?=\s)|secret-tool|cmdkey|vaultcmd|Get-StoredCredential|CredRead|CredEnumerate|keyring|keytar|PasswordVault)(?![A-Za-z0-9_-])|(?<![A-Za-z0-9_-])(?:getPassword|get_password)(?![A-Za-z0-9_-])|find-(?:generic|internet)-password)/i;
+// The patterns below are matched one at a time, with no gap between parts: `security\s[^\n]*dump-keychain` takes time
+// proportional to length times the number of candidates, and a bounded gap could be padded past its limit.
+const KEYCHAIN_DUMP_RE = /\bdump-keychain\b/i;
+const KEYCHAIN_SECURITY_RE = /(?<![A-Za-z0-9_.-])security(?:\.exe)?\s/i;
+// zn's own modules, loaded to read the key.
+const KEYCHAIN_LIB_LOAD_RE = /(?:require\s*\(|import\s*\(|\bimport\s|\bfrom\s)/;
+// zn-gate's own client modules count only by their full path (node_modules, a global install or packages/zn-gate): a
+// project's own lib/client is no business of ours. A relative ./lib/client inside zn-gate itself is not covered.
+// Matching ignores case (macOS and Windows load ZN-GATE/LIB/CLIENT) and drops `/./` segments first.
+const KEYCHAIN_LIB_NAME_RE = /(?:cloud-key(?![A-Za-z0-9_-])|vault[\\/]+keychain|zn-gate[\\/]+lib[\\/]+(?:vault[\\/]+)?client(?![A-Za-z0-9_-]))/i;
+const KEYCHAIN_DOT_RE = /[\\/]\.(?=[\\/])/g;
+// A name written with escapes (\x2f, \x2F, \u{2f}, \057) is the same name once the shell or the interpreter decodes
+// it, so the name is also looked for in decoded copies. The decoded copies only add matches. One pass, no backtracking.
+const KEYCHAIN_ESC_RE = /\\(?:x([0-9A-Fa-f]{2})|u([0-9A-Fa-f]{4})|u\{0*([0-9A-Fa-f]{1,6})\}|([0-7]{1,3}))/g;
+// bash $'...', printf and echo -e also take \x with 1-2 digits, \u with 1-4, \U with 1-8 and \0nnn.
+const KEYCHAIN_SH_ESC_RE = /\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|0?([0-7]{1,3}))/g;
+function keychainUnescape(t, re = KEYCHAIN_ESC_RE) {
+  return t.replace(re, (m, x, u, b, o) => {
+    const cp = o !== undefined ? parseInt(o, 8) : parseInt(x || u || b, 16);
+    return cp <= 0x10ffff ? String.fromCodePoint(cp) : m;
+  });
+}
+// The shell drops quotes and line continuations before the interpreter decodes, so an escape split by them counts too.
+const KEYCHAIN_SHELL_JOIN_RE = /\\\r?\n|['"]/g;
+// A name that merely ends in zn-gate/lib/client (acme-zn-gate/lib/client) is refused on purpose: no left boundary, so a
+// trick that leaves a letter before the name cannot get past the rule.
+const keychainLibName = (t) => {
+  const j = t.replace(KEYCHAIN_SHELL_JOIN_RE, '');
+  return [t, keychainUnescape(j), keychainUnescape(j, KEYCHAIN_SH_ESC_RE)].some((c) => KEYCHAIN_LIB_NAME_RE.test(c.replace(KEYCHAIN_DOT_RE, '')));
+};
+const KEYCHAIN_LIB_USE_RE = /(?:loadStoredKey|resolveApiKey|\b_native\b|CLOUD_SLOT|loadIdentity|storeIdentity|\banalyze\b|\bisCloudEnabled\b)/;
+
+/*
+ * A single simple command that only writes or searches text: `git commit|grep|log|show`, `echo`, `printf`. Such a
+ * command never reads the keychain, so a commit message or a search pattern may name zn's entries. Anything with a
+ * second command, a pipe, a substitution or a newline is not exempt (the words are then checked as usual), and
+ * neither is a git command that can run another program (-c, aliases, --open-files-in-pager, --exec).
+ */
+const TEXT_ONLY_GIT = new Set(['commit', 'grep', 'log', 'show']);
+function textOnlyCommand(text) {
+  if (/[;&|\n\r`]|\$\(|<\(|>\(/.test(text)) return false;
+  const toks = text.trim().split(/\s+/).map((x) => x.replace(/^['"]+|['"]+$/g, ''));
+  let i = 0;
+  while (i < toks.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[i]) || ['env', 'command', 'nohup', 'time'].includes(programBase(toks[i])))) i++;
+  const prog = programBase(toks[i]);
+  if (prog === 'echo' || prog === 'printf') return true;
+  if (prog !== 'git') return false;
+  i++;
+  while (i < toks.length && (toks[i] === '--no-pager' || (toks[i] === '-C' && toks[i + 1] !== undefined))) i += toks[i] === '-C' ? 2 : 1;
+  if (!TEXT_ONLY_GIT.has(toks[i])) return false;
+  return !toks.slice(i + 1).some((x) => /^(?:-O|--open-files-in-pager|--exec|--ext-diff|--textconv|-c)(?:=|$)/.test(x) || /^-O./.test(x));
+}
+
+function programBase(word) {
+  return String(word || '').split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, '');
+}
+
+function keychainQuery(cmd, env) {
+  const text = String(cmd || '');
+  if (text.length > SHELL_SCAN_CAP) return false;
+  if (textOnlyCommand(text)) return false;
+  // zn's entries can be picked by service, account or label.
+  const names = ['zn-vault', 'zn-cloud', 'cloud-api-key', 'age-identity', 'zn-gate-cloud-api-key', 'zn-vault-identity', 'zn vault identity', 'zn-gate cloud API key'];
+  const custom = env && env.ZN_KEYCHAIN_SERVICE;
+  if (typeof custom === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(custom) && !names.includes(custom)) names.push(custom);
+  const named = (t) => names.some((n) => new RegExp('(?<![A-Za-z0-9._-])' + n.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&') + '(?![A-Za-z0-9._-])', 'i').test(t));
+  // Quotes, backslashes and backticks inside a name do not change what the tool sees.
+  for (const t of [text, text.replace(/['"`\\^]/g, '')]) {
+    // Dumping the keychain would include zn's entries whatever name is given.
+    if (KEYCHAIN_DUMP_RE.test(t) && KEYCHAIN_SECURITY_RE.test(t)) return true;
+    if (KEYCHAIN_WORD_RE.test(t) && named(t)) return true;
+    if (keychainLibName(t) && KEYCHAIN_LIB_LOAD_RE.test(t) && KEYCHAIN_LIB_USE_RE.test(t)) return true;
+  }
+  return false;
+}
+
 function bashDenial(cmd, opts = {}) {
   return shellPatchMessage(cmd, bashDenialOf(cmd, opts), opts);
 }
@@ -973,25 +1611,40 @@ function bashDenialOf(cmd, opts = {}) {
   if (String(cmd || '').length > SHELL_SCAN_CAP) return TOO_LONG_MESSAGE;
   const admin = adminCommand(cmd);
   if (admin) return adminDenial(admin, opts, cmd);
+  if (keychainQuery(cmd, opts.env || process.env)) return KEYCHAIN_MESSAGE;
   // The context (home, project, agent directories) is built once per command.
   opts = { ...opts, ctx: contextOf(opts) };
-  opts.budget = { until: Date.now() + CHECK_BUDGET_MS, disk: CHECK_BUDGET_DISK };
+  // The code of a shell inside the command (sh -c "...") is checked as a command of its own, with the same budget.
+  const depth = opts.depth || 0;
+  if (!depth || !opts.budget) opts.budget = { until: Date.now() + CHECK_BUDGET_MS, disk: CHECK_BUDGET_DISK };
+  // The bodies of the here-documents read as data are data, not command-line words, and are dropped first.
+  const text = stripHeredocs(cmd, opts.budget);
   // The command is read three times: a backslash before a letter is a Windows
   // path separator or a bash escape, and a PowerShell backtick is an escape too.
   // A word protected in any reading is refused.
-  const readings = [allWords(cmd, false), allWords(cmd, true), allWords(String(cmd).replace(/`(.)/gs, '$1'), false)];
+  const readings = [allWords(text, false), allWords(text, true), allWords(text.replace(/`(.)/gs, '$1'), false)];
   // Bash $'...' quoting spells characters as escapes ($'\x2eenv' is .env), and $"..." is a plain "...":
   // a fourth reading with them decoded.
-  if (/\$['"]/.test(String(cmd))) readings.push(allWords(decodeAnsiC(String(cmd)), true));
+  if (/\$['"]/.test(text)) readings.push(allWords(decodeAnsiC(text), true));
   // A reading that could not be split to the end is refused, not checked in part.
   if (readings.some((r) => r.truncated)) return TOO_MANY_MESSAGE;
   const words = readings.flat();
+  const codes = new Set();
+  for (const r of readings) shellCodesOf(r, codes);
+  if (codes.size) {
+    if (depth >= SHELL_CODE_DEPTH) return TOO_NESTED_MESSAGE;
+    for (const code of codes) {
+      if (overBudget(opts.budget, 5)) return TOO_SLOW_MESSAGE;
+      const deny = bashDenialOf(code, { ...opts, depth: depth + 1 });
+      if (deny) return deny;
+    }
+  }
   // Inside $( ) or backticks the text is not split into simple commands, so
   // every word of it is checked on its own, as if it were a word of the command.
   // The same for the code an interpreter runs (python -c "open('.env')"), where a path sits inside quotes and brackets.
-  if (/\$\(|`/.test(String(cmd)) || words.some((w) => CODE_CMDS_RE.test(bareHead(w.head)))) {
+  if (/\$\(|`/.test(text) || words.some((w) => CODE_CMDS_RE.test(bareHead(w.head)))) {
     const split = [];
-    for (const t of String(cmd).split(/[\s'"`$(){};|&<>=,]+/)) if (t) split.push({ text: t, redirectTarget: false, head: '', seq: 0 });
+    for (const t of text.split(/[\s'"`$(){};|&<>=,]+/)) if (t) split.push({ text: t, redirectTarget: false, head: '', seq: 0 });
     words.push(...split);
     readings.push(split);
   }
@@ -1000,7 +1653,7 @@ function bashDenialOf(cmd, opts = {}) {
   opts.cdBases = cdBasesOf(readings, opts);
   opts.elsewhere = new Map();
   if (overBudget(opts.budget, 0)) return TOO_SLOW_MESSAGE;
-  opts.cmdText = String(cmd);
+  opts.cmdText = text;
   // A word is classified once per command: each classification resolves the path on disk, and a long command
   // often repeats the same words.
   const classified = new Map();
@@ -1011,13 +1664,15 @@ function bashDenialOf(cmd, opts = {}) {
   const GLOB_NAME_LOOKAHEAD = 32;
   let globDeny = null;
   let afterGlob = 0;
+  // A <rev>:<path> word is read as a git object in any command that runs git (echo HEAD:.env | xargs git show).
+  const anyGit = words.some((x) => x.git || x.text === 'git' || x.text.endsWith('/git'));
   for (const w of words) {
     // --flag=value carries a path too (--kubeconfig=~/.kube/config).
     let text = w.text;
     if (text.startsWith('-')) {
       const eq = text.indexOf('=');
       // git log -L<range>:<file> names a file after the colon.
-      const lineRange = isGit(w.head) ? /^-L[^:]*:(.+)$/.exec(text) : null;
+      const lineRange = w.git ? /^-L[^:]*:(.+)$/.exec(text) : null;
       if (lineRange) text = lineRange[1];
       else if (eq < 0) continue;
       else text = text.slice(eq + 1);
@@ -1026,6 +1681,8 @@ function bashDenialOf(cmd, opts = {}) {
       text = text.slice(text.indexOf('=') + 1);
     }
     if (!text) continue;
+    // A git pathspec with magic names the path after it.
+    if (anyGit && text.charCodeAt(0) === 58) text = text.replace(PATHSPEC_MAGIC_RE, '') || text;
     const writing = !READ_ONLY_CMDS.has(w.head);
     if (!classified.has(text)) {
       if (globDeny && ++afterGlob > GLOB_NAME_LOOKAHEAD) return globDeny;
@@ -1033,11 +1690,11 @@ function bashDenialOf(cmd, opts = {}) {
       classified.set(text, classifyWord(text, opts));
     }
     const c = classified.get(text);
-    if ((!c || c.kind === 'dotenv') && isGit(w.head)) {
+    if ((!c || c.kind === 'dotenv' || c.kind === 'keyfile') && (w.git || anyGit)) {
       // git show HEAD:.env, git cat-file -p :app/.env: a secret file read from the repository, not from disk.
       const deny = gitObjectDenial(text, opts) ||
         // git log -p -- .env, git checkout HEAD -- .env: its history, also once the file is gone from disk.
-        (c && gitReadsContent(w.sub, w.gitArgs) ? gitHistoryDenial(text) : null);
+        (c && w.git && gitReadsContent(w.sub, w.gitArgs) ? gitHistoryDenial(text) : null);
       if (deny) return deny;
     }
     if (!c) {
@@ -1055,7 +1712,7 @@ function bashDenialOf(cmd, opts = {}) {
     let deny;
     if (denied.has(text)) deny = denied.get(text);
     else { deny = denialOf(c, text, opts); denied.set(text, deny); }
-    if (!deny && c.kind === 'dotenv') deny = dotenvElsewhereDenial(text, opts);
+    if (!deny && (c.kind === 'dotenv' || c.kind === 'keyfile')) deny = dotenvElsewhereDenial(text, opts, c.kind);
     if (deny && /[*?[]/.test(text)) { globDeny = globDeny || deny; continue; }
     if (deny) return deny;
   }
@@ -1092,6 +1749,65 @@ const GIT_VALUE_OPTS = new Set(['-c', '-C', '--git-dir', '--work-tree', '--names
 function isGit(head) {
   return String(head || '').replace(/\.exe$/, '') === 'git';
 }
+
+// Programs that run the next command: git behind them is still git. For each, the short options that take a value
+// (skipped with it); every other option is a flag. A wrapper not listed here, or a chain that does not resolve, falls
+// back to the first word that is git (a refused command is the safe side).
+const GIT_WRAPPERS = {
+  sudo: 'ugphCDrtUTR', doas: 'uC', env: 'uCS', command: '', nohup: '', time: 'fo', builtin: '', exec: 'a', nice: 'n', timeout: 'sk',
+  xargs: 'IinLPdEsa', setsid: '', ionice: 'cnpPu', stdbuf: 'ioe', busybox: '',
+  chrt: '', taskset: 'c', chroot: 'ug', runuser: 'ugGsT', unbuffer: '', strace: 'eopsuEaOSbPIX', ltrace: 'eopsunal', nsenter: 'tSG', flock: 'wE',
+};
+// Wrappers that take positional arguments before the command: chrt <priority>, taskset <mask> (not with -c), chroot <newroot>, flock <lock>.
+const WRAPPER_POSITIONAL = { chrt: 1, taskset: 1, chroot: 1, flock: 1 };
+const WRAPPER_LONG_VALUE = new Set(['--user', '--group', '--chdir', '--unset', '--max-args', '--max-procs', '--replace', '--delimiter',
+  '--arg-file', '--eof', '--signal', '--kill-after', '--split-string', '--cpu-list', '--host', '--prompt', '--close-from', '--role', '--type']);
+
+function wordIsGit(text) {
+  return isGit(String(text).replace(/^\(+/, '').split(/[\\/]/).pop().toLowerCase());
+}
+
+/* The index of the word after a wrapper and its options (and the values some take), env's assignments and timeout's duration. */
+function skipWrapper(words, k, name) {
+  const valueOpts = GIT_WRAPPERS[name];
+  let sawC = false;
+  k++;
+  while (k < words.length) {
+    const t = words[k].text;
+    if (t === '--') { k++; break; }
+    if (t.startsWith('--') && t.length > 2) { k += !t.includes('=') && WRAPPER_LONG_VALUE.has(t) ? 2 : 1; continue; }
+    if (t.startsWith('-') && t.length > 1) {
+      if (t === '-c') sawC = true;
+      // -n, -E, -En: flags; a cluster ending in an option that takes a value (sudo -u root) takes the next word.
+      k += /^-[A-Za-z]+$/.test(t) && valueOpts.includes(t[t.length - 1]) ? 2 : 1;
+      continue;
+    }
+    if (ASSIGNMENT_RE.test(t) || (name === 'timeout' && /^[0-9.]+[smhd]?$/.test(t))) { k++; continue; }
+    break;
+  }
+  if (WRAPPER_POSITIONAL[name] && k < words.length && !(name === 'taskset' && sawC)) k += WRAPPER_POSITIONAL[name];
+  return k;
+}
+
+/* The index of the word that is git in a simple command, directly or behind wrappers; -1 when it is not git. */
+function gitStart(words) {
+  let k = words.findIndex((x) => !ASSIGNMENT_RE.test(x.text));
+  if (k < 0) return -1;
+  const first = k;
+  for (let guard = 0; guard < 16; guard++) {
+    if (wordIsGit(words[k].text)) return k;
+    const name = String(words[k].text).replace(/^\(+/, '').split(/[\\/]/).pop().toLowerCase();
+    if (!Object.prototype.hasOwnProperty.call(GIT_WRAPPERS, name)) break;
+    k = skipWrapper(words, k, name);
+    if (k >= words.length) break;
+  }
+  // The chain did not resolve to git: the first word that is git counts as the start, so nothing slips past.
+  for (let j = first; j < words.length; j++) if (wordIsGit(words[j].text)) return j;
+  return -1;
+}
+
+// A git pathspec starts with :(magic) or :/ ... before the path (':(top).env', ':/.env', ':(glob)**/.env').
+const PATHSPEC_MAGIC_RE = /^:(?:\([^)]*\)|[\/!^])+(?=.)/;
 
 /* The subcommand of a git command: the first word after git that is not a global option (git -C app -c k=v log). */
 function gitSubcommand(words) {
@@ -1156,7 +1872,7 @@ function gitObjectDenial(text, opts) {
 // Commands that change the directory the rest of the command runs in.
 const CD_CMDS = new Set(['cd', 'chdir', 'pushd', 'sl', 'set-location', 'push-location']);
 // Interpreters and shells whose code argument can name a file inside quotes or brackets.
-const CODE_CMDS_RE = /^(?:python[0-9.]*|py|node|nodejs|deno|bun|ruby|perl|php|lua|osascript|pwsh|powershell|bash|sh|zsh|dash|ksh|fish|cmd)(?:\.exe)?$/;
+const CODE_CMDS_RE = /^(?:python[0-9.]*|py|node|nodejs|deno|bun|ruby|perl|php|lua|osascript|pwsh|powershell|bash|sh|zsh|dash|ksh|fish|cmd|iex|invoke-expression)(?:\.exe)?$/;
 const CD_BASES_MAX = 16;
 
 function bareHead(h) {
@@ -1205,14 +1921,15 @@ function cdBasesOf(readings, opts) {
 /* A .env path the working directory alone does not settle: one built while the command runs ($DIR/.env, $(...)/.env),
    or one read after a cd. Refused when zn cannot rule out that it reaches a .env file with values.
    The answer is kept per word: the places a cd leads to are the same for the whole command. */
-function dotenvElsewhereDenial(text, opts) {
-  if (opts.elsewhere && opts.elsewhere.has(text)) return opts.elsewhere.get(text);
-  const deny = dotenvElsewhereOf(text, opts);
-  if (opts.elsewhere) opts.elsewhere.set(text, deny);
+function dotenvElsewhereDenial(text, opts, kind = 'dotenv') {
+  const key = kind + '\0' + text;
+  if (opts.elsewhere && opts.elsewhere.has(key)) return opts.elsewhere.get(key);
+  const deny = dotenvElsewhereOf(text, opts, kind);
+  if (opts.elsewhere) opts.elsewhere.set(key, deny);
   return deny;
 }
 
-function dotenvElsewhereOf(text, opts) {
+function dotenvElsewhereOf(text, opts, kind = 'dotenv') {
   const home = opts.home || os.homedir();
   const env = opts.env || process.env;
   const expanded = expandEnv(expandHome(text, home), env).text;
@@ -1221,7 +1938,14 @@ function dotenvElsewhereOf(text, opts) {
   // (`cat $(echo app)/.env` leaves the word /.env right after the closing bracket).
   const cmdText = opts.cmdText || '';
   const afterSubstitution = /[()]/.test(text) || cmdText.includes(')' + text) || cmdText.includes('`' + text);
-  if (/[$`]/.test(expanded) || (missing && afterSubstitution)) {
+  // A path that starts at a Windows root or a network share (\\server\share\.env, \\?\C:\path\.env,
+  // \folder\.env, //server/share/.env): zn cannot follow it, so a .env reached through it is refused.
+  if (kind === 'dotenv' && (String(text).startsWith('\\') || String(text).startsWith('//'))) {
+    return 'zn: this command reads ' + text + ' through a path zn cannot check (a Windows root or a network share), so it was blocked. ' +
+      'Give the path from the current folder instead, for example `cat app/.env`.';
+  }
+  // A key file is judged by its content where the cd leads; only a .env is refused for a path built while the command runs.
+  if (kind === 'dotenv' && (/[$`]|%[A-Za-z_][A-Za-z0-9_]*%/.test(expanded) || (missing && afterSubstitution))) {
     return 'zn: this command builds the path of a .env file while it runs (' + text + '), so zn cannot check whether it holds secrets. ' +
       'Name the file directly, for example `cat app/.env`; if it holds values, ask the user to run `' + znCommand('env shadow .env', opts) + '` in that folder.';
   }
@@ -1234,7 +1958,8 @@ function dotenvElsewhereOf(text, opts) {
   for (const dir of bases.dirs) {
     if (dir === cwd) continue;
     if (overBudget(opts.budget, 1)) return TOO_SLOW_MESSAGE;
-    const deny = readDenial(text, { ...opts, cwd: dir, env: pwdRef ? { ...env, PWD: dir } : env });
+    const where2 = { ...opts, cwd: dir, env: pwdRef ? { ...env, PWD: dir } : env };
+    const deny = kind === 'keyfile' ? keyFileDenial(text, { kind }, where2) : readDenial(text, where2);
     if (deny) {
       // The folder as the user would type it: relative below the current folder, absolute above it.
       const rel = path.relative(cwd, dir);
@@ -1244,7 +1969,7 @@ function dotenvElsewhereOf(text, opts) {
   }
   if (bases.unknown) {
     return 'zn: this command changes to a folder zn cannot follow and then reads ' + text + ', so zn cannot check whether it holds secrets. ' +
-      'Give the path from the current folder instead, for example `cat app/.env`.';
+      'Give the path from the current folder instead, for example `' + (kind === 'keyfile' ? 'cat certs/server.pem' : 'cat app/.env') + '`.';
   }
   return null;
 }
@@ -1280,6 +2005,9 @@ function adminDenial(admin, opts = {}, cmd = '') {
   if (/^(un)?lock$/i.test(admin)) {
     return 'zn blocked this: locking or unlocking the secret vault is the user\'s decision, so an agent may not run `' + znCommand(admin, opts) + '`. ' + run(admin);
   }
+  if (/^(dis)?connect$/i.test(admin)) {
+    return 'zn blocked this: `' + znCommand(admin, opts) + '` turns the optional cloud check on or off and handles your zn API key, which is the user\'s decision. ' + run(admin);
+  }
   if (/^stats/i.test(admin)) {
     return 'zn blocked this: only the user can turn on sharing of zn\'s usage statistics. ' + run('stats share on');
   }
@@ -1289,7 +2017,8 @@ function adminDenial(admin, opts = {}, cmd = '') {
 /** The deny message for a read or write classified by classifyWord. */
 function denialOf(c, text, opts) {
   if (c.kind === 'zn_state') return vaultMessage(opts);
-  if (c.kind === 'dotenv' || c.kind === 'keyfile') return readDenial(text, opts);
+  if (c.kind === 'keyfile') return keyFileDenial(text, c, opts);
+  if (c.kind === 'dotenv') return readDenial(text, opts);
   return credentialDenial(text, c);
 }
 

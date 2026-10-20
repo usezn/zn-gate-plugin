@@ -38,6 +38,13 @@ function service() {
   return s;
 }
 
+/* The entry a backend reads and writes: service (target) name, account and label.
+ * Default: the vault identity. `zn-gate connect` keeps its API key in a second slot (CLOUD_SLOT). */
+function defaultSlot() {
+  return { service: service(), account: ACCOUNT, label: 'zn-vault-identity' };
+}
+const CLOUD_SLOT = Object.freeze({ service: 'zn-cloud', account: 'cloud-api-key', label: 'zn-gate-cloud-api-key' });
+
 /* Keychain helpers run by absolute path, never looked up on PATH: a
  * planted `secret-tool` or `powershell.exe` earlier on PATH would see the
  * identity. */
@@ -91,23 +98,26 @@ function macKeychainArgs() {
 }
 
 const macos = {
-  store(identity) {
+  store(identity, slot) {
+    const sl = slot || defaultSlot();
     // `security -i` reads the command from stdin, so the identity never
     // shows up in the process list.
     const kc = process.env.ZN_KEYCHAIN_PATH;
     if (kc && /\s/.test(kc)) throw znError(CODES.POLICY_DENIED, 'ZN_KEYCHAIN_PATH must not contain spaces. Next step: choose a folder path without spaces, or, if you are an agent, ask the user to do it.');
-    const line = ['add-generic-password', '-U', '-s', service(), '-a', ACCOUNT, '-l', 'zn-vault-identity', '-w', identity].concat(kc ? [kc] : []).join(' ') + '\n';
+    const line = ['add-generic-password', '-U', '-s', sl.service, '-a', sl.account, '-l', sl.label || 'zn-vault-identity', '-w', identity].concat(kc ? [kc] : []).join(' ') + '\n';
     const res = run('/usr/bin/security', ['-i'], line);
     if (res.status !== 0) throw znError(CODES.LOCKED, 'macOS keychain refused the identity (security exit ' + res.status + ')');
   },
-  load() {
-    const res = run('/usr/bin/security', ['find-generic-password', '-s', service(), '-a', ACCOUNT, '-w'].concat(macKeychainArgs()));
+  load(slot) {
+    const sl = slot || defaultSlot();
+    const res = run('/usr/bin/security', ['find-generic-password', '-s', sl.service, '-a', sl.account, '-w'].concat(macKeychainArgs()));
     if (res.status === 44) return null; // errSecItemNotFound
     if (res.status !== 0) throw znError(CODES.LOCKED, 'macOS keychain read failed (security exit ' + res.status + ')');
     return res.stdout.trim();
   },
-  remove() {
-    const res = run('/usr/bin/security', ['delete-generic-password', '-s', service(), '-a', ACCOUNT].concat(macKeychainArgs()));
+  remove(slot) {
+    const sl = slot || defaultSlot();
+    const res = run('/usr/bin/security', ['delete-generic-password', '-s', sl.service, '-a', sl.account].concat(macKeychainArgs()));
     return res.status === 0;
   },
 };
@@ -183,7 +193,8 @@ const WIN_SCRIPT = [
   '}',
 ].join('\r\n');
 
-function winCred(op, input) {
+function winCred(op, input, slot) {
+  const sl = slot || defaultSlot();
   const ps = powershellPath();
   if (!ps) {
     throw znError(CODES.LOCKED, 'the Windows Credential Manager needs the system PowerShell (Windows PowerShell 5.1, in System32\\WindowsPowerShell\\v1.0), '
@@ -191,22 +202,22 @@ function winCred(op, input) {
   }
   const encoded = Buffer.from(WIN_SCRIPT, 'utf16le').toString('base64');
   return run(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], input,
-    { ZN_CRED_OP: op, ZN_CRED_TARGET: service() + ':' + ACCOUNT });
+    { ZN_CRED_OP: op, ZN_CRED_TARGET: sl.service + ':' + sl.account });
 }
 
 const windows = {
-  store(identity) {
-    const res = winCred('write', identity);
+  store(identity, slot) {
+    const res = winCred('write', identity, slot);
     if (res.status !== 0 || res.stdout.trim() !== 'ok') throw znError(CODES.LOCKED, 'Windows Credential Manager refused the identity (exit ' + res.status + ')');
   },
-  load() {
-    const res = winCred('read');
+  load(slot) {
+    const res = winCred('read', undefined, slot);
     if (res.status === 3) return null;
     if (res.status !== 0) throw znError(CODES.LOCKED, 'Windows Credential Manager read failed (exit ' + res.status + ')');
     return res.stdout.trim();
   },
-  remove() {
-    return winCred('delete').status === 0;
+  remove(slot) {
+    return winCred('delete', undefined, slot).status === 0;
   },
 };
 
@@ -221,12 +232,14 @@ function secretTool() {
 }
 
 const libsecret = {
-  store(identity) {
-    const res = run(secretTool(), ['store', '--label=zn vault identity', 'service', service(), 'account', ACCOUNT], identity);
+  store(identity, slot) {
+    const sl = slot || defaultSlot();
+    const res = run(secretTool(), ['store', '--label=' + (slot ? 'zn-gate cloud API key' : 'zn vault identity'), 'service', sl.service, 'account', sl.account], identity);
     if (res.status !== 0) throw znError(CODES.LOCKED, 'Secret Service refused the identity (secret-tool exit ' + res.status + ')');
   },
-  load() {
-    const res = run(secretTool(), ['lookup', 'service', service(), 'account', ACCOUNT]);
+  load(slot) {
+    const sl = slot || defaultSlot();
+    const res = run(secretTool(), ['lookup', 'service', sl.service, 'account', sl.account]);
     const out = (res.stdout || '').trim();
     if (res.status !== 0 && !out) {
       if (res.status === 1) return null;
@@ -234,8 +247,9 @@ const libsecret = {
     }
     return out || null;
   },
-  remove() {
-    return run(secretTool(), ['clear', 'service', service(), 'account', ACCOUNT]).status === 0;
+  remove(slot) {
+    const sl = slot || defaultSlot();
+    return run(secretTool(), ['clear', 'service', sl.service, 'account', sl.account]).status === 0;
   },
 };
 
@@ -340,17 +354,27 @@ async function initIdentity(opts) {
   return { backend, recipient, identity };
 }
 
-/** Remove the identity from its backend (the vault becomes unreadable). */
+/**
+ * Remove the identity from its backend (the vault becomes unreadable).
+ * Safe default: the OS keychain slot does not depend on ZN_HOME, so it may
+ * belong to another vault. Without keychain.json for this home and without an
+ * explicit backend, nothing is deleted.
+ * Returns {deleted, backend} or {deleted: false, reason}.
+ */
 async function deleteIdentity(opts) {
   const o = opts || {};
   const meta = readMeta(o);
-  const backend = o.backend || (meta && meta.backend) || detectBackend();
+  const backend = o.backend || (meta && meta.backend);
+  if (!backend) {
+    return { deleted: false, reason: 'no keychain.json in this vault and no backend given, so nothing was deleted (the keychain slot may belong to another vault). Next step: pass the backend explicitly.' };
+  }
   if (backend === 'passphrase') {
     try { fs.unlinkSync(store.paths(o).identityFile); } catch (err) { /* ignore */ }
   } else {
     NATIVE[backend].remove();
   }
   try { fs.unlinkSync(store.paths(o).metaFile); } catch (err) { /* ignore */ }
+  return { deleted: true, backend };
 }
 
 module.exports = {
@@ -363,5 +387,6 @@ module.exports = {
   readMeta,
   MIN_PASSPHRASE,
   DEFAULT_WORK_FACTOR,
+  CLOUD_SLOT,
   _native: NATIVE,
 };

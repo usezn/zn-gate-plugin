@@ -30,6 +30,13 @@
           { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-launch.js\" hook claude-code", "timeout": 15, "onFailure": "block" }
         ]
       }
+    ],
+    "UserPromptExpansion": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-launch.js\" hook claude-code", "timeout": 15, "onFailure": "block" }
+        ]
+      }
     ]
   }
 }

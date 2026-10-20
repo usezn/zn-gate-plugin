@@ -46,12 +46,20 @@ const DOTENV_SAFE_RE = /\.(example|sample|template|dist|defaults|schema)$/i;
 
 // Control and bidirectional characters: a file or server name from a repository could otherwise move the
 // cursor, clear the screen or reorder the text in the user's terminal.
-const UNSAFE_CHARS_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/g;
+const UNSAFE_CHARS_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+// Characters that end a line or a column: in a one-line field they become a space, so a name cannot start
+// a line of its own in the report.
+const LINE_BREAK_RE = /[\r\n\t\u2028\u2029]+/g;
+// Zero-width, invisible and tag characters: they hide text from the reader and can split a value so that
+// it is not recognised, so they are removed before the value is hidden and again after.
+const INVISIBLE_RE = /[\u200b-\u200d\u2060-\u2064\ufeff\u{e0000}-\u{e007f}]/gu;
 
-/** Text that is safe to show: secret values redacted (as zn audit does), unsafe characters replaced. */
+/** Text that is safe to show on one line: invisible characters removed, secret values redacted (as zn audit
+ * does), line breaks turned into spaces and other unsafe characters replaced. */
 function safeText(s) {
   const { redact } = require('../audit');
-  return redact(String(s == null ? '' : s)).replace(UNSAFE_CHARS_RE, '?');
+  const clean = String(s == null ? '' : s).replace(INVISIBLE_RE, '').replace(LINE_BREAK_RE, ' ');
+  return redact(clean).replace(INVISIBLE_RE, '').replace(LINE_BREAK_RE, ' ').replace(UNSAFE_CHARS_RE, '?');
 }
 
 function displayHome(rel) {
@@ -245,8 +253,40 @@ async function reach(opts = {}) {
  * ~/.zn), so the next run can say "was N". Only counts and a date, under a hash of the folder path: no
  * path, name or value. Without --remember nothing is read or written.
  */
+const MAX_MEMORY_BYTES = 1024 * 1024;
+
 function memoryFile(home, env) {
   return path.join(env.ZN_HOME ? path.resolve(env.ZN_HOME) : path.join(home, '.zn'), 'reach-last.json');
+}
+
+/**
+ * The text of a regular file of at most `max` bytes, or null (absent, a folder, a pipe or a device, a link,
+ * too big, unreadable). The file is opened without following a link and without waiting for a writer, and
+ * the size is checked on the open file, so a named pipe or /dev/zero cannot make the run hang or grow.
+ */
+function readSmallFile(file, max) {
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
+  } catch (_) {
+    return null;
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > max) return null;
+    const buf = Buffer.allocUnsafe(max + 1);
+    let got = 0;
+    while (got <= max) {
+      const r = fs.readSync(fd, buf, got, max + 1 - got, null);
+      if (r <= 0) break;
+      got += r;
+    }
+    return got > max ? null : buf.toString('utf8', 0, got);
+  } catch (_) {
+    return null;
+  } finally {
+    try { fs.closeSync(fd); } catch (_) { /* closed */ }
+  }
 }
 
 function remember(root, counts, home, env) {
@@ -256,7 +296,8 @@ function remember(root, counts, home, env) {
   // Only well-formed entries are kept: anything else in the file is dropped, never a reason to fail.
   const data = {};
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const text = readSmallFile(file, MAX_MEMORY_BYTES);
+    const parsed = text === null ? null : JSON.parse(text);
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       for (const [k, e] of Object.entries(parsed)) {
         if (/^[0-9a-f]{32}$/.test(k) && e && typeof e === 'object' && !Array.isArray(e)) data[k] = e;
@@ -266,7 +307,7 @@ function remember(root, counts, home, env) {
   const was = data[key] || null;
   // Whatever the file holds, only numbers and a YYYY-MM-DD date reach the report.
   const count = (n) => (Number.isSafeInteger(+n) && +n >= 0 ? +n : 0);
-  const day = /^\d{4}-\d{2}-\d{2}$/.test(String(was && was.at)) ? String(was.at) : 'an earlier run';
+  const day = typeof (was && was.at) === 'string' && was.at.length <= 40 && /^\d{4}-\d{2}-\d{2}$/.test(was.at) ? was.at : 'an earlier run';
   const previous = was ? { high: count(was.high), medium: count(was.medium), low: count(was.low), at: day } : null;
   data[key] = { high: counts.high, medium: counts.medium, low: counts.low, at: new Date().toISOString().slice(0, 10) };
   // Up to 200 folders: the oldest go first.
@@ -345,7 +386,7 @@ function report(r, write) {
     w('\n');
   }
   const p = r.previous;
-  const was = p ? ' (last time, ' + p.at + ': ' + p.high + ' high, ' + p.medium + ' medium, ' + p.low + ' low)' : '';
+  const was = p ? ' (last time, ' + safeText(p.at).replace(/[\r\n]+/g, ' ').slice(0, 40) + ': ' + p.high + ' high, ' + p.medium + ' medium, ' + p.low + ' low)' : '';
   w(r.counts.high + ' high, ' + r.counts.medium + ' medium, ' + r.counts.low + ' low' + was + '.\n\n');
   return 0;
 }
