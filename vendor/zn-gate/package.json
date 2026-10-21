@@ -1,7 +1,7 @@
 {
   "name": "zn-gate",
   "mcpName": "io.github.usezn/zn-gate",
-  "version": "1.13.0",
+  "version": "1.13.1",
   "description": "The local security layer for coding agents. zn-gate guards your secrets, your data and your systems while you use Claude Code, Codex CLI, Cursor or OpenCode.",
   "license": "MIT",
   "author": "usezn <admin@usezn.com>",

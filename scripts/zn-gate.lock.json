@@ -1,10 +1,10 @@
 {
   "package": "zn-gate",
-  "version": "1.13.0",
+  "version": "1.13.1",
   "registry": "https://registry.npmjs.org",
-  "integrity": "sha512-rVmmIP/6YxN38vYeZM9g/e1IaWDPqGMAIb950fDsCr036E+uYyHlQugdADY43i14EpqxxrQWskcTSx3yQ1wAtQ==",
+  "integrity": "sha512-KdnCD5Fq66ccAeP3NseEmnY4sg+VvPGlf2Vw+mab0ZqTc4yQnlrjv6l3L7PJ8z2Ki+ZtrPFbALU9Y+sYMCuWdg==",
   "bundled": "vendor/zn-gate",
-  "source": "29d33a25cebaf538f2f6f063357a78e3e88b085d",
+  "source": "de64a48773604de2db3eb629e1e592d091c38524",
   "files": {
     "LICENSE": "a14f2e34934125e28ec5b4f2eb3de931f91115157345a0262454f290f0a74fa9",
     "README.md": "7321bb7a015a3e615b280aaf0d7a759df14d52eb21e163bcbc72487c6b779dad",
@@ -213,6 +213,6 @@
     "node_modules/age-encryption/dist/webauthn.js": "f0cc43ba2916f3c8b4b948fc6e3ef6c0cac3fdf3eaf03e1eec8c17310c6ae560",
     "node_modules/age-encryption/dist/x25519.js": "6d40040e713b5d050b2c52a139e915e3b50792f29034a68c15014b8dfebc7774",
     "node_modules/age-encryption/package.json": "2f3b8be06de0b6c00139f51bb1085c368a2298b172ed63aa017ef75483a7987d",
-    "package.json": "d4c390e4ac74bda2d01adb828153224b55010c16d9801745711d06ce72652327"
+    "package.json": "c6d9c7924c0685eacd15f126f6b217c86ca9ed4dd17441b5e288a70420bc4bd6"
   }
 }
