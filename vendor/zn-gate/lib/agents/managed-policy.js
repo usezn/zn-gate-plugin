@@ -41,7 +41,7 @@ function readSource(file) {
     return { file, error: err.code || err.message };
   }
   try {
-    const data = text.trim() ? JSON.parse(text) : {};
+    const data = text.trim() ? JSON.parse(text.replace(/^\uFEFF/, '')) : {};
     return data && typeof data === 'object' && !Array.isArray(data) ? { file, data } : { file, error: 'not a JSON object' };
   } catch (err) {
     return { file, error: 'invalid JSON' };
@@ -68,7 +68,7 @@ function hasOurHook(data) {
   for (const groups of Object.values(hooks)) {
     for (const g of Array.isArray(groups) ? groups : []) {
       for (const h of g && Array.isArray(g.hooks) ? g.hooks : []) {
-        if (h && typeof h.command === 'string' && OUR_COMMAND_RE.test(h.command)) return true;
+        if (h && typeof h.command === 'string' && (OUR_COMMAND_RE.test(h.command) || require('./launcher').isProjectGuard(h.command, 'claude-code'))) return true;
       }
     }
   }
@@ -282,4 +282,173 @@ function codexPolicyWarnings(opts = {}) {
   return warnings;
 }
 
-module.exports = { claudeCodePolicyWarnings, managedDir, codexPolicyWarnings, _internal: { codexRequirementsFile, codexManagedConfigFile } };
+/* ------------------------------ Cursor ------------------------------ */
+
+/*
+ * Cursor's enterprise hooks.json (read 2026-10-19, https://cursor.com/docs/hooks):
+ *  macOS /Library/Application Support/Cursor/hooks.json, Linux and WSL /etc/cursor/hooks.json,
+ *  Windows C:\ProgramData\Cursor\hooks.json. Format: {"version": 1, "hooks": {"<event>": [{command, failClosed, ...}]}}.
+ *  Priority: Enterprise, Team, Project, User. Hooks from every source run and Cursor merges their responses
+ *  (a deny beats an ask, an ask beats an allow), so an enterprise file does not switch off hooks of the user.
+ *  failClosed (default false) makes a crash, timeout or empty reply block the action.
+ * Team hooks live in Cursor's dashboard and are not seen here.
+ */
+const CURSOR_FAIL_CLOSED_EVENTS = ['beforeReadFile', 'beforeSubmitPrompt'];
+
+function cursorEnterpriseFile(platform, env) {
+  if (platform === 'darwin') return '/Library/Application Support/Cursor/hooks.json';
+  if (platform === 'win32') return path.join((env && env.ProgramData) || 'C:\\ProgramData', 'Cursor', 'hooks.json');
+  return '/etc/cursor/hooks.json';
+}
+
+/**
+ * cursorPolicyWarnings(opts) -> [string]
+ * opts: {platform, env, hooksFile}  (hooksFile replaces the system path, for tests)
+ * Read-only. Empty when the enterprise file does not exist.
+ */
+function cursorPolicyWarnings(opts = {}) {
+  const { isOurs } = require('./config-file');
+  const file = opts.hooksFile || cursorEnterpriseFile(opts.platform || process.platform, opts.env || process.env);
+  const src = readSource(file);
+  if (!src) return [];
+  if (src.error) return ['could not read the Cursor enterprise hooks ' + src.file + ' (' + src.error + '), so zn cannot tell whether zn\'s hooks are set to fail closed there.'];
+  const hooks = src.data.hooks && typeof src.data.hooks === 'object' ? src.data.hooks : {};
+  const entries = (event) => (Array.isArray(hooks[event]) ? hooks[event] : []).filter((h) => h && typeof h === 'object');
+  const ours = (h) => isOurs(h.command, 'cursor');
+  const hasOurs = Object.keys(hooks).some((ev) => entries(ev).some(ours));
+  const hasAny = Object.keys(hooks).some((ev) => entries(ev).length > 0);
+  const warnings = [];
+  if (hasOurs) {
+    for (const ev of CURSOR_FAIL_CLOSED_EVENTS) {
+      if (!entries(ev).some((h) => ours(h) && h.failClosed === true)) {
+        warnings.push('The Cursor enterprise hooks ' + src.file + ' have no zn hook with "failClosed": true under hooks.' + ev
+          + ', so if zn\'s hook crashes or times out Cursor lets the ' + (ev === 'beforeReadFile' ? 'file read' : 'prompt') + ' through. Ask your administrator to add it.');
+      }
+    }
+  } else if (hasAny) {
+    warnings.push('The Cursor enterprise hooks ' + src.file + ' do not include zn\'s hook. They do not turn off the zn hooks you install: Cursor runs the hooks of every source and merges their replies, enterprise first. Run `zn team managed-config --agent cursor` to see what an administrator can add so zn fails closed.');
+  }
+  return warnings;
+}
+
+// JSON with the line and block comments that Gemini CLI allows in settings.json (comments outside strings are dropped).
+function parseJsonc(text) {
+  text = text.replace(/^\uFEFF/, '');
+  try { return JSON.parse(text); } catch (_) { /* try without comments */ }
+  let out = '';
+  let i = 0;
+  let inStr = false;
+  while (i < text.length) {
+    const c = text[i];
+    if (inStr) {
+      out += c;
+      if (c === '\\') { out += text[i + 1] || ''; i += 2; continue; }
+      if (c === '"') inStr = false;
+      i++;
+    } else if (c === '"') { inStr = true; out += c; i++; }
+    else if (c === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; }
+    else if (c === '/' && text[i + 1] === '*') { const j = text.indexOf('*/', i + 2); i = j < 0 ? text.length : j + 2; }
+    else { out += c; i++; }
+  }
+  return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
+}
+
+/**
+ * geminiPolicyWarnings({files: [{file, label}]}) -> [string]
+ * Read-only: Gemini CLI settings that stop hooks from running (read 2026-10-19):
+ *   hooksConfig.enabled false ("no hooks will be executed"), hooksConfig.disabled (hook names or commands that
+ *   do not run even when configured), and the older tools.enableHooks / hooks.enabled / hooks.disabled switches.
+ * The docs rank project over user over system settings; zn reports a switch in any of them, since a list is a
+ * union and a scalar from a higher file would only hide a lower one by turning hooks back on.
+ */
+function geminiPolicyWarnings(opts = {}) {
+  const { isOurs } = require('./config-file');
+  const warnings = [];
+  const named = (v) => typeof v === 'string' && (v === 'zn-gate' || isOurs(v, 'gemini'));
+  for (const { file, label } of opts.files || []) {
+    let text;
+    try { text = fs.readFileSync(file, 'utf8'); } catch (err) {
+      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') continue;
+      warnings.push('could not read ' + file + ' (' + (err.code || 'error') + '), so zn cannot tell whether it turns off its hooks.');
+      continue;
+    }
+    let data;
+    try { data = parseJsonc(text.replace(/^\uFEFF/, '')); } catch (_) {
+      warnings.push('could not read ' + file + ' (invalid JSON), so zn cannot tell whether it turns off its hooks.');
+      continue;
+    }
+    if (!data || typeof data !== 'object') continue;
+    const hc = data.hooksConfig && typeof data.hooksConfig === 'object' ? data.hooksConfig : {};
+    const hk = data.hooks && typeof data.hooks === 'object' && !Array.isArray(data.hooks) ? data.hooks : {};
+    const tl = data.tools && typeof data.tools === 'object' ? data.tools : {};
+    if (hc.enabled === false || tl.enableHooks === false || hk.enabled === false) {
+      warnings.push(label + ' (' + file + ') turn all hooks off (hooksConfig.enabled is false), so zn\'s hook does not run. Set it to true to turn hooks on.');
+      continue;
+    }
+    const lists = [hc.disabled, hk.disabled].filter(Array.isArray);
+    if (lists.some((l) => l.some(named))) {
+      warnings.push(label + ' (' + file + ') list zn\'s hook in hooksConfig.disabled (for example after `/hooks disable`), so it does not run. Remove it from that list, or run `/hooks enable zn-gate` in Gemini CLI.');
+    }
+  }
+  return warnings;
+}
+
+/* ------------------------- zn installed by the organization ------------------------- */
+
+/*
+ * Whether zn's hooks are in the agent's managed configuration (what an administrator deploys with MDM or
+ * configuration management; `zn team managed-config` prints it). Read-only. Verified 2026-10-19 against:
+ *  https://code.claude.com/docs/en/settings  (managed-settings.json, managed-settings.d/*.json)
+ *  https://cursor.com/docs/hooks             (enterprise hooks.json)
+ *  https://learn.chatgpt.com/docs/enterprise/managed-configuration (requirements.toml: [[hooks.<Event>]])
+ * Hooks of the managed layer and of the user both run, so a user-level setup next to it runs twice.
+ * Policy sent through MDM profiles, the Windows registry or the agent's cloud is not seen here.
+ */
+
+/* [{event, matcher, command}] for every hook command in a hooks tree that is zn's own for this agent. */
+function ourHookEntries(hooks, agentId) {
+  const { isOurs } = require('./config-file');
+  const out = [];
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return out;
+  for (const [event, list] of Object.entries(hooks)) {
+    for (const g of Array.isArray(list) ? list : []) {
+      if (!g || typeof g !== 'object') continue;
+      const cands = [g];
+      for (const h of Array.isArray(g.hooks) ? g.hooks : []) cands.push(h);
+      for (const h of cands) {
+        if (!h || typeof h !== 'object') continue;
+        const command = [h.command, h.command_windows, h.commandWindows].find((c) => isOurs(c, agentId));
+        if (command) out.push({ event, matcher: g.matcher, command });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * managedInstall(agentId, opts) -> {files: [path], entries: [{event, matcher, command}]} | null
+ * null when no managed file holds a zn hook. agentId: 'claude-code', 'codex' or 'cursor'.
+ * opts: the same injectable paths as the policy checks above (managedDir; requirementsFile; hooksFile;
+ * platform, env), so tests never read the real system folders.
+ */
+function managedInstall(agentId, opts = {}) {
+  const platform = opts.platform || process.platform;
+  const env = opts.env || process.env;
+  const found = [];
+  if (agentId === 'claude-code') {
+    for (const s of managedSources(opts.managedDir || managedDir(platform))) {
+      if (s.data) found.push({ file: s.file, entries: ourHookEntries(s.data.hooks, agentId) });
+    }
+  } else if (agentId === 'codex') {
+    const r = readToml(opts.requirementsFile || codexRequirementsFile(platform, env));
+    if (r && r.data) found.push({ file: r.file, entries: ourHookEntries(r.data.hooks, agentId) });
+  } else if (agentId === 'cursor') {
+    const r = readSource(opts.hooksFile || cursorEnterpriseFile(platform, env));
+    if (r && r.data) found.push({ file: r.file, entries: ourHookEntries(r.data.hooks, agentId) });
+  }
+  const withZn = found.filter((f) => f.entries.length);
+  if (!withZn.length) return null;
+  return { files: withZn.map((f) => f.file), entries: withZn.flatMap((f) => f.entries) };
+}
+
+module.exports = { claudeCodePolicyWarnings, managedDir, codexPolicyWarnings, cursorPolicyWarnings, geminiPolicyWarnings, managedInstall, _internal: { codexRequirementsFile, codexManagedConfigFile, cursorEnterpriseFile, ourHookEntries } };

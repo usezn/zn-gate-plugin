@@ -4,15 +4,15 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-launch.js\" check claude-code", "timeout": 15 }
+          { "type": "command", "shell": "bash", "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-node.sh\" SessionStart check claude-code", "timeout": 15 }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|PowerShell|Monitor|Read|Grep|LSP|Edit|MultiEdit|Write|NotebookEdit|WebFetch",
+        "matcher": "^(Bash|PowerShell|Monitor|Read|Grep|LSP|Edit|MultiEdit|Write|NotebookEdit|WebFetch)$|^mcp__.*",
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-launch.js\" hook claude-code", "timeout": 15 }
+          { "type": "command", "shell": "bash", "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-node.sh\" PreToolUse hook claude-code", "timeout": 15, "onFailure": "block" }
         ]
       }
     ],
@@ -20,21 +20,21 @@
       {
         "matcher": "^(Bash|PowerShell|Monitor|Read|Grep|LSP|WebFetch|ReadMcpResourceTool)$|^mcp__.*",
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-launch.js\" hook claude-code", "timeout": 15 }
+          { "type": "command", "shell": "bash", "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-node.sh\" PostToolUse hook claude-code", "timeout": 15 }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-launch.js\" hook claude-code", "timeout": 15, "onFailure": "block" }
+          { "type": "command", "shell": "bash", "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-node.sh\" UserPromptSubmit hook claude-code", "timeout": 15, "onFailure": "block" }
         ]
       }
     ],
     "UserPromptExpansion": [
       {
         "hooks": [
-          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-launch.js\" hook claude-code", "timeout": 15, "onFailure": "block" }
+          { "type": "command", "shell": "bash", "command": "/bin/sh \"${CLAUDE_PLUGIN_ROOT}/scripts/zn-node.sh\" UserPromptExpansion hook claude-code", "timeout": 15, "onFailure": "block" }
         ]
       }
     ]

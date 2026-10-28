@@ -83,8 +83,10 @@ function isRecord(r) {
  * Returns the parsed records in file order. Unparseable lines are skipped.
  * gapAt is the index of the first record whose seq is not previous + 1
  * (-1 when there is none); records from that index on are never sent.
+ * Records up to `after` (a sequence number) are left out: they came before
+ * the machine joined and were not consented to be shared.
  */
-function readRecords(auditFile) {
+function readRecords(auditFile, after) {
   let text;
   try {
     text = fs.readFileSync(auditFile, 'utf8');
@@ -97,7 +99,7 @@ function readRecords(auditFile) {
     if (!line.trim()) continue;
     let rec;
     try { rec = JSON.parse(line); } catch (err) { continue; }
-    if (isRecord(rec)) records.push(rec);
+    if (isRecord(rec) && rec.seq > (after || 0)) records.push(rec);
   }
   let gapAt = -1;
   for (let i = 1; i < records.length; i++) {
@@ -152,8 +154,16 @@ function acquireLock(lockFile, nowMs) {
 }
 
 function releaseLock(lockFile, fd) {
+  // The lock may have been deleted meanwhile (`zn team leave`) and another one created by a new membership:
+  // delete the file only if it is still the one this upload created.
+  let ours = false;
+  try {
+    const mine = fs.fstatSync(fd, { bigint: true });
+    const there = fs.statSync(lockFile, { bigint: true });
+    ours = mine.ino === there.ino && mine.dev === there.dev;
+  } catch (err) { ours = false; }
   try { fs.closeSync(fd); } catch (err) { /* already closed */ }
-  try { fs.unlinkSync(lockFile); } catch (err) { /* already removed */ }
+  if (ours) { try { fs.unlinkSync(lockFile); } catch (err) { /* already removed */ } }
 }
 
 /* ------------------------------------------------------------------ */
@@ -174,7 +184,10 @@ function checkOptions(opts) {
   if (!Number.isInteger(maxBatches) || maxBatches < 1) throw new TypeError('uploadPending: maxBatches must be a positive integer');
   const now = opts.now === undefined ? Date.now : opts.now;
   if (typeof now !== 'function') throw new TypeError('uploadPending: now must be a function');
+  const startAfterSeq = opts.startAfterSeq === undefined ? 0 : opts.startAfterSeq;
+  if (!Number.isInteger(startAfterSeq) || startAfterSeq < 0) throw new TypeError('uploadPending: startAfterSeq must be a non-negative integer');
   return {
+    startAfterSeq,
     auditFile: opts.auditFile,
     stateFile: opts.stateFile,
     lockFile: opts.lockFile,
@@ -186,7 +199,17 @@ function checkOptions(opts) {
     now,
     // Called before each batch; true stops the upload (the vault was locked).
     shouldStop: typeof opts.shouldStop === 'function' ? opts.shouldStop : () => false,
+    // Async; false after a response means the membership changed during the request: nothing is written.
+    isCurrent: typeof opts.isCurrent === 'function' ? opts.isCurrent : null,
+    // Async; runs a write (the lock, the state file) in the caller's serialised section, only while the
+    // membership that started the upload is current. Resolves {stale: true} (nothing run) or {value}.
+    guard: typeof opts.guard === 'function' ? opts.guard : null,
   };
+}
+
+/* A write of this upload: through the caller's guard when there is one. */
+function guarded(o, fn) {
+  return o.guard ? o.guard(fn) : Promise.resolve({ value: fn() });
 }
 
 function isExpected(body) {
@@ -205,25 +228,57 @@ function apiFailure(status) {
   return { status: 'error', text: `unexpected HTTP ${status}` };
 }
 
+/*
+ * What a 200 answer confirms. The server says where its chain ends (head.seq,
+ * and optionally head.mac) and how many records of the batch it stored
+ * (accepted; fewer than the batch when the start overlapped what it held).
+ * Without a head, `accepted` counts from the start of the batch. An answer
+ * that says nothing, or contradicts itself or the batch, confirms nothing.
+ */
+function confirmedUpTo(batch, body) {
+  const bad = (text) => ({ outcome: { status: 'error', text } });
+  if (!body || typeof body !== 'object') return bad('unexpected response from server');
+  const accepted = body.accepted;
+  if (accepted !== undefined && (!Number.isInteger(accepted) || accepted < 0 || accepted > batch.length)) {
+    return bad('server answer is inconsistent (records accepted)');
+  }
+  let index;
+  if (body.head !== undefined) {
+    const h = body.head;
+    if (!h || typeof h !== 'object' || !Number.isInteger(h.seq)) return bad('server answer is inconsistent (chain head)');
+    index = batch.findIndex((r) => r.seq === h.seq);
+    if (index < 0) return bad('server confirmed a position outside the uploaded batch');
+    if (h.mac !== undefined && h.mac !== batch[index].mac) return { outcome: { status: 'diverged', text: TEXT_DIVERGED } };
+    if (accepted !== undefined && accepted > index + 1) return bad('server answer is inconsistent (records accepted)');
+  } else if (accepted !== undefined) {
+    if (accepted < 1) return bad('server stored none of the records');
+    index = accepted - 1;
+  } else {
+    return bad('server answer does not say what it stored');
+  }
+  return { record: batch[index], accepted: accepted === undefined ? index + 1 : accepted };
+}
+
 function pendingOf(o, head) {
   try {
-    return countPending(readRecords(o.auditFile).records, head);
+    return countPending(readRecords(o.auditFile, head ? 0 : o.startAfterSeq).records, head);
   } catch (err) {
     return -1;
   }
 }
 
 /* Records the failure in the state file. The head kept in memory is the one that was confirmed. */
-function fail(o, ctx, status, text) {
+async function fail(o, ctx, status, text) {
   const pending = pendingOf(o, ctx.head);
   try {
-    writeState(o.stateFile, { head: ctx.head, last_upload: ctx.lastUpload, last_status: status, last_error: text });
+    await guarded(o, () => writeState(o.stateFile, { head: ctx.head, last_upload: ctx.lastUpload, last_status: status, last_error: text }));
   } catch (err) { /* the state file could not be written; the result still reports the status */ }
   return { status, uploaded: ctx.uploaded, head: ctx.head, pending };
 }
 
 async function sync(o, ctx) {
-  const { records, gapAt } = readRecords(o.auditFile);
+  // Without a confirmed head, the upload starts after the join (o.startAfterSeq), not at the first record.
+  const { records, gapAt } = readRecords(o.auditFile, ctx.head ? 0 : o.startAfterSeq);
   const bySeq = new Map();
   let lastSeq = 0;
   for (const r of records) {
@@ -252,7 +307,7 @@ async function sync(o, ctx) {
   while (!outcome) {
     const from = ctx.head ? ctx.head.seq : 0;
     const start = sendable.findIndex((r) => r.seq > from);
-    if (start < 0 || batches >= o.maxBatches || o.shouldStop()) break;
+    if (start < 0 || batches >= o.maxBatches || await o.shouldStop()) break;
 
     const batch = sendable.slice(start, start + o.batchSize);
     const body = { install_id: o.installId };
@@ -283,17 +338,28 @@ async function sync(o, ctx) {
       break;
     }
 
+    if (o.isCurrent && !(await o.isCurrent())) {
+      ctx.stale = true;
+      outcome = { status: 'stale', text: 'the organization membership changed during the upload' };
+      break;
+    }
     if (!res || res.status !== 200) {
       outcome = { status: 'error', text: 'unexpected response from server' };
       break;
     }
-    const accepted = res.body && Number.isInteger(res.body.accepted) ? res.body.accepted : batch.length;
-    const last = batch[batch.length - 1];
-    ctx.head = { seq: last.seq, mac: last.mac };
-    ctx.uploaded += accepted;
+    const done = confirmedUpTo(batch, res.body);
+    if (done.outcome) { outcome = done.outcome; break; }
+    // The head moves only to the record the server confirmed, never past it.
+    ctx.head = { seq: done.record.seq, mac: done.record.mac };
+    ctx.uploaded += done.accepted;
     ctx.lastUpload = new Date(o.now()).toISOString();
     batches += 1;
-    writeState(o.stateFile, { head: ctx.head, last_upload: ctx.lastUpload, last_status: 'in_progress' });
+    const wrote = await guarded(o, () => writeState(o.stateFile, { head: ctx.head, last_upload: ctx.lastUpload, last_status: 'in_progress' }));
+    if (wrote.stale) {
+      ctx.stale = true;
+      outcome = { status: 'stale', text: 'the organization membership changed during the upload' };
+      break;
+    }
   }
 
   let status;
@@ -309,7 +375,12 @@ async function sync(o, ctx) {
   }
 
   const pending = countPending(records, ctx.head);
-  writeState(o.stateFile, { head: ctx.head, last_upload: ctx.lastUpload, last_status: status, last_error: text });
+  if (o.isCurrent && !(await o.isCurrent())) ctx.stale = true;
+  if (!ctx.stale) {
+    const wrote = await guarded(o, () => writeState(o.stateFile, { head: ctx.head, last_upload: ctx.lastUpload, last_status: status, last_error: text }));
+    if (wrote.stale) ctx.stale = true;
+  }
+  if (ctx.stale) return { status: 'stale', uploaded: ctx.uploaded, head: ctx.head, pending };
   return { status, uploaded: ctx.uploaded, head: ctx.head, pending };
 }
 
@@ -328,23 +399,27 @@ async function uploadPending(opts) {
   const ctx = { head: state.head, lastUpload: state.last_upload, uploaded: 0 };
   let fd = null;
   try {
-    fd = acquireLock(o.lockFile, o.now());
+    // The lock is a file in ~/.zn: it is created only while the membership that started the upload is current.
+    const locked = await guarded(o, () => acquireLock(o.lockFile, o.now()));
+    if (locked.stale) return { status: 'stale', uploaded: 0, head: ctx.head, pending: pendingOf(o, ctx.head) };
+    fd = locked.value;
     if (fd === null) {
       return { status: 'busy', uploaded: 0, head: ctx.head, pending: pendingOf(o, ctx.head) };
     }
     return await sync(o, ctx);
   } catch (err) {
-    return fail(o, ctx, 'error', 'local audit files could not be read or written');
+    return await fail(o, ctx, 'error', 'local audit files could not be read or written');
   } finally {
     if (fd !== null) releaseLock(o.lockFile, fd);
   }
 }
 
-/* Cheap count for `zn team status`: records after the stored head. */
+/* Cheap count for `zn team status`: records after the stored head (or after opts.startAfterSeq when there is none). */
 function pendingCount(opts) {
   const o = opts || {};
   const head = readState(o.stateFile).head;
-  return countPending(readRecords(o.auditFile).records, head);
+  const after = Number.isInteger(o.startAfterSeq) && o.startAfterSeq > 0 ? o.startAfterSeq : 0;
+  return countPending(readRecords(o.auditFile, head ? 0 : after).records, head);
 }
 
 module.exports = { uploadPending, pendingCount };

@@ -25,6 +25,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const store = require('./store');
 const { CODES, znError } = require('../errors');
+const messages = require('../messages');
 
 const BACKENDS = ['macos', 'windows', 'libsecret', 'passphrase'];
 const ACCOUNT = 'age-identity';
@@ -81,10 +82,10 @@ function run(cmd, args, input, extraEnv) {
     encoding: 'utf8',
     timeout: 60000,
     windowsHide: true,
-    env: Object.assign({}, process.env, extraEnv || {}),
+    env: extraEnv && extraEnv.PSModulePath ? require('../exe').psEnv(cmd, process.env, extraEnv) : Object.assign({}, process.env, extraEnv || {}),
     maxBuffer: 1024 * 1024,
   });
-  if (res.error) throw znError(CODES.LOCKED, 'keychain helper failed to start: ' + cmd + ' (' + res.error.code + ')');
+  if (res.error) throw znError(CODES.LOCKED, messages.keychainHelperFailed(cmd + ' (' + res.error.code + ')'));
   return res;
 }
 
@@ -106,13 +107,13 @@ const macos = {
     if (kc && /\s/.test(kc)) throw znError(CODES.POLICY_DENIED, 'ZN_KEYCHAIN_PATH must not contain spaces. Next step: choose a folder path without spaces, or, if you are an agent, ask the user to do it.');
     const line = ['add-generic-password', '-U', '-s', sl.service, '-a', sl.account, '-l', sl.label || 'zn-vault-identity', '-w', identity].concat(kc ? [kc] : []).join(' ') + '\n';
     const res = run('/usr/bin/security', ['-i'], line);
-    if (res.status !== 0) throw znError(CODES.LOCKED, 'macOS keychain refused the identity (security exit ' + res.status + ')');
+    if (res.status !== 0) throw znError(CODES.LOCKED, messages.keychainProblem('macos', 'save', { slotIsVault: !slot, detail: 'security exit ' + res.status }));
   },
   load(slot) {
     const sl = slot || defaultSlot();
     const res = run('/usr/bin/security', ['find-generic-password', '-s', sl.service, '-a', sl.account, '-w'].concat(macKeychainArgs()));
     if (res.status === 44) return null; // errSecItemNotFound
-    if (res.status !== 0) throw znError(CODES.LOCKED, 'macOS keychain read failed (security exit ' + res.status + ')');
+    if (res.status !== 0) throw znError(CODES.LOCKED, messages.keychainProblem('macos', 'read', { slotIsVault: !slot, detail: 'security exit ' + res.status }));
     return res.stdout.trim();
   },
   remove(slot) {
@@ -197,23 +198,22 @@ function winCred(op, input, slot) {
   const sl = slot || defaultSlot();
   const ps = powershellPath();
   if (!ps) {
-    throw znError(CODES.LOCKED, 'the Windows Credential Manager needs the system PowerShell (Windows PowerShell 5.1, in System32\\WindowsPowerShell\\v1.0), '
-      + 'which was not found. Next step: use a passphrase instead with `zn unlock --backend passphrase`, or, if you are an agent, ask the user to do it.');
+    throw znError(CODES.LOCKED, messages.powershellMissing());
   }
   const encoded = Buffer.from(WIN_SCRIPT, 'utf16le').toString('base64');
-  return run(ps, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], input,
-    { ZN_CRED_OP: op, ZN_CRED_TARGET: sl.service + ':' + sl.account });
+  return run(ps, ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], input,
+    { PSModulePath: require('../exe').systemPsModulePath(ps), ZN_CRED_OP: op, ZN_CRED_TARGET: sl.service + ':' + sl.account });
 }
 
 const windows = {
   store(identity, slot) {
     const res = winCred('write', identity, slot);
-    if (res.status !== 0 || res.stdout.trim() !== 'ok') throw znError(CODES.LOCKED, 'Windows Credential Manager refused the identity (exit ' + res.status + ')');
+    if (res.status !== 0 || res.stdout.trim() !== 'ok') throw znError(CODES.LOCKED, messages.keychainProblem('windows', 'save', { slotIsVault: !slot, detail: 'exit ' + res.status }));
   },
   load(slot) {
     const res = winCred('read', undefined, slot);
     if (res.status === 3) return null;
-    if (res.status !== 0) throw znError(CODES.LOCKED, 'Windows Credential Manager read failed (exit ' + res.status + ')');
+    if (res.status !== 0) throw znError(CODES.LOCKED, messages.keychainProblem('windows', 'read', { slotIsVault: !slot, detail: 'exit ' + res.status }));
     return res.stdout.trim();
   },
   remove(slot) {
@@ -227,7 +227,7 @@ const windows = {
 
 function secretTool() {
   const p = secretToolPath();
-  if (!p) throw znError(CODES.LOCKED, 'secret-tool not found in /usr/bin, /bin or /usr/local/bin');
+  if (!p) throw znError(CODES.LOCKED, messages.secretToolMissing());
   return p;
 }
 
@@ -235,7 +235,7 @@ const libsecret = {
   store(identity, slot) {
     const sl = slot || defaultSlot();
     const res = run(secretTool(), ['store', '--label=' + (slot ? 'zn-gate cloud API key' : 'zn vault identity'), 'service', sl.service, 'account', sl.account], identity);
-    if (res.status !== 0) throw znError(CODES.LOCKED, 'Secret Service refused the identity (secret-tool exit ' + res.status + ')');
+    if (res.status !== 0) throw znError(CODES.LOCKED, messages.keychainProblem('libsecret', 'save', { slotIsVault: !slot, detail: 'secret-tool exit ' + res.status }));
   },
   load(slot) {
     const sl = slot || defaultSlot();
@@ -243,7 +243,7 @@ const libsecret = {
     const out = (res.stdout || '').trim();
     if (res.status !== 0 && !out) {
       if (res.status === 1) return null;
-      throw znError(CODES.LOCKED, 'Secret Service read failed (secret-tool exit ' + res.status + ')');
+      throw znError(CODES.LOCKED, messages.keychainProblem('libsecret', 'read', { slotIsVault: !slot, detail: 'secret-tool exit ' + res.status }));
     }
     return out || null;
   },
@@ -265,8 +265,8 @@ function readMeta(opts) {
   let meta = null;
   try { meta = JSON.parse(buf.toString('utf8')); } catch (err) { meta = null; }
   if (!meta || !BACKENDS.includes(meta.backend) || !/^age1[0-9a-z]+$/.test(meta.recipient || '')) {
-    throw znError(CODES.LOCKED, 'vault file keychain.json is corrupted (it records the keychain backend and the public key). ' +
-      'Restore it from a backup; zn will not create a new vault over the existing one.');
+    throw znError(CODES.LOCKED, require('../messages').vaultDamaged('keychain.json',
+      'is corrupted (it records the keychain backend and the public key)'));
   }
   return meta;
 }
@@ -322,7 +322,15 @@ async function loadIdentity(opts) {
     try {
       identity = await store.decryptWithPassphrase(o.passphrase, new Uint8Array(buf));
     } catch (err) {
-      throw znError(CODES.LOCKED, 'wrong passphrase, or vault file identity.age is corrupted');
+      // age reports a wrong passphrase as "no identity matched"; a damaged file fails earlier
+      // (bad header, bad tag). Only the first is a passphrase failure, so only it sets `reason`.
+      if (err && /no identity matched/i.test(String(err.message))) {
+        const e = znError(CODES.LOCKED, 'wrong passphrase, or vault file identity.age is corrupted');
+        e.reason = WRONG_PASSPHRASE;
+        throw e;
+      }
+      throw znError(CODES.LOCKED, require('../messages').vaultDamaged('identity.age',
+        'looks damaged, so it cannot be opened with any passphrase', err && err.message));
     }
   } else {
     identity = NATIVE[backend].load();
@@ -348,7 +356,7 @@ async function initIdentity(opts) {
   // drops the item must fail here, not after secrets were encrypted to it.
   if (backend !== 'passphrase') {
     const back = NATIVE[backend].load();
-    if (back !== identity) throw znError(CODES.LOCKED, 'the ' + backend + ' keychain did not return the stored identity');
+    if (back !== identity) throw znError(CODES.LOCKED, messages.keychainLostKey(backend));
   }
   writeMeta({ v: 1, backend, recipient, created: new Date().toISOString() }, o);
   return { backend, recipient, identity };
@@ -377,7 +385,11 @@ async function deleteIdentity(opts) {
   return { deleted: true, backend };
 }
 
+/** `err.reason` of a ZN_LOCKED error that came from a wrong passphrase (and from nothing else). */
+const WRONG_PASSPHRASE = 'wrong_passphrase';
+
 module.exports = {
+  WRONG_PASSPHRASE,
   BACKENDS,
   detectBackend,
   storeIdentity,

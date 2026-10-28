@@ -3,6 +3,7 @@
  * Scrubber engine: scan / tokenize / detokenize. Detection is 100 % local.
  *
  *   scan(text, ctx)        -> Span[]   synchronous and pure (no vault, no I/O)
+ *   scanAsync(text, ctx)   -> Promise<Span[]>   scan with the vault's values too (the daemon matches them)
  *       Span = {start, end, type, source: 'exact'|'pattern'|'pii', name?}
  *   tokenize(text, ctx)    -> Promise<{text, replaced: [{type, token, source}]}>
  *   detokenize(text, ctx)  -> Promise<{text, restored: [token], withheld: [{token, reason, action}]}>
@@ -16,7 +17,9 @@
  *     exact        false to disable the exact-value layer
  *     exactFiles   false to read the environment only (no credential files)
  *     exactValues  [{name, type, value|values}] extra exact values (scan uses these)
- *     pii          false to disable PII, or {email, phone, iban, card, dni, ssn, ipv4}
+ *     pii          false to disable PII, or {email, phone, iban, card, dni, ssn, ipv4, name, address, username}
+ *     types        a Set (or Map) of span types: only spans of these types are kept, before
+ *                  overlaps are resolved, so a span of another type cannot hide one of them
  *     detectors    compiled custom formats (lib/team/detectors.js compile()), from
  *                  a zn Team policy; they run with the secret patterns
  *
@@ -40,7 +43,7 @@
 const fs = require('fs');
 const path = require('path');
 const { findPatterns, findPii, hintsIn, SECRET_TYPES, PII_TYPES } = require('./patterns');
-const { collectSources, buildMatcher } = require('./exact');
+const { collectSources, buildMatcher, MIN_LENGTH } = require('./exact');
 const { find: findCustom } = require('../team/detectors');
 const { CODES } = require('../errors');
 const { warnNotice, WARN_REASON } = require('../team/effective');
@@ -174,6 +177,13 @@ function scanText(text, c) {
   let spans = [];
   const matcher = matcherFor(c);
   if (matcher) spans = spans.concat(matcher.find(text));
+  // The vault's own values are matched in the daemon (scanAsync fetched where they occur in this text). A prepared
+  // context that has no answer for this text means the caller used scan() where it needed scanAsync(): refuse.
+  if (c.vaultRemote) {
+    const fromVault = c.vaultSpans && c.vaultSpans.get(text);
+    if (fromVault === undefined) throw new Error('scan: the vault matches for this text were not fetched (use scanAsync)');
+    spans = spans.concat(fromVault);
+  }
   const opts = { pii: c.pii, _hints: hintsIn(text) };
   spans = spans.concat(findPatterns(text, opts));
   if (Array.isArray(c.detectors) && c.detectors.length) spans = spans.concat(findCustom(text, c.detectors));
@@ -181,12 +191,14 @@ function scanText(text, c) {
   if (spans.length === 0) return spans;
   const ranges = tokenRanges(text, namesOf(c));
   if (ranges.length > 0) spans = spans.filter((s) => !insideRange(s, ranges));
+  if (c.types) spans = spans.filter((s) => c.types.has(normalizeType(s.type)));
   return resolveOverlaps(spans).map((s) => {
     const out = { start: s.start, end: s.end, type: normalizeType(s.type), source: s.source };
     if (s.name) out.name = s.name;
     if (s.vault) out.vault = true;
     if (s.variant) out.variant = s.variant;
     if (s.merged) out.merged = true;
+    if (s.quote && !s.merged) out.quote = s.quote;
     return out;
   });
 }
@@ -221,24 +233,128 @@ function localEntries(ctx) {
   return entries;
 }
 
+function vaultUnavailableOnPurpose(err) {
+  return !!err && err.code === CODES.LOCKED && err.vaultUnanswered !== true;
+}
+
+function vaultInfoFailure(err) {
+  const why = String((err && err.message) || 'unknown error');
+  return Object.assign(new Error('zn could not read what your secret vault protects (' + why + '), so it cannot check this against your vault values. ' +
+    'Make sure the vault is running and unlocked (zn unlock), then try again.'), { code: CODES.LOCKED, vaultFailed: true, vaultUnanswered: true, cause: err });
+}
+
+
+/* What the vault contributes to the exact layer. The values never leave the vault daemon: maskInfo says which secret
+ * names and how many needles it has (and the longest, for the streaming scrubber), and scanAsync asks maskSpans
+ * where they occur in each text. {remote, names, longest, count, entries, locked}. `entries` is only filled by a vault
+ * started by an older zn-gate, which answers no maskInfo and hands its values to exactValues instead. */
 async function vaultEntries(ctx) {
   const vault = ctx.vault;
-  if (!vault || typeof vault.exactValues !== 'function') return { entries: [], locked: !vault };
+  const none = { remote: false, entries: [], names: [], longest: 0, count: 0, shortCount: 0 };
+  if (!vault || (typeof vault.maskInfo !== 'function' && typeof vault.exactValues !== 'function')) return Object.assign({ locked: !vault }, none);
   let perVault = vaultCache.get(vault);
   if (!perVault) { perVault = new Map(); vaultCache.set(vault, perVault); }
   const project = String(ctx.project || '');
   const now = Date.now();
   const hit = perVault.get(project);
   if (hit && now - hit.at < CACHE_TTL_MS) return hit;
+  const legacy = async () => {
+    const list = await vault.exactValues(project);
+    return Object.assign({}, none, { at: now, locked: false, entries: (Array.isArray(list) ? list : []).map((e) => Object.assign({}, e, { vault: true })) });
+  };
   let res;
   try {
-    const list = await vault.exactValues(project);
-    res = { at: now, entries: (Array.isArray(list) ? list : []).map((e) => Object.assign({}, e, { vault: true })), locked: false };
+    if (typeof vault.maskInfo === 'function') {
+      try {
+        const info = await vault.maskInfo(project, { agent: ctx.agent, tool: ctx.tool });
+        // A wrong shape (null, a string, names that are not a list) is not an empty vault: it is a failure.
+        if (!info || typeof info !== 'object' || Array.isArray(info) || (info.names !== undefined && !Array.isArray(info.names))) {
+          throw vaultInfoFailure(new Error('the vault answered with an unexpected reply'));
+        }
+        res = {
+          at: now, locked: false, remote: true, entries: [],
+          names: Array.isArray(info && info.names) ? info.names.map(String) : [],
+          longest: Number(info && info.longest) || 0,
+          count: Number(info && info.count) || 0,
+          shortCount: Number(info && info.shortCount) || 0,
+        };
+      } catch (err) {
+        if (!(err && err.message === 'unknown operation') || typeof vault.exactValues !== 'function') throw err;
+        res = await legacy();
+      }
+    } else {
+      res = await legacy();
+    }
   } catch (err) {
-    res = { at: now, entries: [], locked: true, error: err };
+    // Not available on purpose (the daemon is not running, or it says it is locked): the vault adds nothing and the
+    // built-in layers still run. Anything else (no answer, bad reply, a refusal) is a failure to read what the vault
+    // protects: propagate it, so the hook denies instead of scanning without the vault's values.
+    if (!vaultUnavailableOnPurpose(err)) throw (err && err.vaultFailed ? err : vaultInfoFailure(err));
+    res = Object.assign({}, none, { at: now, locked: true, error: err });
   }
   perVault.set(project, res);
   return res;
+}
+
+const SPAN_CHUNK = 2 * 1024 * 1024;
+const SPAN_REQUEST_CHARS = 4 * 1024 * 1024;
+const SPAN_REQUEST_TEXTS = 1024;
+
+/* Where the vault's values occur in each of `texts`, from the daemon: Map text -> Span[] (a text too short to hold a
+ * value maps to none). A text over SPAN_CHUNK goes in overlapping pieces, so a value on a cut is still found. When the
+ * vault does not answer, `failed` is true and scanChecked throws, so no text is passed as clean. */
+async function fetchVaultSpans(c, texts) {
+  const r = c.vaultRemote;
+  const map = new Map();
+  const pieces = []; // {text, base, piece}
+  for (const t of texts) {
+    if (map.has(t)) continue;
+    // A text under the minimum can only be a short value from an older version (compared exactly, whole text).
+    if (t.length === 0 || (t.length < MIN_LENGTH && !(r.shortCount > 0))) { map.set(t, EMPTY); continue; }
+    const mine = { parts: [], spans: [] };
+    map.set(t, mine);
+    if (t.length <= SPAN_CHUNK) { pieces.push({ text: t, base: 0, owner: mine }); continue; }
+    const step = Math.max(SPAN_CHUNK - Math.max(r.longest, 1), SPAN_CHUNK / 2);
+    for (let base = 0; base < t.length; base += step) {
+      pieces.push({ text: t.slice(base, base + SPAN_CHUNK), base, owner: mine });
+      if (base + SPAN_CHUNK >= t.length) break;
+    }
+  }
+  let failed = false;
+  const batches = [];
+  let cur = [];
+  let chars = 0;
+  for (const p of pieces) {
+    if (cur.length && (cur.length >= SPAN_REQUEST_TEXTS || chars + p.text.length > SPAN_REQUEST_CHARS)) { batches.push(cur); cur = []; chars = 0; }
+    cur.push(p);
+    chars += p.text.length;
+  }
+  if (cur.length) batches.push(cur);
+  await Promise.all(batches.map(async (batch) => {
+    try {
+      const got = await r.vault.maskSpans(r.project, batch.map((p) => p.text), r.claim);
+      if (!Array.isArray(got) || got.length !== batch.length) throw new Error('unexpected maskSpans answer');
+      batch.forEach((p, i) => { p.owner.parts.push({ base: p.base, spans: Array.isArray(got[i]) ? got[i] : [] }); });
+    } catch (err) {
+      failed = true;
+    }
+  }));
+  for (const [t, v] of map) {
+    if (v === EMPTY) continue;
+    const seen = new Set();
+    const spans = [];
+    for (const part of v.parts.sort((a, b) => a.base - b.base)) {
+      for (const s of part.spans) {
+        const span = Object.assign({}, s, { start: s.start + part.base, end: s.end + part.base, vault: true });
+        const key = span.start + ':' + span.end + ':' + span.name + ':' + span.variant + ':' + span.type;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        spans.push(span);
+      }
+    }
+    map.set(t, spans);
+  }
+  return { map, failed };
 }
 
 /**
@@ -252,13 +368,64 @@ async function prepare(ctx) {
   const fromVault = await vaultEntries(c);
   const extra = Array.isArray(c.exactValues) ? c.exactValues : EMPTY;
   const all = fromVault.entries.concat(local, extra);
-  // scan() stays pure: it receives the resolved exact values in
-  // ctx.exactValues (and their compiled matcher, cached here).
+  // scan() stays pure: it receives the local exact values in ctx.exactValues
+  // (and their compiled matcher, cached here). The vault's own values are
+  // matched by the daemon: scanAsync() fetches the spans of each text.
   c.exactValues = all;
   c.exactMatcher = all.length > 0 ? cachedMatcher(all, fromVault, local, extra) : null;
   c.exactPrepared = true;
   c.vaultLocked = fromVault.locked;
+  if (fromVault.names.length) c.secretNames = (Array.isArray(c.secretNames) ? c.secretNames : EMPTY).concat(fromVault.names);
+  c.vaultLongest = fromVault.longest;
+  c.vaultRemote = fromVault.remote && (fromVault.count > 0 || fromVault.shortCount > 0) ? { vault: c.vault, project: String(c.project || ''), claim: { agent: c.agent, tool: c.tool }, longest: fromVault.longest, shortCount: fromVault.shortCount } : null;
   return c;
+}
+
+/* scan() for a prepared context, with the vault's matches: the daemon says where its values occur in the text (and in
+ * the text without invisible characters, which scan() also reads). -> {spans}. When the vault does not answer it throws
+ * (ZN_LOCKED, vaultFailed): a text scanned without the vault's values would look clean, so the caller must hold the
+ * text back (the post-hook withholds it, the other hooks follow their fail mode, the stream writes a notice). */
+async function scanChecked(text, c) {
+  if (!c.vaultRemote || text.length === 0) return { spans: scan(text, c) };
+  const view = invisibleView(text);
+  const want = view ? [text, view.clean] : [text];
+  const memo = c.vaultMemo;
+  const missing = memo ? want.filter((t) => !memo.has(t)) : want;
+  const got = missing.length ? await fetchVaultSpans(c, missing) : { map: new Map(), failed: false };
+  if (got.failed) throw Object.assign(new Error('the vault did not answer, so this text was not checked against its values'), { code: CODES.LOCKED, vaultFailed: true });
+  const map = new Map();
+  for (const t of want) map.set(t, memo && memo.has(t) ? memo.get(t) : got.map.get(t));
+  return { spans: scan(text, Object.assign({}, c, { vaultSpans: map })) };
+}
+
+/**
+ * warm(ctx, texts) -> Promise<ctx'>: asks the vault daemon about all of `texts` in one request, so that the scanAsync()
+ * calls that follow on the returned context do not make one round trip each. Optional: scanAsync fetches what is
+ * missing. When the vault does not answer, nothing is remembered and scanAsync reports it.
+ */
+async function warm(ctx, texts) {
+  const c = await prepare(ctx);
+  if (!c.vaultRemote) return c;
+  const all = new Set();
+  for (const t of texts) {
+    if (typeof t !== 'string' || t.length === 0 || (t.length < MIN_LENGTH && !(c.vaultRemote.shortCount > 0))) continue;
+    all.add(t);
+    const view = invisibleView(t);
+    if (view) all.add(view.clean);
+  }
+  if (all.size === 0) return c;
+  const { map, failed } = await fetchVaultSpans(c, [...all]);
+  if (failed) return c;
+  return Object.assign({}, c, { vaultMemo: new Map([...(c.vaultMemo || []), ...map]) });
+}
+
+/**
+ * scanAsync(text, ctx) -> Promise<Span[]>: scan() with every layer, the vault's included. Prepares the context when
+ * it is not, and asks the vault daemon where its values occur in `text`. Use it wherever the vault may be unlocked.
+ */
+async function scanAsync(text, ctx) {
+  if (typeof text !== 'string') throw new TypeError('scanAsync(text, ctx): text must be a string');
+  return (await scanChecked(text, await prepare(ctx))).spans;
 }
 
 let lastMatcher = { parts: null, matcher: null };
@@ -294,15 +461,23 @@ function lockedToken(type) {
 }
 
 async function tokenize(text, ctx) {
+  return tokenizeWith(text, ctx);
+}
+
+// tokenize, for a caller that has already scanned this text with the same context (it passes the spans, so the
+// text is not scanned twice). Not part of the public contract.
+async function tokenizeWith(text, ctx, spansOfText) {
   if (typeof text !== 'string') throw new TypeError('tokenize(text, ctx): text must be a string');
   const c = await prepare(ctx);
-  const spans = scan(text, c);
+  // A caller that has already scanned this text with the same context can pass the spans, so the text is not scanned twice.
+  let locked = false;
+  let spans = spansOfText;
+  if (!Array.isArray(spans)) spans = (await scanChecked(text, c)).spans;
   if (spans.length === 0) return { text, replaced: [] };
 
   const vault = c.vault;
   const project = String(c.project || '');
   const memo = new Map();
-  let locked = false;
 
   async function tokenFor(span, value) {
     if (span.vault && span.variant === 'raw' && !span.merged && NAME_RE.test(String(span.name || ''))) {
@@ -336,7 +511,8 @@ async function tokenize(text, ctx) {
   for (const s of spans) {
     const value = text.slice(s.start, s.end);
     const token = await tokenFor(s, value);
-    out += text.slice(last, s.start) + token;
+    // A bare JSON number under a quoted key becomes a string, so the JSON stays valid.
+    out += text.slice(last, s.start) + (s.quote ? s.quote + token + s.quote : token);
     last = s.end;
     replaced.push({ type: s.type, token, source: s.source });
   }
@@ -532,6 +708,9 @@ async function detokenize(text, ctx) {
 }
 
 module.exports = {
+  tokenizeWith,
+  scanAsync,
+  warm,
   scan,
   tokenize,
   detokenize,

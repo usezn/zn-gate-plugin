@@ -127,7 +127,7 @@ function cimTable() {
   if (!ps) return null;
   const script = 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,' +
     '@{n=\'Created\';e={[long](($_.CreationDate.ToUniversalTime() - [datetime]\'1970-01-01\').TotalMilliseconds)}} | ConvertTo-Json -Compress';
-  const r = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: TIMEOUT_MS * 3, maxBuffer: 64 * 1024 * 1024, windowsHide: true });
+  const r = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-Command', script], { env: require('../exe').psEnv(ps), encoding: 'utf8', timeout: TIMEOUT_MS * 3, maxBuffer: 64 * 1024 * 1024, windowsHide: true });
   return !r.error && r.status === 0 ? parseCim(r.stdout) : null;
 }
 

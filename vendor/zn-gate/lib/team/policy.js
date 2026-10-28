@@ -61,6 +61,19 @@ function canonicalJson(value) {
   return '{' + keys.map((k) => JSON.stringify(k) + ':' + canonicalJson(value[k])).join(',') + '}';
 }
 
+/**
+ * SHA-256 (hex) of the canonical JSON of a policy without its validity dates:
+ * what "the same policy" means for one version. The server signs the same
+ * version again every day with new issued_at and expires_at, so the dates are
+ * not part of the content.
+ */
+function digestOf(p) {
+  const content = Object.assign({}, p);
+  delete content.issued_at;
+  delete content.expires_at;
+  return crypto.createHash('sha256').update(canonicalJson(content), 'utf8').digest('hex');
+}
+
 /** kid = first 16 hex characters of SHA-256 of the raw 32-byte public key. */
 function kidOf(rawB64u) {
   return crypto.createHash('sha256').update(Buffer.from(rawB64u, 'base64url')).digest('hex').slice(0, 16);
@@ -150,6 +163,10 @@ function checkShape(p) {
  *   -> {ok: true, policy, expired} | {ok: false, error}
  * envelope: {policy, signature: {alg, kid, sig}} as GET /v1/org/policy returns it.
  * pin: the organization's public key from `zn team join`.
+ * minVersion + heldDigest + heldExpiresAt: the version, content digest (digestOf,
+ * without the dates) and expiry (ms) of the policy already held. The same
+ * version is accepted only with the same content and an expiry that is not
+ * earlier than the one held (the server re-signs a version every day).
  * allowExpired: used when reading the cache, so an expired policy can still
  * restrict (strict mode); a downloaded policy must never be expired.
  */
@@ -176,6 +193,12 @@ function verifyEnvelope(envelope, pin, opts) {
   const expired = Date.parse(p.expires_at) + SKEW_MS <= now;
   if (expired && !o.allowExpired) return { ok: false, error: 'policy expired' };
   if (o.minVersion && p.version < o.minVersion) return { ok: false, error: 'policy version rollback' };
+  // The same version must be the same policy: a second signed policy with the
+  // version already held but other content is refused.
+  if (o.minVersion && o.heldDigest && p.version === o.minVersion) {
+    if (digestOf(p) !== o.heldDigest) return { ok: false, error: 'policy version already used with different content' };
+    if (Number.isFinite(o.heldExpiresAt) && Date.parse(p.expires_at) < o.heldExpiresAt) return { ok: false, error: 'policy older than the one held' };
+  }
   return { ok: true, policy: p, expired };
 }
 
@@ -207,8 +230,9 @@ function writeJson(file, data) {
   if (process.platform !== 'win32') { try { fs.chmodSync(file, 0o600); } catch (err) { /* ignore */ } }
 }
 
+/** true when the file is gone (deleted, or it was not there); false when it could not be deleted. */
 function removeFile(file) {
-  try { fs.unlinkSync(file); return true; } catch (err) { return false; }
+  try { fs.unlinkSync(file); return true; } catch (err) { return Boolean(err) && err.code === 'ENOENT'; }
 }
 
 /**
@@ -250,6 +274,7 @@ function state(opts) {
     expires_at: v.policy.expires_at,
     etag: typeof cache.etag === 'string' ? cache.etag : null,
     fetched_at: cache.fetched_at || null,
+    change: cache.change || null,
   };
 }
 
@@ -266,11 +291,13 @@ function accept(envelope, etag, opts) {
   const pin = o.pin || team.policy_public_key;
   const prev = readCache(o);
   let minVersion = Number(team.min_policy_version) || 0;
+  let heldDigest = null;
+  let heldExpiresAt = null;
   if (prev) {
     const pv = verifyEnvelope(prev.envelope, pin, { now: o.now, org: team.org, allowExpired: true });
-    if (pv.ok) minVersion = Math.max(minVersion, pv.policy.version);
+    if (pv.ok && pv.policy.version >= minVersion) { minVersion = pv.policy.version; heldDigest = digestOf(pv.policy); heldExpiresAt = Date.parse(pv.policy.expires_at); }
   }
-  const v = verifyEnvelope(envelope, pin, { now: o.now, org: team.org, minVersion });
+  const v = verifyEnvelope(envelope, pin, { now: o.now, org: team.org, minVersion, heldDigest, heldExpiresAt });
   if (!v.ok) return { ok: false, error: v.error };
   writeJson(paths(o).policyFile, {
     v: 1, envelope, etag: typeof etag === 'string' && etag.length <= 200 ? etag : null,
@@ -279,13 +306,18 @@ function accept(envelope, etag, opts) {
   return { ok: true, policy: v.policy };
 }
 
-/** Write the readable copy of an accepted policy (the vault daemon keeps the original). */
+/**
+ * Write the readable copy of an accepted policy (the vault daemon keeps the original).
+ * opts.change: what this version removed or loosened (team/changes.js), kept next to it.
+ */
 function writeCache(envelope, etag, opts) {
   const o = opts || {};
-  writeJson(paths(o).policyFile, {
+  const rec = {
     v: 1, envelope, etag: typeof etag === 'string' && etag.length <= 200 ? etag : null,
     fetched_at: new Date(o.now == null ? Date.now() : o.now).toISOString(), accepted_version: envelope.policy.version,
-  });
+  };
+  if (o.change) rec.change = o.change;
+  writeJson(paths(o).policyFile, rec);
 }
 
 /** Keep the cache but record that the server answered 304 (still current). */
@@ -300,6 +332,7 @@ function touchCache(opts) {
 
 module.exports = {
   canonicalJson,
+  digestOf,
   kidOf,
   checkPin,
   checkShape,

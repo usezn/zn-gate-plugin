@@ -4,9 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const http = require('http');
-const { redactSecrets } = require('./rules');
-const { sym } = require('./term');
+// rules (with the scrubber engine behind it), term and http are loaded where they are used, so an
+// append that does not need them (a hook block, see _plainPreview in logEvidence) stays cheap.
 
 const ZN_DIR = path.join(os.homedir(), '.zn');
 const EVIDENCE_FILE = path.join(ZN_DIR, 'evidence.jsonl');
@@ -69,12 +68,91 @@ function readLockToken(lockPath) {
   try { return fs.readFileSync(lockPath, 'utf8'); } catch { return null; }
 }
 
+// Test seams: they let a test run code between two steps of the break protocol.
+const testHooks = { afterMutexCreate: null, beforeMutexRelease: null, beforeMutexReclaim: null };
+
+// The break mutex holds its owner's token, like the lock: a breaker only deletes the mutex while
+// it is still its own. If it took longer than the stale window, another breaker may have
+// reclaimed it and created a new one, and deleting by path would remove that one.
+function releaseMutex(mutex, token) {
+  if (readLockToken(mutex) === token) {
+    try { fs.unlinkSync(mutex); } catch { /* best effort */ }
+  }
+}
+
+// A mutex older than the stale window belongs to a breaker that died. Move it aside first (never
+// delete by the shared path: a new mutex may have been created since we looked), and put it back
+// with link() if what we moved turns out to be fresh.
+function reclaimStaleMutex(mutex, token) {
+  try {
+    if (Math.abs(Date.now() - fs.statSync(mutex).mtimeMs) <= LOCK_STALE_MS) return;
+    if (testHooks.beforeMutexReclaim) testHooks.beforeMutexReclaim(mutex);
+    const aside = `${mutex}-reclaim-${token.replace(':', '-')}`;
+    fs.renameSync(mutex, aside);
+    let fresh = false;
+    try { fresh = Math.abs(Date.now() - fs.statSync(aside).mtimeMs) <= LOCK_STALE_MS; } catch { /* gone */ }
+    if (fresh) {
+      try { fs.linkSync(aside, mutex); } catch { /* another mutex exists again: its owner checks its token */ }
+    }
+    try { fs.unlinkSync(aside); } catch { /* best effort */ }
+  } catch { /* gone or busy: wait and retry */ }
+}
+
+/**
+ * Breaks a stale lock. Breakers take a short-lived `<log>.lock.break` mutex first and judge the
+ * lock stale again inside it: without it, a breaker that judged the old lock stale could rename
+ * away a fresh lock another writer had just created, and that writer would then see its lock
+ * "taken over" and drop its record. Returns true when the caller should retry at once.
+ */
+function breakStaleLock(lockPath, token) {
+  const mutex = `${lockPath}.break`;
+  let fd;
+  try {
+    fd = fs.openSync(mutex, 'wx', LEDGER_FILE_MODE);
+    try { fs.writeSync(fd, token); } catch { /* best effort: without it the mutex is never released by us */ }
+  } catch {
+    // Another breaker is working. A mutex left by a dead process is removed after a while.
+    reclaimStaleMutex(mutex, token);
+    return false;
+  }
+  try {
+    try { fs.closeSync(fd); } catch { /* best effort */ }
+    if (testHooks.afterMutexCreate) testHooks.afterMutexCreate(mutex);
+    // Inside the mutex only breakers touch a stale lock, and a fresh one cannot appear while
+    // the stale file still exists, so what is judged stale here is still the stale file.
+    let stale = false;
+    try { stale = Math.abs(Date.now() - fs.statSync(lockPath).mtimeMs) > LOCK_STALE_MS; } catch { /* gone */ }
+    if (!stale) return true;
+    // Break it by renaming it away, then delete the renamed file. Never delete by the shared path.
+    const aside = `${lockPath}.stale-${token.replace(':', '-')}`;
+    let moved = false;
+    try { fs.renameSync(lockPath, aside); moved = true; } catch { /* already gone, or busy on Windows: retry */ }
+    if (moved) {
+      // Defense in depth: if what we moved is not stale after all, put it back with link()
+      // (atomic, fails if a lock exists again) before deleting our copy.
+      let fresh = false;
+      try { fresh = Math.abs(Date.now() - fs.statSync(aside).mtimeMs) <= LOCK_STALE_MS; } catch { /* gone */ }
+      if (fresh) {
+        try { fs.linkSync(aside, lockPath); } catch { /* a new lock exists: its owner checks its token */ }
+      }
+      try { fs.unlinkSync(aside); } catch { /* best effort */ }
+      sweepStaleLeftovers(lockPath);
+    }
+    return moved;
+  } finally {
+    if (testHooks.beforeMutexRelease) testHooks.beforeMutexRelease(mutex);
+    releaseMutex(mutex, token);
+  }
+}
+
 /**
  * Takes the lock and returns this writer's token (pid + random bytes), which is written into
  * the lock file. The token lets a writer tell its own lock from one taken over after it was
  * considered stale: it only releases, and only appends, while the file still holds its token.
  */
 function acquireLock(lockPath, waitMs = LOCK_WAIT_MS) {
+  // NaN, Infinity or a negative wait would never time out (or time out at once): use the default.
+  if (!(Number.isFinite(waitMs) && waitMs >= 0)) waitMs = LOCK_WAIT_MS;
   const deadline = Date.now() + waitMs;
   const token = `${process.pid}:${crypto.randomBytes(8).toString('hex')}`;
   let delay = 2;
@@ -104,29 +182,60 @@ function acquireLock(lockPath, waitMs = LOCK_WAIT_MS) {
       // abs(): a lock dated in the future (clock moved back) is stale too.
       stale = Math.abs(Date.now() - fs.statSync(lockPath).mtimeMs) > LOCK_STALE_MS;
     } catch { /* gone or unreadable: wait a moment and try again */ }
-    if (stale) {
-      // Break it by renaming it away (atomic: when several writers try, only one rename wins),
-      // then delete the renamed file. Never delete by the shared path.
-      const aside = `${lockPath}.stale-${token.replace(':', '-')}`;
-      try {
-        fs.renameSync(lockPath, aside);
-        try { fs.unlinkSync(aside); } catch { /* best effort */ }
-        continue;
-      } catch { /* someone else broke it first */ }
-    }
+    if (stale && breakStaleLock(lockPath, token)) continue;
     sleepMs(delay + Math.floor(Math.random() * delay));
     delay = Math.min(delay * 2, 50);
   }
+}
+
+// Leftovers `<log>.lock.stale-*` only exist when a process died between renaming a stale lock
+// and deleting it. Remove a few old ones after a stale lock was broken; errors are ignored.
+function sweepStaleLeftovers(lockPath) {
+  try {
+    const prefix = path.basename(lockPath) + '.stale-';
+    const dir = path.dirname(lockPath);
+    let n = 0;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(prefix)) continue;
+      if (++n > 5) break;
+      try {
+        const p = path.join(dir, name);
+        if (Math.abs(Date.now() - fs.statSync(p).mtimeMs) > LOCK_STALE_MS) fs.unlinkSync(p);
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
 }
 
 function ownsLock(lockPath, token) {
   return readLockToken(lockPath) === token;
 }
 
+// On Windows, deleting a file can fail for a moment while another process (a virus scanner, an
+// indexer) has it open. A lock that stays behind blocks every other writer until it goes stale,
+// so try again briefly before giving up. A missing file is fine.
+function unlinkLock(lockPath) {
+  for (let i = 0; i < 40; i++) {
+    try { fs.unlinkSync(lockPath); return; } catch (e) {
+      if (e.code === 'ENOENT') return;
+      if (!(process.platform === 'win32' && (e.code === 'EPERM' || e.code === 'EACCES' || e.code === 'EBUSY')) || i === 39) return;
+    }
+    sleepMs(5);
+  }
+}
+
 function releaseLock(lockPath, token) {
   // Only remove the lock if it is still ours; after a takeover it belongs to someone else.
-  if (!ownsLock(lockPath, token)) return;
-  try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
+  // If the file is missing it may be renamed aside by a breaker that is about to put it back
+  // (link-back): look again a few times, and delete it if it reappears with our token.
+  for (let i = 0; i < 4; i++) {
+    const current = readLockToken(lockPath);
+    if (current === token) {
+      unlinkLock(lockPath);
+      return;
+    }
+    if (current !== null) return;
+    if (i < 3) sleepMs(5);
+  }
 }
 
 // Canonical serialization of a record for hashing. Node writes UTF-8 as is; Python used to
@@ -280,7 +389,7 @@ function getLastHash(filePath = EVIDENCE_FILE) {
  *   write lock stays busy for 2 seconds; it never throws for a log problem.
  */
 function logEvidence(event, filePath = EVIDENCE_FILE, opts = {}) {
-  if (filePath === EVIDENCE_FILE) {
+  if (filePath === EVIDENCE_FILE && !opts.noStats) {
     require('./stats').record({
       layer: 'shield', agent: event.agent || event.agent_environment || 'other', checked: 1,
       blocked: String(event.verdict || '').toLowerCase() === 'block' ? 1 : 0,
@@ -304,8 +413,9 @@ function logEvidence(event, filePath = EVIDENCE_FILE, opts = {}) {
       }
       return null;
     }
-    const finalRecord = buildRecord(event, prevHash);
-    if (typeof opts.beforeAppend === 'function') opts.beforeAppend(); // test hook
+    const finalRecord = buildRecord(event, prevHash, opts._plainPreview === true);
+    // _beforeAppend is a test-only hook (internal, not part of the public options).
+    if (typeof opts._beforeAppend === 'function') opts._beforeAppend();
     // Still our lock? If it was taken over (this process was stalled for over 10 s) the last
     // hash read above may be out of date: write nothing rather than fork the chain.
     if (!ownsLock(lockPath, token)) throw new EvidenceLockError('the write lock was taken over');
@@ -325,7 +435,21 @@ function logEvidence(event, filePath = EVIDENCE_FILE, opts = {}) {
   }
 }
 
-function buildRecord(event, prevHash) {
+// The preview keeps 120 characters, so only the start of the payload is redacted for it: redacting a
+// 40 MB tool output in full to keep 120 characters would be a second full pass. 64 KB leaves room for a
+// long secret that starts in the first 120 characters (a private key block) to be matched whole.
+const PREVIEW_REDACT_CHARS = 64 * 1024;
+
+// The redacted start of a payload, cut to 120 characters. A private key block that runs past the redacted part
+// has no END line there, so it is not matched: the preview then stops before its BEGIN line.
+function previewOf(payloadStr) {
+  const head = String(require('./rules').redactSecrets(payloadStr.slice(0, PREVIEW_REDACT_CHARS)).sanitized || '');
+  const begin = head.search(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/);
+  const cut = begin === -1 ? head : head.slice(0, begin) + '[REDACTED_PRIVATE_KEY]';
+  return cut.slice(0, 120);
+}
+
+function buildRecord(event, prevHash, plainPreview = false) {
   const timestamp = new Date().toISOString();
   const id = 'ev_' + Date.now().toString(36) + '_' + crypto.randomBytes(4).toString('hex');
 
@@ -342,8 +466,12 @@ function buildRecord(event, prevHash) {
     phase: event.phase || 'tool-call',
     tool_name: event.tool_name || event.tool || 'unknown',
     payload_sha256: payloadSha256,
-    // Redact the full payload first, then cut, so a secret straddling the cut is not leaked.
-    payload_preview: String(redactSecrets(payloadStr).sanitized || '').slice(0, 120),
+    // Redact the full payload first, then cut, so a secret straddling the cut is not leaked. With
+    // _plainPreview the caller built the payload from fixed fields only (no text the agent sent), so
+    // it is cut as it is and the redaction engine is not loaded.
+    payload_preview: plainPreview
+      ? payloadStr.slice(0, 120)
+      : previewOf(payloadStr),
     verdict: event.verdict || 'allow',
     rule: event.rule || null,
     reason: event.reason || null,
@@ -614,7 +742,7 @@ function renderAuditRow(r) {
  * Starts a zero-dependency local dashboard at 127.0.0.1:<port> (loopback only)
  */
 function startEvidenceUi(port = 3100, filePath = EVIDENCE_FILE) {
-  const server = http.createServer((req, res) => {
+  const server = require('http').createServer((req, res) => {
     // Only answer requests addressed to the loopback name and port, so a web
     // page cannot reach the dashboard through DNS rebinding.
     const addr = server.address();
@@ -822,7 +950,7 @@ function startEvidenceUi(port = 3100, filePath = EVIDENCE_FILE) {
   });
 
   // Loopback only: the ledger must not be reachable from the network.
-  const banner = sym(process.env, '🛡️', null, '  ');
+  const banner = require('./term').sym(process.env, '🛡️', null, '  ');
   server.listen(port, '127.0.0.1', () => {
     process.stdout.write(`
 ${banner}zn Evidence Engine Dashboard running at http://127.0.0.1:${server.address().port}
@@ -846,4 +974,5 @@ module.exports = {
   renderAuditRow,
   EVIDENCE_FILE,
   GENESIS_HASH,
+  _testHooks: testHooks,
 };

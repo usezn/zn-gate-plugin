@@ -1,8 +1,8 @@
 {
   "name": "zn-gate",
   "mcpName": "io.github.usezn/zn-gate",
-  "version": "1.13.1",
-  "description": "The local security layer for coding agents. zn-gate guards your secrets, your data and your systems while you use Claude Code, Codex CLI, Cursor or OpenCode.",
+  "version": "1.14.1",
+  "description": "The local security layer for coding agents. zn-gate guards your secrets, your data and your systems while you use Claude Code, Codex CLI, Cursor, OpenCode, Antigravity or ZCode desktop app.",
   "license": "MIT",
   "author": "usezn <admin@usezn.com>",
   "homepage": "https://usezn.com",
@@ -24,6 +24,8 @@
     "cursor",
     "claude-code",
     "opencode",
+    "antigravity",
+    "zcode",
     "codex"
   ],
   "bin": {
@@ -31,16 +33,22 @@
     "zn-mcp": "bin/cli.js",
     "zn": "bin/cli.js"
   },
+  "type": "commonjs",
   "main": "lib/client.js",
+  "types": "lib/client.d.ts",
   "scripts": {
     "test": "node test/run-all.js"
+  },
+  "contentPolicy": {
+    "class": "dual-use"
   },
   "files": [
     "bin/",
     "lib/",
     "README.md",
     "LICENSE",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "DISCLOSURE"
   ],
   "engines": {
     "node": ">=18"
@@ -50,5 +58,10 @@
   },
   "bundleDependencies": [
     "age-encryption"
-  ]
+  ],
+  "devDependencies": {
+    "c8": "12.0.0",
+    "fast-check": "4.10.2",
+    "typescript": "5.9.3"
+  }
 }

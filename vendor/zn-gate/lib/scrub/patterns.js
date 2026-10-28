@@ -22,12 +22,13 @@
  *
  * findPatterns(text, opts) -> [{start, end, type, source: 'pattern'}]
  * findPii(text, opts)      -> [{start, end, type, source: 'pii'}]
- *   opts.pii = {email, phone, iban, card, dni, ssn, ipv4}  (booleans; ipv4 off by default)
+ *   opts.pii = {email, phone, iban, card, dni, ssn, ipv4, name, address, username}  (booleans; ipv4 off by default;
+ *     name, address and username are key-based: see the block before the PII list)
  */
 
 // Version of the type catalogue (secret and PII patterns, validators). Bump it
 // when a pattern, validator or type name changes; see CONTRIBUTING.md.
-const SCRUB_RULES_VERSION = '2026-10-17.3';
+const SCRUB_RULES_VERSION = '2026-10-24.1';
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -342,6 +343,11 @@ const S_LINES = [
   [new RegExp('^[ \\t]*-[ \\t]+(["\']?)([A-Za-z_][A-Za-z0-9_.-]{0,127})=([^\\s"\'`]{1,512})\\1' + S_TAIL, 'd'), 2, 3],
   /* KEY=value lines: dotenv, `export`, Dockerfile `ENV` / `ARG`, `set`. */
   [new RegExp('^[ \\t]*(?:(?:export|ENV|ARG|set)[ \\t]+)?([A-Za-z_][A-Za-z0-9_]{0,127})[ \\t]*=[ \\t]*(["\']?)([^\\s"\'`]{1,512})\\2' + S_TAIL, 'd'), 1, 3],
+  /* PowerShell `$env:KEY = value`, quoted or not. */
+  [new RegExp('^[ \\t]*\\$env:([A-Za-z_][A-Za-z0-9_]{0,127})[ \\t]*=[ \\t]*(["\']?)([^\\s"\'`;]{1,512})\\2' + S_TAIL, 'd'), 1, 3],
+  /* Inline assignment before a command: `KEY=value cmd args`, after up to
+   * four other `NAME=value` words and an optional `env`. */
+  [new RegExp('^[ \\t]*(?:env[ \\t]+)?(?:[A-Za-z_][A-Za-z0-9_]{0,127}=(?:"[^"\\n]{0,512}"|\'[^\'\\n]{0,512}\'|[^\\s"\']{0,512})[ \\t]+){0,4}?(?=[A-Za-z0-9_]{0,127}?(?:pass|pwd|secret|token|key|credential|auth|dsn))([A-Za-z_][A-Za-z0-9_]{0,127})=(["\']?)([^\\s"\'`;&|]{1,512})\\2(?=[ \\t]+[A-Za-z0-9_./~\\\\-])', 'di'), 1, 3],
   /* Dockerfile `ENV KEY value` (legacy form, one pair per line). */
   [new RegExp('^[ \\t]*ENV[ \\t]+([A-Za-z_][A-Za-z0-9_]{0,127})[ \\t]+(["\']?)([^\\s"\'`=]{1,512})\\2' + S_TAIL, 'd'), 1, 3],
 ];
@@ -372,6 +378,110 @@ function findStructured(text, out) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Quoted values with spaces, and numbers, under a secret key           */
+/* ------------------------------------------------------------------ */
+
+/* A secret key followed by `:` `=` `=>` or `:=` and a value, in JSON, YAML,
+ * shell, Python or JS. Groups: 1 = name, 2 = the quote that closes a quoted
+ * key (with the backslashes of a JSON string inside a string), 3 = the
+ * opening quote of the value (same escapes). The name takes no suffix, so
+ * password_hint and token_count are other keys. */
+const KV_OPEN = new RegExp('(password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token)(\\\\{0,2}["\'])?[ \\t]{0,16}(?:=>|:=|=|:)[ \\t]{0,16}(\\\\{0,2}["\'])?', 'gi');
+const KV_PREFILTER = /(?:pass|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)/i;
+/* Longest quoted value read. A value with no closing quote inside this
+ * window is left alone, so the work per opening quote is bounded. */
+const KV_MAX_VALUE = 4096;
+const KV_MIN_VALUE = 8;
+const KV_NUMBER = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+/* A placeholder, or a reference after an auth scheme word ("Bearer ${TOKEN}"). */
+const KV_PLACEHOLDER = (v) => {
+  const bare = (s) => PLACEHOLDER_RE.test(s) || PLACEHOLDER_WORDS.test(s) || /^(.)\1+$/.test(s);
+  return bare(v) || bare(v.replace(/^(?:bearer|basic|token)\s+/i, ''));
+};
+
+/* Spans of two kinds of value that the entropy rules do not see:
+ *   - a quoted value that has whitespace in it, up to its closing quote
+ *     (`"password":"abcdefgh ijk lmn"`); a double-quoted value ends at the
+ *     first quote that is not escaped, a single-quoted one at the next `'`,
+ *     and a value inside an escaped JSON string at its own escaped quote;
+ *   - a bare number of 8 or more characters under a quoted key
+ *     (`{"token":12345678}`). The replacement keeps the JSON valid: span.quote
+ *     is the quote that the engine puts around the token. An unquoted key
+ *     (YAML, shell) with a number is left alone.
+ * Values shorter than 8 characters, placeholders and values with no closing
+ * quote on the same line (and inside KV_MAX_VALUE characters) are left alone. One pass over the
+ * text; each opener reads at most KV_MAX_VALUE characters. */
+function findQuotedKv(text, out) {
+  KV_OPEN.lastIndex = 0;
+  let m;
+  while ((m = KV_OPEN.exec(text)) !== null) {
+    const afterOpen = KV_OPEN.lastIndex;
+    KV_OPEN.lastIndex = Math.max(afterOpen, m.index + 1);
+    if (m[3] === undefined) {
+      KV_NUMBER.lastIndex = afterOpen;
+      const num = KV_NUMBER.exec(text);
+      // Only a quoted key (a JSON member or a dict entry) counts: YAML and shell numbers
+      // (`password: 123456789012345`) are left alone, as the structured rules always did.
+      if (!m[2] || !num || num[0].length < KV_MIN_VALUE) continue;
+      const end = afterOpen + num[0].length;
+      if (end < text.length && /[A-Za-z0-9_.-]/.test(text[end])) continue; // part of a longer word, not a number
+      if (/^-?(\d)\1+$/.test(num[0])) continue;                            // 00000000: a mask
+      out.push({ start: afterOpen, end, quote: m[2] });
+      KV_OPEN.lastIndex = end;
+      continue;
+    }
+    const open = m[3];
+    const quote = open[open.length - 1];
+    const level = open.length - 1;           // backslashes before the opening quote
+    const start = afterOpen;
+    const limit = Math.min(text.length, start + KV_MAX_VALUE);
+    let i = start;
+    let end = -1;
+    while (i < limit) {
+      const c = text.charCodeAt(i);
+      // A value never runs over a line break: the quote that follows `token="` in a source
+      // line is the closing quote of that string, not the start of a value (print("token=" + x)).
+      if (c === 10 || c === 13) break;
+      if (c === 92) {
+        if (level > 0) {
+          // Count the run of backslashes only inside the window, so a long run stays linear.
+          let k = 0;
+          while (i + k < limit && text.charCodeAt(i + k) === 92) k++;
+          if (k === level && text[i + k] === quote) { end = i; break; }
+          i += k + 1;
+        } else if (quote !== "'") {
+          i += 2;                            // a backslash escapes the next character
+        } else {
+          i += 1;
+        }
+      } else if (level === 0 && text[i] === quote) {
+        end = i;
+        break;
+      } else {
+        i++;
+      }
+    }
+    if (end < 0) continue;
+    const value = text.slice(start, end);
+    if (value.length < KV_MIN_VALUE || !/\s/.test(value) || KV_PLACEHOLDER(value)) continue;
+    let spanEnd = end;
+    if (level === 0 && !m[2]) {
+      // A shell word glued to more quoted pieces ('a b''c') is one value: take them too.
+      let p = end + 1;
+      for (let n = 0; n < 8 && (text[p] === '"' || text[p] === "'"); n++) {
+        let q = p + 1;
+        while (q < text.length && /[A-Za-z0-9_.-]/.test(text[q])) q++;
+        if (q === p + 1) break;
+        spanEnd = q;
+        p = q + 1;
+      }
+    }
+    out.push({ start, end: spanEnd });
+    KV_OPEN.lastIndex = spanEnd;
+  }
+}
+
 const PATTERNS = [
   { type: 'ANTHROPIC_KEY', hints: ['sk-ant-'], re: re(NB + 'sk-ant-[a-z]{3,8}\\d{2}-[A-Za-z0-9_-]{32,200}' + NA),
     check: (v) => !maskedBody(v.replace(/^sk-ant-[a-z]+\d{2}-/, '')) },
@@ -383,7 +493,7 @@ const PATTERNS = [
   { type: 'OPENAI_KEY', hints: ['sk-'], re: re(NB + 'sk-[0-9a-f]{32}' + NA),
     check: (v) => hexSecret(v.slice(3)) },
   { type: 'AWS_KEY', hints: ['AKIA', 'ASIA', 'ABIA', 'ACCA'], re: re('(?<![A-Za-z0-9])(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}(?![A-Za-z0-9])'),
-    check: (v) => !/^(.)\1+$/.test(v.slice(4)) && !/EXAMPLE$/.test(v) },
+    check: (v) => !/^(.)\1+$/.test(v.slice(4)) },
   { type: 'AWS_SECRET', hints: ['ecret', 'ECRET'], re: re(NB64 + '[A-Za-z0-9+/]{40}' + NA64),
     check: (v, text, index) => looksRandom(v, 3, 4.0) &&
       /(?:aws|secret[_ -]?access[_ -]?key|SecretAccessKey)/i.test(text.slice(Math.max(0, index - 160), index)) &&
@@ -548,7 +658,7 @@ const PATTERNS = [
     re: re(PEM_BEGIN + PEM_LABEL + '-----(?:[ \\t]*\\r?\\n[ \\t>#*/"\'-]*(?:[A-Za-z0-9+/=:,-]+[ \\t]*))*') },
   /* Password segment of scheme://user:password@host (any scheme). */
   { type: 'DB_PASSWORD', hints: ['://'],
-    re: re('\\b([a-zA-Z][a-zA-Z0-9+.-]{1,24}):\\/\\/([^\\s:@\\/?#\'"`<>]{0,128}):([^\\s@\\/?#\'"`<>]{1,256})@([A-Za-z0-9.-]+|\\[[0-9a-fA-F:]+\\])'),
+    re: re('(?<![A-Za-z0-9_])([a-zA-Z][a-zA-Z0-9+._-]{1,40}):\\/\\/([^\\s:@\\/?#\'"`<>]{0,128}):([^\\s@\\/?#\'"`<>]{1,256})@([A-Za-z0-9.-]+|\\[[0-9a-fA-F:]+\\])'),
     group: 3,
     check: (pw, text, index, m) => {
       const user = m[2];
@@ -589,6 +699,8 @@ const PATTERNS = [
   /* Sensitive key in structured config: YAML, docker-compose (map and
    * list), dotenv, Dockerfile ENV / ARG (see S_LINES). */
   { type: 'SECRET', hints: null, prefilter: S_PREFILTER, find: findStructured },
+  /* Quoted value with spaces, or a number, under a secret key (see findQuotedKv). */
+  { type: 'SECRET', hints: null, prefilter: KV_PREFILTER, find: findQuotedKv },
   /* `docker run -e KEY=value` / `--env KEY=value` / `--env=KEY=value`. */
   { type: 'SECRET', hints: ['-e', '--env'],
     re: re('(?<![^\\s])(?:-e|--env)(?:[ \\t]+|=)(["\']?)([A-Za-z_][A-Za-z0-9_]{0,127})=([^\\s"\'`;&|]{1,512})\\1(?![^\\s;&|)])'),
@@ -624,7 +736,11 @@ function findPatterns(text, opts) {
     if (p.find) {
       const found = [];
       p.find(text, found);
-      for (const f of found) spans.push({ start: f.start, end: f.end, type: p.type, source: 'pattern' });
+      for (const f of found) {
+        const span = { start: f.start, end: f.end, type: p.type, source: 'pattern' };
+        if (f.quote) span.quote = f.quote;
+        spans.push(span);
+      }
       continue;
     }
     p.re.lastIndex = 0;
@@ -688,6 +804,104 @@ function findEmails(text, check, out) {
   }
 }
 
+/* Personal fields that have no checksum (a person's name, a postal address, a
+ * username) are detected only from an explicit key next to the value:
+ *   - HTTP headers (X-User-Name: ..., also as a JSON key or inside -H '...');
+ *   - query strings and form bodies (?name=...&user=..., or a key=value line
+ *     that starts in column 0).
+ * Only the value is the span; the key stays readable. A bare value without its
+ * key is never matched. Code (keyword arguments, JSON schemas, package
+ * manifests, ALL-CAPS environment variables) is not in scope on purpose. */
+const KEYED_PLACEHOLDER = /^(?:\{.*\}|\$.*|<.*>|\[.*\]|%[sd]|__ZN_.*|null|undefined|none|nil|true|false|n\/a|na|anonymous|unknown|-+|\*+|x+)$/i;
+const NOT_A_PERSON = new Set(['root', 'admin', 'administrator', 'system', 'guest', 'default', 'test', 'tester', 'user', 'username', 'name', 'bot', 'ci', 'runner', 'ubuntu', 'ec2-user', 'nobody', 'www-data', 'service', 'me', 'self', 'github-actions', 'dependabot', 'example', 'git', 'postgres', 'mysql', 'nginx', 'deploy']);
+const NAME_PARTICLES = new Set(['de', 'del', 'la', 'van', 'von', 'da', 'di', 'bin', 'al', 'el', 'y']);
+
+function decodeFormValue(v) {
+  const s = v.replace(/\+/g, ' ');
+  try { return decodeURIComponent(s); } catch (_) { return s; }
+}
+function validPersonName(d, strong) {
+  if (d.length < 2 || d.length > 80) return false;
+  const words = d.trim().split(/\s+/);
+  if (words.length > 5) return false;
+  for (const w of words) if (!/^\p{L}[\p{L}'.-]*$/u.test(w)) return false;
+  if (words.length === 1) return strong && words[0].length >= 2 && !NOT_A_PERSON.has(words[0].toLowerCase());
+  if (strong) return true;
+  // generic key (name=): every word capitalised, so build names stay out
+  return words.every((w) => /^\p{Lu}/u.test(w) || NAME_PARTICLES.has(w.toLowerCase()));
+}
+function validUsername(d) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$/.test(d)) return false;
+  if (/^\d+$/.test(d) || NOT_A_PERSON.has(d.toLowerCase())) return false;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(d)) return false;   // UUID
+  return true;
+}
+function validAddress(d) {
+  if (d.length < 6 || d.length > 160 || /:\/\/|@/.test(d) || /^0x/i.test(d)) return false;
+  const tokens = d.split(/[\s,]+/).filter(Boolean);
+  return tokens.length >= 2 && /\d/.test(d) && /\p{L}{2}/u.test(d);
+}
+
+function keyedFinder(spec) {
+  const hdr = new RegExp('(?<![A-Za-z0-9_-])(' + spec.headers.join('|') + ')["\']?[ \\t]*:[ \\t]*(["\']?)', 'gi');
+  const frm = new RegExp('(?<![A-Za-z0-9_.-])(' + spec.forms.join('|') + ')=', 'gi');
+  const isLetter = (c) => c !== undefined && /\p{L}/u.test(c);
+  const accept = (raw, strong, form) => {
+    if (!raw) return false;
+    const d = (form ? decodeFormValue(raw) : raw).trim();
+    if (KEYED_PLACEHOLDER.test(d)) return false;
+    return spec.valid(d, strong);
+  };
+  return function find(text, check, out) {
+    let m;
+    hdr.lastIndex = 0;
+    while ((m = hdr.exec(text)) !== null) {
+      const start = m.index + m[0].length;
+      const quote = m[2];
+      let i = start;
+      for (; i < text.length; i++) {
+        const c = text[i];
+        if (c === '\n' || c === '\r' || c === '"') break;
+        if (quote && c === quote) break;
+        if (c === "'" && !(isLetter(text[i - 1]) && isLetter(text[i + 1]))) break;
+      }
+      let end = i;
+      while (end > start && /[\s,;\\]/.test(text[end - 1])) end--;
+      if (end > start && accept(text.slice(start, end), true, false)) out.push({ start, end });
+      hdr.lastIndex = Math.max(hdr.lastIndex, i);
+    }
+    frm.lastIndex = 0;
+    while ((m = frm.exec(text)) !== null) {
+      const key = m[1];
+      const kStart = m.index;
+      const before = kStart > 0 ? text[kStart - 1] : '\n';
+      const query = before === '?' || before === '&';
+      if (!query && before !== '\n' && before !== '\r') continue;
+      if (!query && key === key.toUpperCase()) continue;   // USER=... style environment variables
+      const start = kStart + key.length + 1;
+      let i = start;
+      for (; i < text.length; i++) {
+        const c = text[i];
+        if (c === '\n' || c === '\r' || c === '&' || c === '"' || c === "'") break;
+        if (query && (c === ' ' || c === '\t' || c === '#')) break;
+      }
+      let end = i;
+      while (end > start && /[\s,;]/.test(text[end - 1])) end--;
+      const strong = !/^name$/i.test(key);
+      if (end > start && accept(text.slice(start, end), strong, true)) out.push({ start, end });
+      frm.lastIndex = Math.max(frm.lastIndex, i);
+    }
+  };
+}
+
+/* Same language as /X-[A-Za-z-]{4,16}\s*["']?\s*:/, written so that a run of whitespace after
+ * the name is scanned once: with the quote optional between two \s*, a long run could be split
+ * between them in every possible way (quadratic). Here the second \s* only follows a quote. */
+const KEYED_PREFILTER = /X-[A-Za-z-]{4,16}\s*(?:["']\s*)?:|(?:name|user|login|address)=/i;
+const findPersonName = keyedFinder({ headers: ['X-User-?Name', 'X-Full-?Name'], forms: ['full_?name', 'name'], valid: validPersonName });
+const findUsername = keyedFinder({ headers: ['X-Username', 'X-User', 'X-Forwarded-User', 'X-Remote-User'], forms: ['username', 'user', 'login'], valid: (d) => validUsername(d) });
+const findPostalAddress = keyedFinder({ headers: ['X-Address'], forms: ['address'], valid: (d) => validAddress(d) });
+
 const PII = [
   { type: 'EMAIL', key: 'email', hints: ['@'], find: findEmails,
     check: (v, text, index) => {
@@ -721,9 +935,12 @@ const PII = [
     re: re('(?<![0-9A-Za-z.-])\\d{3}-\\d{2}-\\d{4}(?![0-9A-Za-z]|-\\d)'), check: (v) => ssnValid(v) },
   { type: 'IPV4', key: 'ipv4', hints: ['.'],
     re: re('(?<![0-9.])(?:\\d{1,3}\\.){3}\\d{1,3}(?![0-9.])'), check: (v) => ipv4Public(v) },
+  { type: 'PERSON_NAME', key: 'name', hints: null, prefilter: KEYED_PREFILTER, find: findPersonName },
+  { type: 'POSTAL_ADDRESS', key: 'address', hints: null, prefilter: KEYED_PREFILTER, find: findPostalAddress },
+  { type: 'USERNAME', key: 'username', hints: null, prefilter: KEYED_PREFILTER, find: findUsername },
 ];
 
-const PII_DEFAULTS = { email: true, phone: true, iban: true, card: true, dni: true, ssn: true, ipv4: false };
+const PII_DEFAULTS = { email: true, phone: true, iban: true, card: true, dni: true, ssn: true, ipv4: false, name: true, address: true, username: true };
 const PII_TYPES = PII.map((p) => p.type);
 
 function findPii(text, opts) {

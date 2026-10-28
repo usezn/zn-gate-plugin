@@ -52,7 +52,9 @@ const UNSAFE_CHARS_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200e\u200f\u2
 const LINE_BREAK_RE = /[\r\n\t\u2028\u2029]+/g;
 // Zero-width, invisible and tag characters: they hide text from the reader and can split a value so that
 // it is not recognised, so they are removed before the value is hidden and again after.
-const INVISIBLE_RE = /[\u200b-\u200d\u2060-\u2064\ufeff\u{e0000}-\u{e007f}]/gu;
+const { BMP_CLASS, ASTRAL_CLASS } = require('../invisible');
+// The shared table (lib/invisible.js) plus the invisible math operators U+2061-2064.
+const INVISIBLE_RE = new RegExp('[' + BMP_CLASS + '\\u2061-\\u2064' + ASTRAL_CLASS + ']', 'gu');
 
 /** Text that is safe to show on one line: invisible characters removed, secret values redacted (as zn audit
  * does), line breaks turned into spaces and other unsafe characters replaced. */

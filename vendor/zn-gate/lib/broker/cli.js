@@ -21,6 +21,7 @@ const { writeFileAtomic } = require('./files');
 const deps = require('../deps');
 const exe = require('../exe');
 const { humanError } = require('../errors');
+const { validateSecretValue } = require('../scrub/exact');
 const { znCommand } = require('../zn-command');
 
 const MODES = new Set(['proxy', 'env', 'file']);
@@ -66,6 +67,7 @@ function makeIo(io = {}) {
     readSecret: io.readSecret,
     confirm: io.confirm,
     human: io.human, // tests: skip the terminal check
+    ancestry: io.ancestry, claude: io.claude, run: io.run, envList: io.envList, // tests (zn-gate uninstall)
   };
 }
 
@@ -137,6 +139,8 @@ async function secretSet(args, io) {
   const value = flags.clipboard ? tty.readClipboard()
     : await (io.readSecret ? io.readSecret(name) : tty.readHidden('Value for ' + name + ' (hidden): ', io));
   if (!value) throw deps.znError('ZN_USAGE', 'empty value, nothing stored');
+  const tooShort = validateSecretValue(value);
+  if (tooShort) throw deps.znError('ZN_USAGE', tooShort + ' Nothing stored.');
   const meta = metaFromFlags(flags);
   await vault.setSecret(name, value, meta);
   out(io, 'Stored ' + name + ' (' + meta.mode + ' mode). Agents use it as ' + markers.markerFor(name) + '.');
@@ -211,15 +215,8 @@ async function secretAllow(args, io) {
   if ((flags.in || []).some((p) => p !== 'header')) {
     out(io, 'Warning: in the URL or the body, an injected prompt could make zn send ' + name + ' somewhere readable on an allowed host (a gist, an issue). Allow it only if the API needs it.');
   }
-  if (typeof vault.updateSecretMeta === 'function') out(io, 'Confirm the change in the zn vault prompt (system dialog or the `zn unlock --foreground` terminal).');
-  if (typeof vault.updateSecretMeta === 'function') {
-    await vault.updateSecretMeta(name, meta);
-  } else {
-    const project = deps.findProjectRoot(io.cwd);
-    const value = await vault.resolve(project, markers.markerFor(name));
-    if (value == null) throw deps.znError('ZN_NOT_FOUND', name + ' has no value');
-    await vault.setSecret(name, value, meta);
-  }
+  out(io, 'Confirm the change in the zn vault prompt (system dialog or the `zn unlock --foreground` terminal).');
+  await vault.updateSecretMeta(name, meta);
   out(io, name + ': mode=' + meta.mode + ' hosts=' + (meta.allowHosts.join(',') || '-') + ' commands=' + (meta.allowCommands.join(',') || '-') + ' http=' + meta.allowIn.join(','));
   return 0;
 }
@@ -255,10 +252,9 @@ async function secretAdopt(args, io) {
   const vault = await vaultOf(io);
   if (await existingMeta(vault, flags.name)) throw deps.znError('ZN_USAGE', flags.name + ' already exists');
   const project = deps.findProjectRoot(io.cwd);
-  const value = await vault.resolve(project, markers.markerFor(tokenName));
-  if (value == null) throw deps.znError('ZN_NOT_FOUND', markers.markerFor(tokenName) + ' is not known for this project');
   const meta = metaFromFlags(flags, { source: 'adopted' });
-  await vault.setSecret(flags.name, value, meta);
+  // The value moves inside the vault: it never comes back to this process.
+  await vault.adoptToken(project, markers.markerFor(tokenName), flags.name, meta);
   out(io, 'Adopted ' + markers.markerFor(tokenName) + ' as ' + markers.markerFor(flags.name) + ' (' + meta.mode + ' mode).');
   return 0;
 }
@@ -274,10 +270,16 @@ function secretNameForKey(key) {
  * Plan which .env values move to the vault. Returns
  * {parsed, items: [{entry, name, value, start, end}], skipped: [{key, why}]}
  */
+function shortWhy(n) {
+  return 'the value is only ' + n + ' character(s); values under ' + dotenv.MIN_SECRET_LEN
+    + ' are not moved because they cannot be told apart from ordinary text. It stays in the file in plain text. Use a longer value.';
+}
+
 function planImport(text, flags) {
   const parsed = dotenv.parseDotenv(text);
   const items = [];
   const skipped = [];
+  const notes = [];
   const only = flags.keys ? new Set(flags.keys) : null;
   for (const e of parsed.entries) {
     if (only && !only.has(e.key)) continue;
@@ -290,19 +292,29 @@ function planImport(text, flags) {
     let start = e.start;
     let end = e.end;
     if (pw) {
-      name = name + '_PASSWORD';
-      value = e.value.slice(pw.start, pw.end);
-      start = e.start + pw.start;
-      end = e.start + pw.end;
+      const pass = e.value.slice(pw.start, pw.end);
+      if (pass.length >= dotenv.MIN_SECRET_LEN) {
+        name = name + '_PASSWORD';
+        value = pass;
+        start = e.start + pw.start;
+        end = e.start + pw.end;
+      } else if (e.value.length >= dotenv.MIN_SECRET_LEN) {
+        // The password alone is too short to be found and hidden later, so
+        // the whole URL moves to the vault instead and the password goes with it.
+        notes.push({ key: e.key, why: 'the password in the URL is only ' + pass.length + ' character(s) long, so the whole URL was moved to the vault instead of just the password' });
+      } else {
+        skipped.push({ key: e.key, why: shortWhy(e.value.length) });
+        continue;
+      }
     } else if (/^[a-z][a-z0-9+.-]*:\/\//i.test(e.value)) {
       continue; // URL without credentials: nothing secret
     }
-    if (value.length < dotenv.MIN_SECRET_LEN && !only) { skipped.push({ key: e.key, why: 'shorter than 8 characters' }); continue; }
+    if (value.length < dotenv.MIN_SECRET_LEN) { skipped.push({ key: e.key, why: shortWhy(value.length) }); continue; }
     const bad = markers.validateSecretName(name);
     if (bad) { skipped.push({ key: e.key, why: bad + ' (store it with zn secret set OTHER_NAME)' }); continue; }
     items.push({ entry: e, name, value, start, end });
   }
-  return { parsed, items, skipped };
+  return { parsed, items, skipped, notes };
 }
 
 async function storeItems(vault, items, flags, source, io) {
@@ -310,8 +322,8 @@ async function storeItems(vault, items, flags, source, io) {
   for (const it of items) {
     const cur = await existingMeta(vault, it.name);
     if (cur && !flags.force) {
-      const same = await vault.resolve(deps.findProjectRoot(io.cwd), markers.markerFor(it.name));
-      if (same !== it.value) {
+      const same = await vault.sameSecretValue(it.name, it.value);
+      if (!same) {
         out(io, '  skip ' + it.name + ': a different value is already stored (use --force to replace)');
         continue;
       }
@@ -334,6 +346,7 @@ async function secretImport(args, io) {
   const stored = await storeItems(vault, plan.items, flags, 'dotenv:' + path.basename(file), io);
   out(io, 'Imported ' + stored.length + ' secret(s) from ' + path.basename(file) + ': ' + (stored.map((s) => s.name).join(', ') || '-'));
   for (const s of plan.skipped) out(io, '  skipped ' + s.key + ': ' + s.why);
+  for (const s of plan.notes) out(io, '  note ' + s.key + ': ' + s.why);
   out(io, 'The file is unchanged. To replace its values with markers run: zn env shadow ' + path.relative(io.cwd, file));
   return 0;
 }
@@ -357,6 +370,8 @@ async function envShadow(args, io) {
   }
   if (flags['dry-run']) {
     for (const it of plan.items) out(io, '  ' + it.entry.key + ' -> ' + markers.markerFor(it.name));
+    for (const s of plan.notes) out(io, '  note ' + s.key + ': ' + s.why);
+    for (const s of plan.skipped) out(io, '  skipped ' + s.key + ': ' + s.why);
     return 0;
   }
   const vault = await vaultOf(io);
@@ -372,6 +387,7 @@ async function envShadow(args, io) {
   writeFileAtomic(file, shadowed, mode);
   out(io, 'Shadowed ' + edits.length + ' value(s) in ' + path.basename(file) + '. The file now holds only markers; the values are in the local vault.');
   out(io, 'Encrypted copy of the original: ' + bak + ' (restore with: zn env unshadow ' + path.relative(io.cwd, file) + ' --backup ' + bak + ')');
+  for (const s of plan.notes) out(io, '  note ' + s.key + ': ' + s.why);
   for (const s of plan.skipped) out(io, '  skipped ' + s.key + ': ' + s.why);
   const names = stored.map((s) => s.name).join(',');
   if (!flags.command) {
@@ -389,10 +405,11 @@ async function envUnshadow(args, io) {
   }
   needHuman(io, 'zn env unshadow');
   const vault = await vaultOf(io);
-  const text = await vault.resolve(deps.findProjectRoot(io.cwd), markers.markerFor(flags.backup));
-  if (text == null) throw deps.znError('ZN_NOT_FOUND', flags.backup + ' not found');
   const ok = await (io.confirm ? io.confirm('Write plain-text values back to ' + path.basename(file) + '?') : tty.confirm('Write plain-text values back to ' + path.basename(file) + '?', io));
   if (!ok) return 1;
+  // The vault asks again on its own channel before the plain text leaves it.
+  const text = await vault.readBackup(deps.findProjectRoot(io.cwd), flags.backup, file);
+  if (text == null) throw deps.znError('ZN_NOT_FOUND', flags.backup + ' not found');
   writeFileAtomic(file, text, 0o600);
   out(io, 'Restored ' + path.basename(file) + ' from ' + flags.backup + '.');
   return 0;
@@ -415,7 +432,25 @@ async function audit(args, io) {
   }
   const reader = mod.read || mod.query || mod.list;
   if (typeof reader !== 'function') throw deps.znError('ZN_UNAVAILABLE', 'lib/vault/audit.js has no read API');
-  const records = await reader({ since: flags.since });
+  // An unlocked vault verifies the chain first and refuses to show a log that does not verify.
+  let records;
+  let verified;
+  try {
+    verified = await verifiedRead(flags.since);
+  } catch (err) {
+    // The vault is unlocked but could not check the log (an older daemon that is still running
+    // after an upgrade does not know the operation): do not show a log nobody verified.
+    out(io, 'The log is not shown because the unlocked vault could not check it (' + (err && err.message ? err.message : String(err)) + ').');
+    out(io, 'If you just upgraded zn, restart the vault (`' + znCommand('lock') + '`, then `' + znCommand('unlock') + '`) and try again.');
+    return 1;
+  }
+  if (verified && !verified.ok) {
+    out(io, 'chain: BROKEN: ' + (verified.reason || verified.error || 'verification failed'));
+    out(io, 'The log is not shown because it did not verify. Keep a copy of ~/.zn/audit.jsonl as evidence and run `' + znCommand('vault verify') + '`.');
+    return 1;
+  }
+  if (verified) records = verified.events;
+  else records = await reader({ since: flags.since });
   for (const r of records || []) {
     out(io, [r.ts, r.decision, r.secret, r.mode, r.agent, r.tool, r.argv0 || r.host || '', r.reason || ''].map((x) => x == null ? '-' : String(x)).join('  '));
   }
@@ -425,13 +460,28 @@ async function audit(args, io) {
   return chain.broken ? 1 : 0;
 }
 
+/** Verified read through the unlocked vault; null when the vault is locked or unreachable.
+ *  Throws when the vault is unlocked but the verified read fails. */
+async function verifiedRead(since) {
+  let client;
+  try {
+    client = require('../vault/client').createClient({});
+    let unlocked = false;
+    try { unlocked = await client.isUnlocked(); } catch (err) { unlocked = false; }
+    if (!unlocked) return null;
+    return await client.auditRead({ since });
+  } finally {
+    if (client) client.close();
+  }
+}
+
 /** The chain is checked with the key held by the unlocked vault (same check as `zn vault verify`). */
 async function auditChain() {
   let client;
   try {
     client = require('../vault/client').createClient({});
     if (!(await client.isUnlocked())) {
-      return { broken: false, line: 'chain: not checked: the vault is locked or unreachable (run `zn unlock`, then `zn vault verify`)' };
+      return { broken: false, line: 'chain: not checked: the vault is locked or unreachable (run `' + znCommand('unlock') + '`, then `' + znCommand('vault verify') + '`)' };
     }
     const v = await client.auditVerify();
     if (v && v.ok) return { broken: false, line: 'chain: valid, ' + v.records + ' records' };
@@ -446,15 +496,22 @@ async function auditChain() {
 
 /* ------------------------------ hooks ------------------------------ */
 
+function hooksUsage() {
+  return 'usage: zn hooks install|uninstall ' + require('../agents').listAdapters().join('|') + ' [--project] [--no-mcp]';
+}
+
 async function hooks(args, io) {
   const { flags, positional } = parseFlags(args, { bool: ['project', 'no-mcp'] });
   const [action, agentId] = positional;
   if (!['install', 'uninstall'].includes(action) || !agentId) {
-    throw deps.znError('ZN_USAGE', 'usage: zn hooks install|uninstall claude-code|codex|cursor|opencode [--project] [--no-mcp]');
+    throw deps.znError('ZN_USAGE', hooksUsage());
   }
+  // Check the agent name first, so a script or an agent is told the real reason.
+  const unsupported = require('../agents').unsupportedAgentMessage(agentId);
+  if (unsupported) throw deps.znError('ZN_USAGE', unsupported);
   needHuman(io, 'zn hooks ' + action);
   const adapter = require('../agents').getAdapter(agentId);
-  const opts = { scope: flags.project ? 'project' : 'user', projectDir: io.cwd, home: io.home, env: io.env, mcp: !flags['no-mcp'] };
+  const opts = { scope: flags.project ? 'project' : 'user', projectDir: io.cwd, home: io.home, env: io.env, mcp: !flags['no-mcp'], selfCheck: true };
   const report = action === 'install' ? adapter.install(opts) : adapter.uninstall(opts);
   out(io, (action === 'install' ? 'Installed' : 'Removed') + ' zn hooks for ' + adapter.id + ' in ' + report.settings);
   if (report.backup) out(io, '  backup: ' + report.backup);
@@ -468,11 +525,50 @@ async function hooks(args, io) {
 
 /* ------------------------------ entry ------------------------------ */
 
+const HELP = {
+  'hooks': [
+    hooksUsage(),
+    'Adds the zn hooks to a coding agent, or removes them again.',
+    '  install     add the hooks (and the secrets MCP server unless --no-mcp)',
+    '  uninstall   remove them',
+    '  --project   change the settings of this project instead of your user settings',
+    '  --no-mcp    do not add the secrets MCP server',
+  ],
+  'secret': [
+    'usage: zn secret set|list|rm|allow|approve|import|adopt|log ...',
+    'Stores secrets in the zn vault so your agent can use them without seeing them.',
+    'Run zn secret set NAME and type the value at the hidden prompt (or use --clipboard); values are never passed as arguments.',
+  ],
+  'uninstall': [
+    'usage: zn-gate uninstall [--dry-run]',
+    'Removes zn-gate from this computer: the zn-gate plugin of Claude Code, zn\'s hooks (your user and this project),',
+    'and MCP servers wrapped by zn-gate init --wrap-mcp. It shows the plan and asks first; run it in your own terminal.',
+    'The vault is only deleted if you confirm it separately (default no). .env files with markers are left alone.',
+    '  --dry-run   show the plan and change nothing',
+  ],
+  'env': [
+    'usage: zn env shadow [FILE] | zn env unshadow FILE --backup NAME',
+    'shadow moves the secrets of a .env file into the vault and leaves placeholders; unshadow puts them back.',
+  ],
+};
+
+/* -h / --help anywhere before a lone "--" prints the usage and exits 0,
+ * before any option that takes a value can swallow it. */
+function wantsHelp(args) {
+  const end = args.indexOf('--');
+  return (end === -1 ? args : args.slice(0, end)).some((a) => a === '-h' || a === '--help');
+}
+
 const SECRET_USAGE = 'usage: zn secret set|list|rm|allow|approve|import|adopt|log ...';
 
 async function dispatch(group, args, ioIn) {
   const io = makeIo(ioIn);
   try {
+    const helpKey = group === 'secrets' ? 'secret' : group;
+    if (HELP[helpKey] && !(helpKey === 'secret' && args[0] === 'log') && wantsHelp(args)) {
+      for (const line of HELP[helpKey]) out(io, line);
+      return 0;
+    }
     if (group === 'secret' || group === 'secrets') {
       const [sub, ...rest] = args;
       if (sub === 'set') return await secretSet(rest, io);
@@ -500,6 +596,7 @@ async function dispatch(group, args, ioIn) {
       throw deps.znError('ZN_USAGE', 'usage: zn vault log [--since 1h]');
     }
     if (group === 'hooks') return await hooks(args, io);
+    if (group === 'uninstall') return await require('../uninstall').run(args, io);
     throw deps.znError('ZN_USAGE', 'unknown command ' + group);
   } catch (err) {
     io.stderr.write('zn ' + group + ': ' + humanError(err) + '\n');

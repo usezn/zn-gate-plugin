@@ -13,13 +13,17 @@
 
 const readline = require('readline');
 const pins = require('./mcp-pins');
+const messages = require('./messages');
 
 function ask(question) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+    // End of input before an answer counts as no answer, so the approval is refused.
+    rl.on('close', () => resolve(''));
     rl.question(question, (answer) => {
-      rl.close();
+      // Resolve before closing: close emits 'close', which would otherwise win with ''.
       resolve(String(answer || '').trim());
+      rl.close();
     });
   });
 }
@@ -45,28 +49,28 @@ async function run(args, io = {}) {
   }
   if (sub === 'approve') {
     if (!which) {
-      process.stderr.write('usage: zn-gate pins approve <server>|--all\n');
+      process.stderr.write(messages.PINS_USAGE_APPROVE + '\n');
       return 2;
     }
     const tty = require('./broker/tty');
     const agent = tty.agentDetected(io.env || process.env, io);
     if (agent) {
-      process.stderr.write('zn-gate pins approve must be run by you in your own terminal, not by an AI agent' + tty.agentNote(agent) + '\n');
+      process.stderr.write(messages.pinsAgentRefusal(agent) + '\n');
       return 2;
     }
     if (!process.stdin.isTTY || !process.stderr.isTTY) {
-      process.stderr.write('zn-gate pins approve runs only in your own terminal, so that an agent cannot approve tool changes. Run it there.\n');
+      process.stderr.write(messages.PINS_NEEDS_TERMINAL + '\n');
       return 2;
     }
     const expected = which === '--all' ? 'all' : which;
     const typed = await ask('Type ' + (which === '--all' ? '"all"' : 'the server key') + ' again to approve: ');
     if (typed !== expected) {
-      process.stderr.write('Not approved.\n');
+      process.stderr.write(messages.PINS_NOT_APPROVED + '\n');
       return 2;
     }
     const r = pins.approve(which);
     if (r.error) {
-      process.stderr.write('zn-gate pins: ' + r.error + '. Run zn-gate pins to see the servers and their full keys.\n');
+      process.stderr.write(messages.pinsError(r.error) + '\n');
       return 2;
     }
     if (!r.approved.length) {

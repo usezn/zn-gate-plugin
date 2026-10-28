@@ -6,6 +6,7 @@
  */
 
 const { spawnSync } = require('child_process');
+const messages = require('../messages');
 
 /**
  * Environment variables that coding agents set in the shells they spawn.
@@ -31,12 +32,7 @@ function agentDetected(env = process.env, io = {}) {
 }
 
 /* The end of a refusal, in words for someone who does not program. */
-function agentNote(agent) {
-  if (/^started from /.test(agent)) {
-    return ' (zn found it was ' + agent + '). If you are not using an AI agent, open a new terminal window and try again.';
-  }
-  return ' (detected ' + agent + ').';
-}
+const agentNote = messages.agentNote;
 
 /** Throws unless a person is at an interactive terminal. */
 function requireHuman(what, io = {}) {
@@ -44,12 +40,12 @@ function requireHuman(what, io = {}) {
   const env = io.env || process.env;
   const agent = agentDetected(env, io);
   if (agent) {
-    const err = new Error(what + ' must be run by you in your own terminal, not by an AI agent' + agentNote(agent));
+    const err = new Error(messages.agentRefusal(what, agent));
     err.code = 'ZN_POLICY_DENIED';
     throw err;
   }
   if (!stdin.isTTY) {
-    const err = new Error(what + ' needs an interactive terminal.');
+    const err = new Error(messages.notInteractive(what));
     err.code = 'ZN_POLICY_DENIED';
     throw err;
   }
@@ -76,7 +72,7 @@ function readHidden(prompt, io = {}) {
     function onData(chunk) {
       for (const ch of chunk) {
         if (ch === '\r' || ch === '\n') return done();
-        if (ch === '\u0003') { const e = new Error('cancelled'); e.code = 'ZN_CANCELLED'; return done(e); }
+        if (ch === '\u0003') { const e = new Error(messages.PROMPT_CANCELLED); e.code = 'ZN_CANCELLED'; return done(e); }
         if (ch === '\u007f' || ch === '\b') { value = value.slice(0, -1); continue; }
         if (ch === '\u0015') { value = ''; continue; }
         value += ch;
@@ -118,11 +114,10 @@ function readClipboard() {
       ? (ps ? [[ps, ['-NoProfile', '-Command', 'Get-Clipboard -Raw']]] : [])
       : [['/usr/bin/wl-paste', ['--no-newline']], ['/usr/bin/xclip', ['-selection', 'clipboard', '-o']], ['/usr/bin/xsel', ['--clipboard', '--output']]];
   for (const [cmd, args] of candidates) {
-    const r = spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true });
+    const r = spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true, ...(cmd === ps ? { env: require('../exe').psEnv(ps) } : {}) });
     if (!r.error && r.status === 0) return String(r.stdout || '').replace(/\r?\n$/, '');
   }
-  const err = new Error(candidates.length ? 'could not read the clipboard (tried ' + candidates.map((c) => c[0]).join(', ') + ')'
-    : 'could not read the clipboard: the system PowerShell (Windows PowerShell 5.1) was not found');
+  const err = new Error(candidates.length ? messages.clipboardUnreadable(candidates.map((c) => c[0])) : messages.CLIPBOARD_NO_POWERSHELL);
   err.code = 'ZN_UNAVAILABLE';
   throw err;
 }

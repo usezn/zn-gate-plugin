@@ -42,12 +42,14 @@ function getKnownEnvironments() {
   // Antigravity: Google's MCP guides use ~/.gemini/antigravity/mcp_config.json;
   // other setup guides use a shared ~/.gemini/config/mcp_config.json. Both are
   // checked (each only if it exists), so servers in either file are covered.
+  // A project can also have its own .agents/mcp_config.json (docs: antigravity.google/docs/mcp).
 
   return [
     { name: 'Claude Desktop', id: 'claude-desktop', filePath: claudeDesktopPath, key: 'mcpServers', format: 'mcpServers-json' },
     { name: 'Claude Code', id: 'claude-code', filePath: path.join(home, '.claude.json'), key: 'mcpServers', format: 'mcpServers-json' },
     { name: 'Cursor', id: 'cursor', filePath: path.join(home, '.cursor', 'mcp.json'), key: 'mcpServers', format: 'mcpServers-json' },
     { name: 'Antigravity (AGY)', id: 'antigravity', filePath: path.join(home, '.gemini', 'antigravity', 'mcp_config.json'), key: 'mcpServers', format: 'mcpServers-json' },
+    { name: 'Antigravity (this project)', id: 'antigravity-project', filePath: path.join(process.cwd(), '.agents', 'mcp_config.json'), key: 'mcpServers', format: 'mcpServers-json', scope: 'project' },
     { name: 'Antigravity (shared settings)', id: 'antigravity-shared', filePath: path.join(home, '.gemini', 'config', 'mcp_config.json'), key: 'mcpServers', format: 'mcpServers-json' },
     { name: 'Codex', id: 'codex', filePath: path.join(codexHome, 'config.toml'), key: 'mcp_servers', format: 'codex-toml' },
     { name: 'OpenCode', id: 'opencode', filePath: opencodePath, key: 'mcp', format: 'opencode-json' },
@@ -320,6 +322,258 @@ function scanEnvironments(customEnvList = null) {
 }
 
 /**
+ * Symlink-safe backup helpers. A config path can be controlled by a repository
+ * (the project-level agent config), so backups are never chosen by name order
+ * and nothing is read or written through a symlink.
+ */
+function isRegularFile(p, singleLink) {
+  try {
+    const st = fs.lstatSync(p);
+    return st.isFile() && (!singleLink || st.nlink === 1);
+  } catch {
+    return false;
+  }
+}
+
+function realOrNull(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+function isInside(child, parent) {
+  const rel = path.relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function sameRealDir(a, b) {
+  const ra = realOrNull(path.dirname(a));
+  return ra !== null && ra === realOrNull(path.dirname(b));
+}
+
+/**
+ * The folders a home-scope config may live under: the home folder and the
+ * config roots the known environments use (XDG, APPDATA, CODEX_HOME).
+ */
+function homeScopeRoots() {
+  const roots = [os.homedir()];
+  for (const v of [process.env.XDG_CONFIG_HOME, process.env.APPDATA, process.env.CODEX_HOME]) {
+    if (v && path.isAbsolute(v)) roots.push(v);
+  }
+  return roots;
+}
+
+/**
+ * Checks every folder above a home-scope config, not only the file itself.
+ * A parent that is a symlink is fine while its real path stays inside the
+ * root the config is declared under (the home folder, reached through a link
+ * or not); one that leads outside it is refused, naming the link, because
+ * writing there would replace a file that is not zn-gate's to change.
+ * Returns { dir } with the real directory to write and back up in, or { reason }.
+ */
+function validateHomeParents(filePath) {
+  const declared = path.resolve(path.dirname(filePath));
+  const realDir = realOrNull(declared);
+  if (!realDir) return { reason: 'config folder cannot be resolved' };
+  let root = null;
+  for (const r of homeScopeRoots()) {
+    const lexical = path.resolve(r);
+    if (isInside(declared, lexical) && (root === null || lexical.length > root.length)) root = lexical;
+  }
+  // A path outside every known root (a custom list) is only checked as itself.
+  if (root === null) return { dir: realDir };
+  const realRoot = realOrNull(root);
+  if (!realRoot) return { reason: 'config root cannot be resolved' };
+  if (isInside(realDir, realRoot)) return { dir: realDir };
+  let cur = root;
+  for (const part of path.relative(root, declared).split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    let st = null;
+    try {
+      st = fs.lstatSync(cur);
+    } catch {}
+    if (st && st.isSymbolicLink()) {
+      const real = realOrNull(cur);
+      if (!real || !isInside(real, realRoot)) {
+        return { reason: `${cur} is a link that leads outside ${root}; zn-gate will not write through it` };
+      }
+    }
+  }
+  return { reason: `config folder is outside ${root}; zn-gate will not write through a link to it` };
+}
+
+/**
+ * Where a config really lives, or why it cannot be touched safely.
+ * Project scope (a repository controls it): a plain file with one link, whose
+ * real directory is inside the current directory. Home scope: a plain file, or
+ * a symlink (dotfiles managers) to a regular file inside the home folder and
+ * outside the current directory; every folder above it must stay inside the
+ * home folder once links are resolved. The result carries the real folder
+ * (dir) so the backup and the write go through the validated path.
+ */
+function resolveConfig(filePath, scope) {
+  let st;
+  try {
+    st = fs.lstatSync(filePath);
+  } catch {
+    return { reason: 'config is not a regular file' };
+  }
+  if (scope === 'project') {
+    if (!st.isFile()) return { reason: 'config is a symlink or not a regular file' };
+    if (st.nlink !== 1) return { reason: 'config has more than one hard link' };
+    const dir = realOrNull(path.dirname(filePath));
+    const cwd = realOrNull(process.cwd());
+    if (!dir || !cwd || !isInside(dir, cwd)) return { reason: 'config directory is outside the project' };
+    return { target: path.join(dir, path.basename(filePath)), dir };
+  }
+  const parents = validateHomeParents(filePath);
+  if (parents.reason) return { reason: parents.reason };
+  if (st.isFile()) return { target: path.join(parents.dir, path.basename(filePath)), dir: parents.dir };
+  if (!st.isSymbolicLink()) return { reason: 'config is not a regular file' };
+  const real = realOrNull(filePath);
+  const home = realOrNull(os.homedir());
+  const cwd = realOrNull(process.cwd());
+  if (!real || !home || !isRegularFile(real)) return { reason: 'config is a symlink to something other than a regular file' };
+  if (!isInside(real, home)) {
+    return { reason: 'config is a symlink that points outside your home folder; move the real file into your home folder, or wrap this server by hand' };
+  }
+  if (cwd && cwd !== home && isInside(real, cwd)) return { reason: 'config is a symlink that points into the current project' };
+  return { target: real, dir: parents.dir };
+}
+
+/** Refuses to write in a folder that is not already its own real path (a link swapped in after the check). */
+function assertRealDir(dir) {
+  const real = realOrNull(dir);
+  if (!real || real !== dir) {
+    throw new Error(`${dir} is not a real folder (a link was put in its place); zn-gate will not write through it`);
+  }
+}
+
+/** Writes content to a temp file next to target, then renames it over target. */
+function atomicWrite(target, content) {
+  assertRealDir(path.dirname(target));
+  let mode = 0o600;
+  try {
+    mode = fs.statSync(target).mode & 0o777;
+  } catch {}
+  const tmpFile = path.join(path.dirname(target), `.${path.basename(target)}.zn-tmp.${process.pid}.${Date.now()}`);
+  let created = false;
+  try {
+    fs.writeFileSync(tmpFile, content, { flag: 'wx', mode });
+    created = true;
+    try {
+      fs.chmodSync(tmpFile, mode);
+    } catch {}
+    renameWithRetry(tmpFile, target);
+  } catch (err) {
+    if (created) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
+    throw err;
+  }
+}
+
+/**
+ * Copies src to a new backup file without ever overwriting or writing through
+ * an existing entry (including a dangling symlink) at the backup name.
+ * Content goes to a temp file opened with 'wx', then is renamed into place.
+ */
+function createBackup(src, backup) {
+  const exists = () => new Error(`${backup} already exists; refusing to overwrite it`);
+  const lstatMissing = () => {
+    try {
+      fs.lstatSync(backup);
+      return false;
+    } catch (e) {
+      if (e.code === 'ENOENT') return true;
+      throw e;
+    }
+  };
+  if (!lstatMissing()) throw exists();
+  assertRealDir(path.dirname(backup));
+  let mode = 0o600;
+  try {
+    mode = fs.statSync(src).mode & 0o777;
+  } catch {}
+  const data = fs.readFileSync(src);
+  const tmpFile = path.join(path.dirname(backup), `.${path.basename(backup)}.zn-tmp.${process.pid}.${Date.now()}`);
+  let created = false;
+  try {
+    fs.writeFileSync(tmpFile, data, { flag: 'wx', mode });
+    created = true;
+    try {
+      fs.chmodSync(tmpFile, mode);
+    } catch {}
+    if (!lstatMissing()) throw exists();
+    renameWithRetry(tmpFile, backup);
+  } catch (err) {
+    if (created) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
+    throw err;
+  }
+}
+
+/** Renames over target; on Windows-style sharing errors waits briefly and retries. */
+function renameWithRetry(from, to) {
+  const busy = new Set(['EPERM', 'EACCES', 'EBUSY']);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (err) {
+      if (!busy.has(err.code)) throw err;
+      if (attempt >= 5) {
+        throw new Error(`could not replace ${to}: it is in use by another program; close it and run again`);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 75);
+    }
+  }
+}
+
+/** Newest "<file>.bak.<digits>" next to filePath (largest number), or null. */
+function latestBackup(filePath, scope) {
+  const dir = path.dirname(filePath);
+  const prefix = path.basename(filePath) + '.bak.';
+  let best = null;
+  let bestN = -1;
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return null;
+  }
+  for (const f of names) {
+    if (!f.startsWith(prefix)) continue;
+    const tail = f.slice(prefix.length);
+    if (!/^\d+$/.test(tail)) continue;
+    const full = path.join(dir, f);
+    if (!isRegularFile(full, scope === 'project')) continue;
+    const n = Number(tail);
+    if (n > bestN) {
+      bestN = n;
+      best = full;
+    }
+  }
+  return best;
+}
+
+/** Copies backup over the config (its real file for a home symlink) via a temp file and rename. */
+function safeRestore(backup, filePath, scope) {
+  const r = resolveConfig(filePath, scope);
+  if (r.reason) throw new Error(r.reason);
+  if (!isRegularFile(backup, scope === 'project')) throw new Error('backup is a symlink or not a regular file');
+  if (!sameRealDir(backup, filePath)) throw new Error('backup is not in the same directory as the config');
+  atomicWrite(r.target, fs.readFileSync(backup));
+}
+
+/**
  * Protects (or reverts) the detected environments.
  *
  * @param {object} options - { shadow: boolean, dryRun: boolean, revert: boolean, envList: array }
@@ -331,20 +585,28 @@ function configureEnvironments(options = {}) {
   for (const env of envs) {
     if (!env.exists) continue;
 
-    if (options.revert) {
-      const dir = path.dirname(env.filePath);
-      const base = path.basename(env.filePath);
-      const baks = fs.readdirSync(dir)
-        .filter((f) => f.startsWith(base + '.bak.'))
-        .sort()
-        .reverse();
+    const resolved = resolveConfig(env.filePath, env.scope);
+    if (resolved.reason) {
+      if (options.revert || env.serverCount > 0) {
+        actions.push({ env: env.name, status: 'skipped_unsafe', file: env.filePath, error: `${env.filePath}: ${resolved.reason}; skipped` });
+      }
+      continue;
+    }
 
-      if (baks.length > 0) {
-        const latestBak = path.join(dir, baks[0]);
-        if (!options.dryRun) {
-          fs.copyFileSync(latestBak, env.filePath);
+    if (options.revert) {
+      const latestBak = latestBackup(path.join(resolved.dir, path.basename(env.filePath)), env.scope);
+
+      if (latestBak) {
+        try {
+          if (options.dryRun) {
+            if (!sameRealDir(latestBak, env.filePath)) throw new Error('backup is not in the same directory as the config');
+          } else {
+            safeRestore(latestBak, env.filePath, env.scope);
+          }
+          actions.push({ env: env.name, status: 'reverted', from: latestBak });
+        } catch (err) {
+          actions.push({ env: env.name, status: 'skipped_unsafe', file: env.filePath, error: `${latestBak}: ${err.message}; skipped` });
         }
-        actions.push({ env: env.name, status: 'reverted', from: latestBak });
       } else if (env.serverCount > 0) {
         actions.push({ env: env.name, status: 'no_backup_found' });
       }
@@ -363,9 +625,9 @@ function configureEnvironments(options = {}) {
 
       let backup;
       if (modified && !options.dryRun) {
-        backup = `${env.filePath}.bak.${Date.now()}`;
-        fs.writeFileSync(backup, raw, 'utf8');
-        fs.writeFileSync(env.filePath, content, 'utf8');
+        backup = path.join(resolved.dir, `${path.basename(env.filePath)}.bak.${Date.now()}`);
+        createBackup(resolved.target, backup);
+        atomicWrite(resolved.target, content);
       }
 
       if (modified) {
@@ -395,5 +657,8 @@ module.exports = {
   scanEnvironments,
   configureEnvironments,
   // exported for tests
+  latestBackup,
+  safeRestore,
+  resolveConfig,
   _internal: { scanCodexToml, parseTomlStringArray, parseTomlKeyPath },
 };

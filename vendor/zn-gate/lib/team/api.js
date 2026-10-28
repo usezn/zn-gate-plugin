@@ -213,7 +213,8 @@ function createApi(options = {}) {
       const raw = await readBody(res);
       const resHeaders = res.headers;
       const resEtag = resHeaders && typeof resHeaders.get === 'function' ? resHeaders.get('etag') : null;
-      return { status: res.status, etag: resEtag || undefined, data: parseJson(raw) };
+      const retryAfter = resHeaders && typeof resHeaders.get === 'function' ? resHeaders.get('retry-after') : null;
+      return { status: res.status, etag: resEtag || undefined, retryAfter: retryAfter || undefined, data: parseJson(raw) };
     } catch (err) {
       if (err instanceof TeamApiError) throw err;
       if (timedOut) {
@@ -280,7 +281,36 @@ function createApi(options = {}) {
     return { status: 200, body: r.data };
   }
 
-  return { base, preview, join, getPolicy, ingest };
+  /**
+   * This installation revokes itself: POST /v1/org/install/leave, authenticated only by its own install token (no
+   * body, no id). Never throws for an HTTP answer or a network failure:
+   *   {done: true, reason: 'revoked' | 'already' | 'token_invalid'}   200 (both values), or 401: the token is no longer valid
+   *   {done: false, error, status?, retryAfterSeconds?, unsupported?} 429, 5xx, a network error or timeout, and 404/405
+   *                                                                   (an older server without the endpoint: never "revoked")
+   */
+  async function leaveInstall() {
+    const client = /^zn-gate\/[0-9A-Za-z.+_-]{1,32}$/.test(userAgent) ? { 'X-ZN-Client': userAgent } : undefined;
+    let r;
+    try {
+      r = await request('POST', '/v1/org/install/leave', { auth: true, extraHeaders: client });
+    } catch (err) {
+      if (err && err.code === 'ZN_USAGE') throw err;
+      return { done: false, error: err && err.code === 'ZN_TEAM_TIMEOUT' ? 'the server did not answer in time' : 'could not reach the server' };
+    }
+    if (r.status === 200) {
+      if (isObject(r.data) && r.data.revoked === true) return { done: true, reason: r.data.already === true ? 'already' : 'revoked' };
+      return { done: false, error: 'unexpected answer from the server', status: 200 };
+    }
+    if (r.status === 401) return { done: true, reason: 'token_invalid' };
+    if (r.status === 404 || r.status === 405) return { done: false, error: 'this server does not support leaving yet (HTTP ' + r.status + ')', status: r.status, unsupported: true };
+    if (r.status === 429) {
+      const secs = Number.parseInt(r.retryAfter, 10);
+      return { done: false, error: 'the server asked to retry later (HTTP 429)', status: 429, ...(Number.isFinite(secs) && secs > 0 ? { retryAfterSeconds: Math.min(secs, 86400) } : {}) };
+    }
+    return { done: false, error: 'the server answered HTTP ' + r.status, status: r.status };
+  }
+
+  return { base, preview, join, getPolicy, ingest, leaveInstall };
 }
 
 module.exports = { checkBase, createApi, TeamApiError, POLICY_FEATURES_HEADER, POLICY_FEATURES };

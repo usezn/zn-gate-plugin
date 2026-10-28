@@ -15,7 +15,8 @@
  *
  * Files are written atomically (temporary file + rename) with mode 0600.
  * On POSIX the directories are checked to be owned by the current user and
- * closed to group and others; anything else is refused.
+ * closed to group and others; anything else is refused. On Windows they get an
+ * explicit owner-only access list that is read back (lib/vault/winacl.js).
  *
  * Encryption: age X25519 recipients (age-encryption, by Filippo Valsorda);
  * scrypt recipients for the passphrase fallback. No custom cryptography.
@@ -27,6 +28,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { CODES, znError } = require('../errors');
+const winacl = require('./winacl');
 
 const PROJECT_FILE_RE = /^[0-9a-f]{32}\.age$/;
 const STALE_DAYS = 30;
@@ -81,9 +83,13 @@ function projectFile(project, opts) {
 
 function ensurePrivateDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  if (process.platform === 'win32') return; // user profile ACLs apply
   const st = fs.lstatSync(dir);
   if (!st.isDirectory() || st.isSymbolicLink()) throw znError(CODES.POLICY_DENIED, 'not a directory: ' + dir);
+  if (process.platform === 'win32') {
+    // Explicit owner-only permissions, set and read back; refused if that fails.
+    winacl.ensurePrivate(dir, { dir: true });
+    return;
+  }
   if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
     throw znError(CODES.POLICY_DENIED, 'directory is owned by another user: ' + dir);
   }
@@ -195,10 +201,16 @@ async function readEncrypted(file, identity) {
   let text;
   try {
     text = await decryptWith(identity, new Uint8Array(buf));
+  } catch (err) {
+    throw znError(CODES.LOCKED, require('../messages').vaultDamaged(path.basename(file),
+      'is corrupted or was encrypted to another key', (err && err.message) || err));
+  }
+  try {
     return JSON.parse(text);
   } catch (err) {
-    throw znError(CODES.LOCKED, 'vault file ' + path.basename(file) + ' is corrupted or was encrypted to another key (' +
-      String((err && err.message) || err).slice(0, 80) + '). Restore it from a backup; zn will not read or replace it.');
+    // The parser's message quotes the start of the decrypted text: never pass it on, not even with ZN_VERBOSE or DEBUG.
+    throw znError(CODES.LOCKED, require('../messages').vaultDamaged(path.basename(file),
+      'is corrupted or was encrypted to another key', 'not valid JSON'));
   }
 }
 

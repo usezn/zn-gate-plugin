@@ -75,29 +75,64 @@ function portablePath(p, platform = process.platform) {
 // characters. A command with any of them is passed encoded instead.
 const UNSAFE_IN_DOUBLE_QUOTES = /[%!"$`“”„\u0000-\u001F\u007F]/;
 
+// The Windows PowerShell a hook command names, by its absolute path: cmd.exe (Codex runs hook commands through it) and the
+// process start of several agents look in the current folder first, where a repository could hold a powershell.exe of its
+// own. On Windows it is the system PowerShell (lib/exe.js systemPowerShell); when that cannot be found nothing is written
+// (an error), never the bare name. A command written for Windows on another system names the default install folder.
+const DEFAULT_POWERSHELL = 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe';
+// The Windows folder (one folder under a drive) and System32\WindowsPowerShell\v1.0 below it: nothing else is the system PowerShell.
+const PLAIN_POWERSHELL = /^[A-Za-z]:\/[A-Za-z0-9_.-]+\/System32\/WindowsPowerShell\/v1\.0\/powershell\.exe$/i;
+function powershellExe(platform = process.platform) {
+  if (platform !== 'win32') return DEFAULT_POWERSHELL;
+  const ps = require('./exe').systemPowerShell();
+  const p = ps ? portablePath(ps, 'win32') : null;
+  if (p && PLAIN_POWERSHELL.test(p)) return p;
+  throw new Error('zn: the Windows PowerShell (System32\\WindowsPowerShell\\v1.0\\powershell.exe) was not found under the Windows folder, so no hook was written. Next step: run the command again in a normal Windows session; if it keeps failing, report it.');
+}
+// For a command that only cmd.exe reads and that is shared between machines (the project hook of Codex): cmd.exe expands
+// %SystemRoot% to the Windows folder of the machine that runs it.
+const CMD_POWERSHELL = '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+// The powershell.exe at the start of a hook command: one of the two forms above, or the bare name (earlier versions).
+// The folder names are matched in any case (Windows writes C:\WINDOWS\system32 as often as C:\Windows\System32).
+const POWERSHELL_EXE = '(?:[A-Za-z]:/[A-Za-z0-9_.-]+/[Ss][Yy][Ss][Tt][Ee][Mm]32/[Ww][Ii][Nn][Dd][Oo][Ww][Ss][Pp][Oo][Ww][Ee][Rr][Ss][Hh][Ee][Ll][Ll]/[Vv]1\\.0/|%SystemRoot%\\\\System32\\\\WindowsPowerShell\\\\v1\\.0\\\\)?powershell\\.exe';
+
 /**
  * A command that runs `& <program> <args...>` in powershell.exe and reads the
  * same from cmd.exe, PowerShell and Git Bash. Plain paths stay readable
  * (-Command "..."); a path with a character one of those shells would act on
  * inside double quotes is passed as -EncodedCommand (base64 of UTF-16LE),
- * which no shell changes.
+ * which no shell changes. `opts.encoded` always uses -EncodedCommand, for an
+ * agent that splits the command on spaces and ignores quotes.
  */
-function windowsCommand(program, args, extra = []) {
+function windowsCommand(program, args, extra = [], opts = {}) {
   const inner = '& ' + [program, ...args].map((a) => powershellQuote(portablePath(a, 'win32'))).join(' ') +
     (extra.length ? ' ' + extra.join(' ') : '');
-  const head = 'powershell.exe -NoProfile -NonInteractive ';
-  if (!UNSAFE_IN_DOUBLE_QUOTES.test(inner)) return head + '-Command "' + inner + '"';
+  const head = powershellExe() + ' -NoProfile -NonInteractive ';
+  if (!opts.encoded && !UNSAFE_IN_DOUBLE_QUOTES.test(inner)) return head + '-Command "' + inner + '"';
   return head + '-EncodedCommand ' + Buffer.from(inner, 'utf16le').toString('base64');
 }
 
 /** The PowerShell text of a windowsCommand() result, or null when it is not one. */
 function windowsCommandScript(command) {
   const s = String(command || '');
-  let m = /^powershell\.exe -NoProfile -NonInteractive -Command "(.*)"\s*$/s.exec(s);
+  let m = new RegExp('^' + POWERSHELL_EXE + ' -NoProfile -NonInteractive -Command "(.*)"\\s*$', 's').exec(s);
   if (m) return m[1];
-  m = /^powershell\.exe -NoProfile -NonInteractive -EncodedCommand ([A-Za-z0-9+/=]+)\s*$/.exec(s);
+  m = new RegExp('^' + POWERSHELL_EXE + ' -NoProfile -NonInteractive -EncodedCommand ([A-Za-z0-9+/=]+)\\s*$').exec(s);
   if (m) return Buffer.from(m[1], 'base64').toString('utf16le');
   return null;
 }
 
-module.exports = { shQuote, SH_QUOTE_ESCAPE, powershellQuote, portablePath, windowsCommand, windowsCommandScript };
+/**
+ * A windowsCommand() result in its readable -Command form, so code that
+ * recognises zn's own hook commands sees one shape for both spellings. Any
+ * other command is returned as it is.
+ */
+function readableWindowsCommand(command) {
+  const s = String(command || '');
+  const head = new RegExp('^(' + POWERSHELL_EXE + ') -NoProfile -NonInteractive -EncodedCommand ').exec(s);
+  if (!head) return s;
+  const script = windowsCommandScript(s);
+  return script === null ? s : head[1] + ' -NoProfile -NonInteractive -Command "' + script + '"';
+}
+
+module.exports = { shQuote, SH_QUOTE_ESCAPE, powershellQuote, portablePath, powershellExe, CMD_POWERSHELL, POWERSHELL_EXE, windowsCommand, windowsCommandScript, readableWindowsCommand };

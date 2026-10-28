@@ -14,6 +14,8 @@
  */
 
 const cloudKey = require('./cloud-key');
+const messages = require('./messages');
+const { znCommand } = require('./zn-command');
 
 const CONNECT_URL = 'https://usezn.com/connect?source=cli&utm_source=cli';
 // The only host this module talks to, and the routes on it.
@@ -57,7 +59,9 @@ function openBrowser(url) {
   }
   if (!cmd) return false;
   try {
-    const r = spawnSync(cmd, args, { stdio: 'ignore', timeout: 15000, windowsHide: true });
+    const opts = { stdio: 'ignore', timeout: 15000, windowsHide: true };
+    if (process.platform === 'win32') opts.env = require('./exe').psEnv(cmd);
+    const r = spawnSync(cmd, args, opts);
     return !r.error && r.status === 0;
   } catch (_) { return false; }
 }
@@ -74,9 +78,9 @@ function scrub(text, key) {
  * Resolves {status, body} or {error}. Redirects are not followed, the
  * certificate is always verified, and the host cannot be changed by the caller.
  */
-function request(h, method, path, key) {
+function request(h, method, path, key, saved) {
   return new Promise((resolve) => {
-    const why = cloudKey.tlsRefusal();
+    const why = cloudKey.tlsRefusal(process.env, { saved });
     if (why) { resolve({ error: why }); return; }
     let done = false;
     const finish = (v) => { if (!done) { done = true; resolve(v); } };
@@ -116,7 +120,7 @@ function version() {
  *   'failed'   anything else, or no answer: nothing is stored
  */
 async function verifyKey(h, key) {
-  const r = await request(h, 'GET', VERIFY_PATH, key);
+  const r = await request(h, 'GET', VERIFY_PATH, key, false);
   if (r.error) return { state: 'failed', detail: r.error };
   if (r.status === 200) return { state: 'full', detail: null };
   if (r.status === 401) return { state: 'rejected', detail: null };
@@ -128,18 +132,6 @@ async function verifyKey(h, key) {
   return { state: 'failed', detail: 'HTTP ' + r.status };
 }
 
-function noStoreText() {
-  return [
-    'zn-gate will not keep the key in a plain file, and this computer has no system keychain',
-    '(and the zn vault is not unlocked), so nothing was saved.',
-    '',
-    'To use the cloud check anyway, set the key in your own shell before starting your agent:',
-    '  ZN_API_KEY=<your key> and ZN_CLOUD=1',
-    'A key in ZN_API_KEY alone does nothing. Or run `zn unlock` first and then `zn-gate connect` again.',
-    '',
-  ].join('\n') + '\n';
-}
-
 async function connect(args, io) {
   const c = defaults(io);
   const rest = args.filter((a) => a !== '--reconnect');
@@ -147,7 +139,7 @@ async function connect(args, io) {
   if (rest.length) {
     // A key must never travel as an argument (shell history, process list).
     const looksLikeKey = rest.some((a) => /zn_[A-Za-z0-9._-]{8,}/.test(a) || /^--?(key|api-key|token)\b/.test(a));
-    c.err(looksLikeKey ? 'Never put the key on the command line. Run `zn-gate connect` and paste it at the hidden prompt.\n' : USAGE_CONNECT);
+    c.err(looksLikeKey ? messages.CONNECT_KEY_ON_COMMAND_LINE + '\n' : USAGE_CONNECT);
     return 2;
   }
   try { c.tty.requireHuman('zn-gate connect', c.ttyIo); } catch (e) {
@@ -161,7 +153,7 @@ async function connect(args, io) {
     return 0;
   }
   const store = await cloudKey.availableStore(c.deps);
-  if (!store) { c.out(noStoreText()); return 1; }
+  if (!store) { c.err(messages.connectNoStore(znCommand('unlock')) + '\n'); return 1; }
 
   c.out('zn-gate connect (optional)\n\n'
     + 'Right now zn-gate runs entirely on your computer and sends nothing.\n'
@@ -180,32 +172,32 @@ async function connect(args, io) {
 
   let key;
   try { key = (await c.tty.readHidden('API key (hidden): ', c.ttyIo)).trim(); } catch (e) {
-    c.err('Cancelled. Nothing was saved.\n');
+    c.err(messages.CONNECT_CANCELLED + '\n');
     return 1;
   }
   if (!cloudKey.looksLikeZnKey(key)) {
-    c.err('That does not look like a zn API key (they start with zn_). Nothing was saved.\n');
+    c.err(messages.CONNECT_NOT_A_KEY + '\n');
     return 1;
   }
 
   const v = await verifyKey(c.https, key);
   if (v.state === 'rejected') {
-    c.err('usezn.com did not accept this key (it may be revoked or mistyped). Nothing was saved.\n');
+    c.err(messages.CONNECT_REJECTED + '\n');
     return 1;
   }
   if (v.state === 'full') {
-    c.err('This key can do more than analyze text, and zn-gate only accepts a key limited to analyzing. Create an analysis-only key on the connect page and paste that one: ' + CONNECT_URL + '\nNothing was saved.\n');
+    c.err(messages.connectFullAccess(CONNECT_URL) + '\n');
     return 1;
   }
   if (v.state !== 'analyze') {
-    c.err('Could not verify the key with usezn.com (' + v.detail + '), so nothing was saved. Try again later.\n');
+    c.err(messages.connectUnverified(v.detail) + '\n');
     return 1;
   }
 
   let where;
   try { where = await cloudKey.saveKey(key, c.deps); } catch (e) {
-    if (e instanceof cloudKey.NoSecureStore || (e && e.code === 'ZN_NO_SECURE_STORE')) { c.out(noStoreText()); return 1; }
-    c.err('Could not save the key: ' + scrub(e && e.message, key) + '. Nothing was kept.\n');
+    if (e instanceof cloudKey.NoSecureStore || (e && e.code === 'ZN_NO_SECURE_STORE')) { c.err(messages.connectNoStore(znCommand('unlock')) + '\n'); return 1; }
+    c.err(messages.connectSaveFailed(scrub(e && e.message, key)) + '\n');
     return 1;
   }
   c.out('Key scope: analyze only. It cannot list or create keys; it can only revoke itself.\n');
@@ -225,7 +217,7 @@ const DASHBOARD = 'https://usezn.com/api-keys';
  * 'failed' (no answer or anything else).
  */
 async function revokeKey(h, key) {
-  const r = await request(h, 'DELETE', REVOKE_PATH, key);
+  const r = await request(h, 'DELETE', REVOKE_PATH, key, true);
   if (r.error) return { state: 'failed', detail: r.error };
   if (r.status === 200) return { state: 'revoked', detail: null };
   if (r.status === 401) return { state: 'rejected', detail: null };
@@ -243,9 +235,9 @@ function revokeLine(res, key) {
   switch (res.state) {
     case 'revoked': return { ok: true, text: 'Revoked key ' + k + ' on usezn.com: it no longer works.\n' };
     case 'rejected': return { ok: false, text: 'usezn.com did not accept key ' + k + ' (already revoked, or not valid), so nothing was revoked from here.' + link + '\n' };
-    case 'unavailable': return { ok: false, text: 'usezn.com could not revoke key ' + k + ' from here (' + res.detail + '); it may still work.' + link + '\n' };
-    case 'maybe': return { ok: false, text: 'usezn.com had an error (' + res.detail + '), so key ' + k + ' may still work.' + link + '\n' };
-    default: return { ok: false, text: 'Could not reach usezn.com (' + scrub(res.detail, key) + '), so key ' + k + ' was not revoked.' + link + '\n' };
+    case 'unavailable': return { ok: false, text: 'usezn.com cannot revoke key ' + k + ' from here, so it may still work.' + link + messages.verboseDetail(res.detail) + '\n' };
+    case 'maybe': return { ok: false, text: messages.revokeNotReached(res.detail, k, DASHBOARD) + '\n' };
+    default: return { ok: false, text: messages.revokeNotReached(scrub(res.detail, key), k, DASHBOARD) + '\n' };
   }
 }
 
@@ -268,10 +260,10 @@ async function disconnect(args, io) {
   let stored = null;
   if (!flags.includes('--no-revoke')) {
     stored = await cloudKey.loadStoredKey(c.deps);
-    if (!stored) {
+    // A keychain that cannot be read must not leave the person stuck: zn's own setting is removed below.
+    if (!stored && marker.store !== 'keychain') {
       // Removing the local copy now would lose the only way to name and revoke this key from here.
-      c.err('Could not read the saved key from ' + STORE_WORDS[marker.store] + ', so nothing was removed or revoked.'
-        + (marker.store === 'vault' ? ' Run `zn unlock` and try again.' : '') + '\n'
+      c.err(messages.DISCONNECT_UNLOCK_FIRST(znCommand('unlock')) + '\n'
         + 'Revoke the key at ' + DASHBOARD + ', or run `zn-gate disconnect --no-revoke` to only remove the local copy.\n');
       return 1;
     }
@@ -285,9 +277,20 @@ async function disconnect(args, io) {
   // The local copy goes first and in every case: a failed or interrupted call must not keep it.
   const del = await cloudKey.deleteKey(c.deps);
   let code = 0;
-  if (!del.removed) {
-    c.err('Could not remove the saved key from ' + STORE_WORDS[del.store] + ': ' + scrub(del.error && del.error.message, stored && stored.key)
-      + (del.store === 'vault' ? '. Run `zn unlock`, then `zn-gate disconnect` again.' : '.') + '\n');
+  let keychainLeft = false;
+  // --revoke was asked for but the key could not be read to revoke it: say so, and exit 1.
+  const unreadable = !stored && marker.store === 'keychain';
+  if (unreadable && flags.includes('--revoke')) {
+    c.err('Could not read the saved key from ' + STORE_WORDS[marker.store] + ', so it was not revoked. Revoke it at ' + DASHBOARD + '.\n');
+    code = 1;
+  }
+  if (!del.removed && del.store === 'keychain') {
+    // The keychain is out of reach (or refused): still forget zn's own setting, say what is left, exit 0.
+    cloudKey.forgetMarker();
+    keychainLeft = true;
+    c.out(messages.disconnectKeychainLeft(scrub(del.error && del.error.message, stored && stored.key) || 'unknown error', DASHBOARD, revoke || (unreadable && code === 1)) + '\n');
+  } else if (!del.removed) {
+    c.err(messages.disconnectVaultNotRemoved(scrub(del.error && del.error.message, stored && stored.key), znCommand('unlock'), znCommand('disconnect')) + '\n');
     code = 1;
   } else {
     c.out('Removed the saved key from ' + STORE_WORDS[del.store] + '. The cloud check is off; zn-gate runs only on your computer.\n');
@@ -297,7 +300,7 @@ async function disconnect(args, io) {
     const line = revokeLine(await revokeKey(c.https, stored.key), stored.key);
     (line.ok ? c.out : c.err)(line.text);
     if (!line.ok) code = 1;
-  } else if (del.removed) {
+  } else if (del.removed && !keychainLeft && !(unreadable && code === 1)) {
     c.out('The key itself still works until you revoke it. Revoke it at ' + DASHBOARD
       + (stored ? ' (it is listed as ' + shown(stored.key) + ').' : '.') + '\n');
   }
