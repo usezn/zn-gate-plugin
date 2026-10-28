@@ -1,0 +1,168 @@
+zn-gate: disclosure for the npm dual-use content policy
+
+Package:   zn-gate
+Source:    https://github.com/usezn/zn
+Security:  https://github.com/usezn/zn/blob/main/SECURITY.md
+
+This package is a defensive security tool. Some of what it does can look like
+malware to an automatic scanner, because protecting a computer from a coding
+agent means touching the same places an attacker would: the configuration of
+other programs, the permissions of files, and the way programs are started.
+This file says what each of those things is for, and when it happens.
+
+1. What zn-gate is
+
+zn-gate is a local security layer for coding agents. It runs on the computer of
+the person who installs it, between the agent and the files, commands and tools
+the agent uses. It blocks the agent from reading files that hold secrets, hides
+secret values in what tools return, checks text for prompt injection, reviews
+MCP servers, and keeps secrets in an encrypted vault on the user's own computer.
+It does not need an account. Its source code is open (MIT license).
+
+2. Changes to the configuration of other programs
+
+zn-gate adds hooks to the configuration of the coding agents it protects:
+Claude Code, Codex CLI, Cursor, OpenCode, Antigravity, the ZCode desktop app
+and, as experimental support, Gemini CLI and GitHub Copilot CLI. A hook is an
+entry that tells the agent to ask zn-gate before it runs a tool, reads a file or
+sends a prompt. For OpenCode the hook is a small JavaScript plugin file that
+zn-gate writes into OpenCode's plugins folder. The hooks start a short launcher
+script that zn-gate keeps in its own folder (by default .zn/hooks in the home
+folder).
+The same setup can also, after asking:
+  - register zn's "secrets" MCP server with an agent (for Claude Code, through
+    the `claude mcp` command);
+  - install, turn on or turn off the zn-gate plugin for Claude Code, through
+    the `claude plugin` commands;
+  - with `zn-gate init --wrap-mcp`, change the MCP server entries in the
+    agents' configuration files (and in Claude Desktop's) so that each server
+    starts through `npx -y zn-gate shield -- <the original command>`. zn-gate
+    then checks what passes between the agent and that server; it starts only
+    the server the person had configured.
+This happens only when the person runs `zn hooks install` or `zn-gate init` in
+their own terminal (`init` asks before each change). Nothing is written when
+the package is installed or imported. zn-gate reads, but never writes, the
+system-wide managed settings of Claude Code, Codex and Cursor, to report
+whether they switch its hooks off; `zn team managed-config` only prints a file
+for an administrator to put in place. `zn-gate uninstall` lists what zn-gate
+added (hooks, wrapped MCP servers, the Claude Code plugin) and removes it after
+asking. The hooks also guard their own files, so that the agent cannot switch
+the protection off by editing them.
+
+When an agent asks zn's secrets MCP server to write a file from a template,
+zn-gate writes the secret values only for secrets the person set up for files,
+and only into a file inside the project that git ignores (or that is outside
+any repository). Overwriting a file, or writing outside the project, needs the
+person's confirmation in a zn window or terminal, not the agent's.
+
+3. Programs that zn-gate starts, and file permissions on Windows
+
+zn-gate starts other programs by a fixed absolute path, or from the absolute
+folders of the PATH, never from the project folder. It starts:
+  - the agents' own command-line tools, for the setup steps in section 2;
+  - npm, to find where zn-gate is installed (`npm prefix -g`) and, when the
+    person accepts that step in `zn-gate init`, to install this same version
+    for the user (`npm install -g zn-gate@<version>`);
+  - git, to learn whether a file is inside a repository and ignored by it
+    (`git rev-parse` and `git check-ignore`, with git's file monitor off);
+  - Node.js, to run the vault as a background process after the person runs
+    `zn unlock` (it stops when its time limit or idle limit passes), and to
+    read the Node.js version in `zn-gate check`;
+  - zn's own hooks, once each with a harmless test event, in `zn-gate check`
+    and when the hooks for Antigravity are installed;
+  - the command the person gives to `zn run`, with the stored secrets that
+    command is allowed to use in its environment, and the MCP server the person
+    configured, under `zn-gate shield`;
+  - on macOS and Linux, the system's own tools: `security` (macOS) or
+    `secret-tool` (Linux) to keep the vault key in the system keychain;
+    `osascript` (macOS), `zenity` or `kdialog` (Linux) to show a confirmation
+    window; `pbpaste` (macOS), `wl-paste`, `xclip` or `xsel` (Linux) to read the
+    clipboard when the person passes --clipboard to store a secret; `open`
+    (macOS) or `xdg-open` (Linux) to open the browser at the sign-in page in
+    `zn-gate connect`; and `ps`, to read the list of running programs (process
+    id, parent and command line) when a command that only a person should run,
+    such as `zn-gate init`, `zn-gate uninstall`, `zn vault purge` or adding a
+    secret, checks whether a coding agent started it. The list is kept in memory
+    only; it is not saved or sent.
+
+On Windows, zn-gate starts the PowerShell that ships with the system, by its
+full path inside the Windows folder, never one found through the PATH or the
+project folder. It runs short inline scripts with -Command or -EncodedCommand,
+for these things only:
+  - to make the vault and zn's hook files readable only by the current user.
+    This uses .NET access-control calls that replace the permission list of
+    those folders and files with a single entry for that user; zn-gate then
+    reads the list back and checks it;
+  - to give the vault's local named pipe the same single-user permission list;
+  - to read, without changing them, the permission lists of a script and of
+    every folder above it before the vault passes a secret to that script, and
+    of the folder that holds zn's hook launcher and the folders above it, so
+    that zn refuses a place that another account can change;
+  - to keep the vault key in the Windows Credential Manager, through a few lines
+    of C# that PowerShell compiles in memory to call the system's own credential
+    functions;
+  - to show a confirmation window;
+  - to open the browser at the sign-in page when the person runs
+    `zn-gate connect`, and to read the clipboard when the person passes
+    --clipboard to store a secret;
+  - to read the list of running programs (name, parent and command line), for
+    the same check as `ps` above. The list is kept in memory only; it is not
+    saved or sent;
+  - to run zn's own hook once when the person runs `zn-gate check`.
+The hooks that zn-gate writes for an agent on Windows also start this
+PowerShell to run zn-gate. Nothing is downloaded for this, no user or group is
+created or changed, and the permission changes apply only to zn-gate's own
+folders, files and named pipe.
+
+4. Deleting the vault
+
+`zn vault purge` deletes the vault on the user's own computer (the encrypted
+secrets, their token maps, the audit log, the backups and the session key) and
+the vault key that zn-gate stored in the system keychain. It lists every file
+it will delete, and the person has to type a confirmation phrase in their own
+terminal. It refuses to run when an AI agent is the one running it (a script
+with no terminal and no agent can pass --yes). It deletes only zn-gate's own
+files and the keychain entry zn-gate created. `zn vault reset` deletes no
+secrets: after the same kind of checks, it moves the old vault into a backup
+folder with the date in its name, so that the next `zn unlock` starts an empty
+vault.
+
+5. No install scripts, no downloaded code, no telemetry by default
+
+The package has no preinstall, install or postinstall script. zn-gate does not
+download or run code from the network itself; everything it runs is in the
+package or is a program already on the computer (section 3). The only downloads
+it starts are steps the person accepts in `zn-gate init`: installing this same
+version of zn-gate with npm, and adding the zn-gate plugin to Claude Code from
+the usezn/zn repository with the `claude plugin` commands. npm and Claude Code
+do those downloads. An MCP server wrapped by `zn-gate init --wrap-mcp` starts
+with `npx -y zn-gate`, so npm fetches zn-gate from the npm registry when it is
+not installed yet. The shield then starts each MCP server with the command the
+person configured; when that command is a package runner such as npx or uvx,
+the runner may fetch the server's code, as it would without zn-gate.
+
+It collects no telemetry unless the person turns it on. Network use is limited
+to features the person chooses:
+  - the optional cloud check of prompts: after `zn-gate connect` it talks only
+    to https://api.usezn.com; with an API key in ZN_API_KEY and ZN_CLOUD=1 it
+    talks to https://api.usezn.com, or to the address the person sets in
+    ZN_API_URL or --url. Secret values are removed from the text before it is
+    sent. `zn-gate connect` itself talks only to https://api.usezn.com;
+  - zn Team, after the person runs `zn team join`: zn-gate talks to
+    https://api.usezn.com, or to the organization's own server given with
+    --api (zn warns first), to fetch the organization's policy and to send the
+    metadata of zn's audit records, never secret values or tool output;
+  - HTTP requests that the secrets MCP server makes for an agent, only to the
+    hosts the person allowed for each secret (`zn secret allow NAME --host`);
+  - off by default, pseudonymous daily counts that `zn-gate stats share on`
+    sends to https://api.usezn.com after printing them.
+Hooks, the vault, the shield and every other command work locally. The vault
+talks to zn-gate's own commands over a local socket in zn's folder (a named
+pipe on Windows) that only the current user can open. The local dashboard
+listens on 127.0.0.1 only.
+
+6. More information
+
+Source code, documentation and issues: https://github.com/usezn/zn
+Security policy and private reporting of vulnerabilities:
+https://github.com/usezn/zn/blob/main/SECURITY.md

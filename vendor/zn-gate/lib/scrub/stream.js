@@ -15,7 +15,8 @@
  * line passes MAX_LINE) only the text before that window is scrubbed and
  * written, and the cut is moved back so it never splits a detected secret.
  * The rest waits for its newline or the end of the stream. WINDOW is at
- * least WINDOW_MIN and grows to the longest exact value the scrubber knows.
+ * least WINDOW_MIN and grows to the longest exact value the scrubber knows
+ * (for the vault's values the daemon reports the longest, and matches them).
  *
  * Fail-closed: if text cannot be scrubbed it is replaced with a notice,
  * never passed through.
@@ -39,13 +40,13 @@ function longestExact(c) {
 }
 
 function windowFor(c) {
-  return Math.min(MAX_LINE / 2, Math.max(WINDOW_MIN, longestExact(c)));
+  return Math.min(MAX_LINE / 2, Math.max(WINDOW_MIN, longestExact(c), (c && c.vaultLongest) || 0));
 }
 
 /* Move a cut back so that it never falls inside a detected secret. */
-function safeCut(text, cut, c) {
+async function safeCut(text, cut, c) {
   let spans;
-  try { spans = engine.scan(text, c); } catch (_) { return 0; }
+  try { spans = await engine.scanAsync(text, c); } catch (_) { return 0; }
   for (let i = spans.length - 1; i >= 0; i--) {
     const s = spans[i];
     if (s.start < cut && s.end > cut) cut = s.start;
@@ -88,7 +89,14 @@ function createStream(opts) {
     const text = pending;
     let cut = text.length - windowFor(c);
     if (cut <= 0) return;
-    cut = safeCut(text, cut, c);
+    cut = await safeCut(text, cut, c);
+    /* Never cut between the two halves of a surrogate pair: each half would
+       be written to stdout as a replacement character. */
+    if (cut > 0 && cut < text.length) {
+      const hi = text.charCodeAt(cut - 1);
+      const lo = text.charCodeAt(cut);
+      if (hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff) cut -= 1;
+    }
     if (cut <= 0) return;
     pending = pending.slice(cut);
     write(await scrub(text.slice(0, cut)));

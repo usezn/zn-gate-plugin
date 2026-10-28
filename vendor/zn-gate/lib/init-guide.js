@@ -35,12 +35,16 @@ function fromTemporaryCopy(dir = __dirname) {
   return /[\\/](?:_npx|dlx(?:-[^\\/]*)?|xfs-[^\\/]*|\.bun[\\/]install[\\/]cache|bunx-[^\\/]*)[\\/]/.test(dir);
 }
 
-/* Absolute path of a program, searched only in absolute PATH entries; null when not found. */
+/* Absolute path of a program, searched only in absolute PATH entries (exe.programEnv, exe.findProgram); null when not
+ * found. On Windows an npm-installed .cmd (npm, claude, zn) comes first, then an .exe. */
 function findProgram(name, env) {
   const exe = require('./exe');
-  const absPath = String((env || process.env).PATH || '').split(path.delimiter).filter((d) => d && path.isAbsolute(d)).join(path.delimiter);
-  const found = exe.whichSync(isWin ? name + '.cmd' : name, absPath) || (isWin ? exe.whichSync(name + '.exe', absPath) : null);
-  return found ? path.resolve(found) : null;
+  const e = env || process.env;
+  if (isWin) {
+    const cmd = exe.whichSync(name + '.cmd', exe.programEnv(e).PATH);
+    if (cmd) return path.resolve(cmd);
+  }
+  return exe.findProgram(name, e);
 }
 
 function samePath(a, b) {
@@ -60,8 +64,9 @@ function cmp(a, b) {
 
 /* Run a program found by findProgram, with fixed arguments. */
 function spawnProgram(file, args, env, extra = {}) {
-  const childEnv = { ...env };
-  if (isWin) childEnv.NoDefaultCurrentDirectoryInExePath = '1';
+  // The program gets only the absolute PATH entries: a .cmd shim (npm, claude on Windows) looks up `node` by name, and
+  // so do the programs it starts; a relative entry would point into the folder zn runs in, often a project.
+  const childEnv = require('./exe').programEnv(env || process.env);
   // A .cmd file (npm, claude, zn on Windows) only starts through cmd.exe; its path is absolute and quoted.
   if (isWin && /\.cmd$/i.test(file)) {
     return spawnSync('"' + file + '"', args, { ...extra, env: childEnv, shell: true, windowsHide: true });
@@ -86,11 +91,12 @@ function globalInstall(env) {
 /* The plan: {items: [{id, name, found, state, problem, steps}], setup: [step]} ; a step is {label, run: [file, args] | null, manual}. */
 async function plan(opts = {}) {
   const { getAdapter } = require('./agents');
-  const { check, _internal: { pluginNodeOk } } = require('./check');
+  const { check, _internal: { pluginNodeStatus, PLUGIN_NODE_MIN } } = require('./check');
   const env = opts.env || process.env;
   const home = opts.home;
   const nodeVersion = opts.nodeVersion || process.versions.node;
-  const res = await check({ home, env, cwd: opts.cwd, nodeVersion });
+  const nodeSt = pluginNodeStatus({ env, nodeVersion: opts.nodeVersion, hookNode: opts.hookNode });
+  const res = await check({ home, env, cwd: opts.cwd, nodeVersion, pluginNode: nodeSt });
   let temporary = opts.temporary !== undefined ? opts.temporary : fromTemporaryCopy();
   const glob = opts.global || globalInstall(env);
   if (opts.temporary === undefined && !temporary && glob.pkgDir && !samePath(PKG_ROOT, glob.pkgDir)) temporary = true;
@@ -107,15 +113,17 @@ async function plan(opts = {}) {
       // A broken plugin next to zn's own hooks that do not work either: the hooks are repaired first (below).
       let hooksVerb = r.id !== 'claude-code' ? 'install' : r.via === 'hooks' ? 'install'
         : r.via === 'both' && r.duplicate ? 'uninstall' : r.via === 'both' && r.pluginBroken && r.hooksBroken ? 'install' : null;
-      // The plugin needs Node.js 20.12 or later: with an older one it is not installed, and zn's own hooks are set up instead.
+      // The plugin needs Node.js 20.19 or later: with an older one it is not installed, and zn's own hooks are set up instead.
       // A plugin that is already installed does not work there either: once the hooks are seen to work, it is turned off.
       let dropPlugin = false;
-      if (r.id === 'claude-code' && !pluginNodeOk(nodeVersion) && !hooksVerb && !r.rulesFault && (r.via === 'plugin' || r.state === 'not-set-up')) {
+      if (r.id === 'claude-code' && !nodeSt.ok && !hooksVerb && !r.rulesFault && (r.via === 'plugin' || r.state === 'not-set-up')) {
         hooksVerb = 'install';
         dropPlugin = r.via === 'plugin' && !r.pluginOff;
+        const need = nodeSt.unknown ? 'zn-gate could not find or run the `node` that the hooks of the plugin start with (the first one on your PATH), and the plugin needs Node.js ' + PLUGIN_NODE_MIN + ' or later'
+          : 'it needs Node.js ' + PLUGIN_NODE_MIN + ' or later (' + nodeSt.why + ')';
         item.note = dropPlugin
-          ? 'Claude Code plugin will be turned off: it needs Node.js 20.12 or later (you have ' + nodeVersion + '); zn\'s hooks will be used instead. Update Node.js to use the plugin.'
-          : 'Claude Code plugin skipped: it needs Node.js 20.12 or later (you have ' + nodeVersion + '). zn\'s hooks are set up instead; update Node.js to use the plugin.';
+          ? 'Claude Code plugin will be turned off: ' + need + '; zn\'s hooks will be used instead. Update Node.js to use the plugin.'
+          : 'Claude Code plugin skipped: ' + need + '. zn\'s hooks are set up instead; update Node.js to use the plugin.';
       }
       const disablePlugin = () => {
         const claude = opts.claude !== undefined ? opts.claude : findProgram('claude', env);
@@ -154,7 +162,7 @@ async function plan(opts = {}) {
         // Only after the hooks are repaired and seen to work: the steps stop at the first one that is skipped or fails,
         // so the plugin is never turned off while the hooks still do not work.
         if (r.pluginBroken || dropPlugin) {
-          item.steps.push({ label: 'check that zn\'s hooks for ' + r.name + ' work now', manual: 'zn-gate check (go on only if it says the hooks work)', verify: () => hooksWorkNextToPlugin({ ...opts, nodeVersion }, r.id) });
+          item.steps.push({ label: 'check that zn\'s hooks for ' + r.name + ' work now', manual: 'zn-gate check (go on only if it says the hooks work)', verify: () => hooksWorkNextToPlugin({ ...opts, nodeVersion, pluginNode: nodeSt }, r.id) });
           const off = disablePlugin();
           if (dropPlugin) off.done = 'Claude Code plugin turned off; zn\'s hooks protect Claude Code. Update Node.js to use the plugin.';
           item.steps.push(off);
@@ -179,7 +187,7 @@ async function plan(opts = {}) {
 /* After the hooks are repaired next to a broken plugin: '' when check now finds those hooks working, else why not. */
 async function hooksWorkNextToPlugin(opts, id) {
   const { check } = require('./check');
-  const r = (await check({ home: opts.home, env: opts.env || process.env, cwd: opts.cwd, nodeVersion: opts.nodeVersion })).results.find((x) => x.id === id);
+  const r = (await check({ home: opts.home, env: opts.env || process.env, cwd: opts.cwd, nodeVersion: opts.nodeVersion, hookNode: opts.hookNode, pluginNode: opts.pluginNode })).results.find((x) => x.id === id);
   if (!r) return 'zn-gate check did not report it';
   if (r.state === 'protected' || (r.pluginBroken && !r.hooksBroken)) return '';
   return r.problem || 'zn-gate check did not find them working';
@@ -188,8 +196,48 @@ async function hooksWorkNextToPlugin(opts, id) {
 /* Run one step in the user's terminal (inherits stdio). Absolute program path and fixed arguments only. */
 function runStep(step, env) {
   const [file, args] = step.run;
-  const r = spawnProgram(file, args, env, { stdio: 'inherit' });
-  return !r.error && r.status === 0;
+  // stderr is copied to the terminal as it is, and kept to tell a permission failure from any other.
+  const r = spawnProgram(file, args, env, { stdio: ['inherit', 'inherit', 'pipe'], encoding: 'utf8' });
+  if (r.stderr) process.stderr.write(r.stderr);
+  return { ok: !r.error && r.status === 0, stderr: String(r.stderr || '') };
+}
+
+const isPosix = process.platform !== 'win32';
+
+/* The folder `npm install -g` writes to, when known. */
+function globalPrefix(opts, step) {
+  if (opts.prefix) return opts.prefix;
+  if (opts.global && opts.global.prefix) return opts.global.prefix;
+  try { return globalInstall(opts.env || process.env).prefix || ''; } catch { return ''; }
+}
+
+/* True when npm could not write its global folder: EACCES/EPERM in its output, or that folder is not writable. POSIX only. */
+function permissionFailure(stderr, prefix) {
+  if (!isPosix) return false;
+  if (/\b(EACCES|EPERM)\b|permission denied/i.test(String(stderr || ''))) return true;
+  if (!prefix) return false;
+  try { fs.accessSync(prefix, fs.constants.W_OK); return false; } catch (e) { return e.code === 'EACCES' || e.code === 'EPERM'; }
+}
+
+/* The next step after a permission failure: never sudo; same commands as https://usezn.com/docs/install. */
+function permissionAdvice({ prefix, env, todo, shell }) {
+  const sh = shell || String((env && env.SHELL) || '');
+  const profile = /zsh/.test(sh) || process.platform === 'darwin' ? '~/.zshrc' : '~/.bashrc';
+  const left = (todo || []).filter((i) => i.steps.some((x) => x.needsGlobal)).map((i) => i.name);
+  const lines = [
+    '  that did not finish: npm is not allowed to write to its global folder' + (prefix ? ' (' + prefix + ')' : '') + '.',
+    left.length
+      ? '  Until zn-gate is installed for your user, ' + left.join(', ') + ' stay' + (left.length === 1 ? 's' : '') + ' unprotected.'
+      : '  Until zn-gate is installed for your user, the agents above that need it stay unprotected.',
+    '  Fix it without administrator rights, in your own terminal:',
+    '    mkdir -p ~/.npm-global && npm config set prefix ~/.npm-global',
+    '    echo \'export PATH="$HOME/.npm-global/bin:$PATH"\' >> ' + profile,
+    '  Then open a new terminal and run: npx -y zn-gate init',
+    '  Or install Node.js with a version manager such as nvm (https://github.com/nvm-sh/nvm), which needs no special permissions.',
+    '  More: https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally',
+    ''
+  ];
+  return lines.join(String.fromCharCode(10)) + String.fromCharCode(10);
 }
 
 /**
@@ -216,7 +264,7 @@ async function guide(opts = {}) {
   w('\n');
   const tail = () => w('(To wrap the MCP servers in your agent configs, which `zn-gate init` used to do: `zn-gate init --wrap-mcp`.)\n');
   if (!items.some((i) => i.found)) {
-    w('No supported coding agent was found (Claude Code, Codex CLI, Cursor, OpenCode). Nothing was changed.\n');
+    w('No supported coding agent was found (Claude Code, Codex CLI, Cursor, OpenCode, Antigravity, ZCode desktop app). Nothing was changed.\n');
     w('Install one, then run `npx -y zn-gate init` again. Other editors: https://usezn.com/docs/install\n');
     tail();
     return 1;
@@ -243,7 +291,12 @@ async function guide(opts = {}) {
   for (const s of setup) {
     if (!s.run) { w(`First, ${s.label}: ${s.manual}\n`); skipped++; break; }
     if (!(await ask(`${s.label}: run \`${s.manual}\`?`))) { w(`  skipped. You can run it later: ${s.manual}\n`); skipped++; break; }
-    if (!run(s, env)) { w(`  that did not finish. Run it yourself: ${s.manual}\n`); skipped++; break; }
+    const res = run(s, env);
+    if (!(res === true || (res && res.ok))) {
+      if (s.run && permissionFailure(res && res.stderr, globalPrefix(opts, s))) w(permissionAdvice({ prefix: globalPrefix(opts, s), env, todo, shell: opts.shell }));
+      else w(`  that did not finish. Run it yourself: ${s.manual}\n`);
+      skipped++; break;
+    }
     globalReady = true;
   }
   let glob = null;
@@ -272,8 +325,8 @@ async function guide(opts = {}) {
   }
   w('\n');
   const { check, report } = require('./check');
-  const code = report(await check({ home: opts.home, env, cwd: opts.cwd, nodeVersion: opts.nodeVersion }), w);
+  const code = report(await check({ home: opts.home, env, cwd: opts.cwd, nodeVersion: opts.nodeVersion, hookNode: opts.hookNode }), w);
   return skipped ? 1 : code;
 }
 
-module.exports = { guide, plan, fromTemporaryCopy, _internal: { findProgram, globalInstall, cmp, runStep, spawnProgram } };
+module.exports = { guide, plan, fromTemporaryCopy, _internal: { permissionFailure, permissionAdvice, findProgram, globalInstall, cmp, runStep, spawnProgram } };

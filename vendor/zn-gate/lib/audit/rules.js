@@ -7,7 +7,7 @@
 
 // Version of the rule catalogue and of the command patterns in audit/patterns.js.
 // Bump it when a rule, a pattern or a rule id changes; see CONTRIBUTING.md.
-const AUDIT_RULES_VERSION = '2026-10-17.1';
+const AUDIT_RULES_VERSION = '2026-10-23.8';
 
 const SEVERITIES = ['low', 'medium', 'high', 'critical'];
 const RANK = { none: 99, low: 1, medium: 2, high: 3, critical: 4 };
@@ -95,7 +95,7 @@ const RULES = [
   {
     id: 'ZNA011', severity: 'high', name: 'secret-in-config',
     title: 'Secret value in an agent file',
-    help: 'Credentials committed with agent configs leak with the repository. The value is never printed in the report.',
+    help: 'Credentials committed with agent configs leak with the repository. This covers known key formats anywhere in the file and, in MCP server configs, a value written in plain text under a name such as an API key, token, password or Authorization header, in a credential argument or in a URL key. The value is never printed in the report.',
     fix: 'Revoke the secret, remove it from the file and its history, and reference it from the environment or a secret store.',
     references: [],
   },
@@ -160,6 +160,13 @@ const RULES = [
     title: 'Agent file could not be checked',
     help: 'zn audit could not review this file or directory: a syntax error, a size over the limit, a symbolic link leaving the repository, or a scan that stopped early. Agents may still read and act on it. High when the file can run commands or redirect the agent, or when the scan did not finish.',
     fix: 'Fix the syntax error, move the content into the repository, or review the file by hand.',
+    references: [],
+  },
+  {
+    id: 'ZNA021', severity: 'medium', name: 'blank-line-padding',
+    title: 'Instruction file hides text behind a long run of blank lines',
+    help: 'A run of 40 or more empty or whitespace-only lines, followed by more text, pushes that text out of view for a person who opens the file and past the part of it a classifier reads. The report gives the line where the hidden text starts and the length of the run; the text is never printed.',
+    fix: 'Open the file at the reported line and read what follows. Remove the blank lines, and the text too unless you wrote it.',
     references: [],
   },
 ];

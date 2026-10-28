@@ -51,7 +51,7 @@
  * It reduces what a prompt-injected agent can do through its own tools; it
  * is not a sandbox.
  *
- * No dependencies; Node.js 20.12 or later.
+ * No dependencies; Node.js 20.19 or later.
  */
 
 const crypto = require('crypto');
@@ -66,10 +66,17 @@ const LOCK_FILE = path.join(__dirname, 'zn-gate.lock.json');
 // vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER: Node.js 20.12 / 21.7 and later,
 // marked experimental in Node's documentation. Without it the launcher
 // refuses to run (hooks exit 2, the MCP server does not start) rather than
-// load zn-gate another way. CI tests the versions in .github/workflows/plugins.yml.
-const NODE_OK = !!(vm.constants && vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER);
-const NODE_HINT = 'the zn-gate plugin needs Node.js 20.12 or later with vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER (this is ' + process.version + ').';
-const SUPPORTED_AGENTS = new Set(['claude-code', 'codex', 'cursor']);
+// load zn-gate another way. The locked dependencies (@noble/*) declare Node.js
+// 20.19 or later, so that is the floor on the 20 line, and it is tested with
+// that exact version in .github/workflows/plugins.yml.
+const [NODE_MAJOR, NODE_MINOR] = process.versions.node.split('.').map((x) => parseInt(x, 10) || 0);
+const NODE_VERSION_OK = NODE_MAJOR > 21 || (NODE_MAJOR === 21 && NODE_MINOR >= 7) || (NODE_MAJOR === 20 && NODE_MINOR >= 19);
+const NODE_OK = NODE_VERSION_OK && !!(vm.constants && vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER);
+const NODE_HINT = 'the zn-gate plugin needs Node.js 20.19 or later with vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER (this is ' + process.version + ').';
+// Not derived from the package's adapter list on purpose: this launcher runs the pinned, verified zn-gate
+// build, which can be older than the adapters in the repo, and the plugin ships hook files only for these
+// agents. plugins/tools/test-launch.js fails when an id here is not an adapter of the package.
+const SUPPORTED_AGENTS = new Set(['claude-code', 'codex', 'cursor', 'zcode']);
 
 // zn-gate starts child processes with this process's environment; a preload
 // set through NODE_OPTIONS or a module path in NODE_PATH must not reach them.
@@ -144,7 +151,9 @@ function candidates(lock) {
   const cfg = znConfig();
   if (cfg.plugin && typeof cfg.plugin.packageDir === 'string') return [path.resolve(cfg.plugin.packageDir)];
   const out = [path.resolve(__dirname, '..', 'node_modules', 'zn-gate')];
-  const dirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  // Absolute PATH entries only: a relative one points into the folder the agent runs in (every candidate is still
+  // checked against the lock file, so this only keeps the search out of the project).
+  const dirs = String(process.env.PATH || '').split(path.delimiter).filter((d) => d && path.isAbsolute(d));
   for (const dir of dirs) {
     const bin = path.join(dir, 'zn-gate');
     try {
@@ -487,6 +496,72 @@ function withhold(v) {
       : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, withhold(x)])) : v;
 }
 
+// BEGIN top-level scan (the same text is in plugins/zn-gate/scripts/zn-launch.js and in packages/zn-gate/lib/hooks/runner.js; a test keeps the two equal)
+// The metadata of an event too large to parse: the keys of the TOP-LEVEL object that decide what the event is,
+// whatever their order and wherever they are in the text that was read (the first occurrence of each, with its
+// value when that is a short string, otherwise true). One pass, linear in the text, memory bounded by the
+// longest key or value kept (256 characters): strings are skipped as they are met and JSON depth is tracked, so a
+// key inside the tool arguments or the tool output, or text in a string that looks like a key, is never taken.
+// Returns null when the text is not the start of a JSON object.
+const TOP_KEYS = new Set(['hook_event_name', 'hookEventName', 'hook', 'tool_name', 'toolName', 'tool_response', 'toolResult', 'tool_result', 'tool_output']);
+
+function unescapeShort(s) {
+  if (s.indexOf('\\') < 0) return s;
+  try { return JSON.parse('"' + s + '"'); } catch (_) { return s; }
+}
+
+function readShortString(text, k) {
+  if (text.charCodeAt(k) !== 34) return true;
+  const end = Math.min(text.length, k + 257);
+  for (let j = k + 1; j < end; j++) {
+    const d = text.charCodeAt(j);
+    if (d === 92) j++;
+    else if (d === 34) return unescapeShort(text.slice(k + 1, j));
+  }
+  return true;
+}
+
+function topLevelKeys(text) {
+  const keys = Object.create(null);
+  const n = text.length;
+  let i = 0;
+  while (i < n && text.charCodeAt(i) <= 32) i++;
+  if (text.charCodeAt(i) !== 123) return null;
+  let depth = 0;
+  for (; i < n; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 34) {
+      let j = i + 1;
+      for (; j < n; j++) {
+        const d = text.charCodeAt(j);
+        if (d === 92) j++;
+        else if (d === 34) break;
+      }
+      if (j >= n) break; // the text ends inside this string
+      if (depth === 1 && j - i <= 65) {
+        const key = unescapeShort(text.slice(i + 1, j));
+        if (TOP_KEYS.has(key) && !(key in keys)) {
+          let k = j + 1;
+          while (k < n && text.charCodeAt(k) <= 32) k++;
+          if (text.charCodeAt(k) === 58) {
+            k++;
+            while (k < n && text.charCodeAt(k) <= 32) k++;
+            keys[key] = readShortString(text, k);
+          }
+        }
+      }
+      i = j;
+    } else if (c === 123 || c === 91) {
+      depth++;
+    } else if (c === 125 || c === 93) {
+      depth--;
+      if (depth <= 0) break;
+    }
+  }
+  return keys;
+}
+// END top-level scan
+
 function eventName() {
   return hook.event && typeof hook.event === 'object' ? String(hook.event.hook_event_name || '') : '';
 }
@@ -522,7 +597,7 @@ function refusalFor(msg) {
     if (!builtin) {
       let out = ev.tool_output;
       if (typeof out === 'string') { try { out = JSON.parse(out); } catch (_) { /* plain text */ } }
-      const replaced = withhold(out);
+      const replaced = out === undefined ? WITHHELD : withhold(out);
       return {
         code: 0,
         stdout: JSON.stringify({ updated_mcp_tool_output: typeof replaced === 'string' ? { text: replaced } : replaced, additional_context: msg }),
@@ -592,6 +667,69 @@ function captureStdio(raw) {
   Object.defineProperty(process, 'stdout', { configurable: true, enumerable: true, get: () => output });
 }
 
+// The same limit as the runner (POST_STDIN_CAP of lib/hooks/runner.js): characters of the event that are read.
+const STDIN_CAP = 32 * 1024 * 1024;
+
+/*
+ * Reads the event from stdin, in blocks, and stops as soon as it is over STDIN_CAP characters: an event that
+ * large is not read to the end, not parsed and not held in memory. An unreadable stdin is an empty one.
+ */
+function readEvent() {
+  const { StringDecoder } = require('string_decoder');
+  const decoder = new StringDecoder('utf8');
+  const block = Buffer.allocUnsafe(256 * 1024);
+  const parts = [];
+  let length = 0;
+  try {
+    for (;;) {
+      let n;
+      try {
+        n = fs.readSync(0, block, 0, block.length, null);
+      } catch (err) {
+        if (err && err.code === 'EOF') break; // Windows: the writer closed the pipe
+        throw err;
+      }
+      if (n === 0) break;
+      const text = decoder.write(block.subarray(0, n));
+      parts.push(text);
+      length += text.length;
+      if (length > STDIN_CAP) return { text: parts.join(''), tooLarge: true };
+    }
+    parts.push(decoder.end());
+  } catch (_) {
+    return { text: '', tooLarge: false };
+  }
+  return { text: parts.join(''), tooLarge: false };
+}
+
+/*
+ * An event over STDIN_CAP characters is answered here, as the runner answers it, without loading zn-gate: the
+ * installed runner may be an older one. What it is comes from its top-level keys, wherever they are in the text
+ * that was read. A post-tool event (or a nameless one that has its output key) has its output withheld, which
+ * hooks.whenUnavailable does not change; a Stop event passes with a warning (exit 2 would make the agent go on
+ * with its answer); anything else is refused like an event zn cannot read.
+ */
+function refuseOversize(text) {
+  const keys = topLevelKeys(text);
+  const name = keys ? keys.hook_event_name : undefined;
+  const post = hook.agent === 'cursor' ? 'postToolUse' : 'PostToolUse';
+  hook.raw = '';
+  hook.event = { hook_event_name: name, tool_name: keys && typeof keys.tool_name === 'string' ? keys.tool_name : '' };
+  if (name === 'Stop') {
+    hook.refusal = { pass: true, msg: 'zn plugin: could not check this Stop event (it is too large), so the last answer was not checked.' };
+    return;
+  }
+  // With no name among the characters read, the output key (before its big value) tells a post-tool event.
+  const outputKey = hook.agent === 'cursor' ? 'tool_output' : 'tool_response';
+  if (keys && (name === post || (name === undefined && keys[outputKey] !== undefined))) {
+    hook.event.hook_event_name = post;
+    const msg = 'zn plugin: the output of this tool call is too large to check for secrets, so it was withheld.';
+    hook.refusal = { msg, ...refusalFor(msg) };
+    return;
+  }
+  refuseHook('The event on stdin is too large to check.');
+}
+
 function runHook(agent) {
   if (!SUPPORTED_AGENTS.has(agent)) {
     process.stderr.write('zn plugin: unknown agent "' + agent + '"\n');
@@ -608,7 +746,9 @@ function runHook(agent) {
   process.on('uncaughtException', onError);
   process.on('unhandledRejection', onError);
   try {
-    try { hook.raw = fs.readFileSync(0, 'utf8'); } catch (_) { hook.raw = ''; }
+    const input = readEvent();
+    if (input.tooLarge) return refuseOversize(input.text.replace(/^﻿/, ''));
+    hook.raw = input.text;
     try { hook.event = JSON.parse(hook.raw.replace(/^﻿/, '')); } catch (_) { hook.event = null; }
     captureStdio(hook.raw);
     const lock = loadLock();
@@ -726,7 +866,7 @@ function main(argv) {
   if (mode === 'secrets-mcp') return runMcp();
   if (mode === 'zn-gate-mcp') return runZnGateMcp(agent);
   if (mode === 'check') return runCheck(agent || '');
-  process.stderr.write('usage: zn-launch.js hook <claude-code|codex|cursor> | secrets-mcp | zn-gate-mcp | check [agent]\n');
+  process.stderr.write('usage: zn-launch.js hook <' + [...SUPPORTED_AGENTS].join('|') + '> | secrets-mcp | zn-gate-mcp | check [agent]\n');
   process.exitCode = 1;
 }
 

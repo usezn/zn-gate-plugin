@@ -476,8 +476,17 @@ class AhoCorasick {
  */
 function buildMatcher(entries) {
   const needles = [];
+  // Values stored by older versions that are shorter than MIN_LENGTH (new ones
+  // are refused). They are compared exactly: only a string that is the value
+  // itself (ignoring surrounding whitespace) matches, never a part of a word.
+  const shorts = new Map();
   for (const e of entries || []) {
     if (!e) continue;
+    if (e.exactShort === true && Array.isArray(e.values) && typeof e.values[0] === 'string'
+      && e.values[0].length > 0 && e.values[0].length < MIN_LENGTH) {
+      if (!shorts.has(e.values[0])) shorts.set(e.values[0], { type: e.type || 'SECRET', name: e.name, vault: !!e.vault });
+      continue;
+    }
     // The 8-character minimum applies to the value itself, not to its
     // (longer) encodings. values[0] is the raw value by contract.
     const raw = typeof e.value === 'string' ? e.value : (Array.isArray(e.values) ? e.values[0] : null);
@@ -494,18 +503,42 @@ function buildMatcher(entries) {
   const ac = new AhoCorasick(needles);
   return {
     size: needles.length,
+    shortSize: shorts.size,
     find(text) {
-      return ac.find(text).map((h) => {
+      const found = ac.find(text).map((h) => {
         const span = { start: h.start, end: h.end, type: h.payload.type, source: 'exact', name: h.payload.name, variant: h.payload.variant };
         if (h.payload.vault) span.vault = true;
         return span;
       });
+      if (shorts.size > 0 && text.length < 256) {
+        const t = text.trim();
+        const hit = shorts.get(t);
+        if (hit) {
+          const start = text.length - text.trimStart().length;
+          const span = { start, end: start + t.length, type: hit.type, source: 'exact', name: hit.name, variant: 'raw' };
+          if (hit.vault) span.vault = true;
+          found.push(span);
+        }
+      }
+      return found;
     },
   };
 }
 
+/**
+ * validateSecretValue(value) -> error message or null. The vault refuses a new
+ * value under MIN_LENGTH characters: it cannot be told apart from ordinary text.
+ */
+function validateSecretValue(value) {
+  const n = typeof value === 'string' ? Array.from(value).length : 0;
+  if (n >= MIN_LENGTH) return null;
+  return 'the value is only ' + n + ' character(s); the vault stores values of at least ' + MIN_LENGTH
+    + ' characters, because a shorter one cannot be told apart from ordinary text. Use a longer value.';
+}
+
 module.exports = {
   MIN_LENGTH,
+  validateSecretValue,
   AC_PREFIX,
   collectSources,
   variants,

@@ -30,26 +30,30 @@ const VAULT_SECRET = 'ZN_CLOUD_API_KEY';
 // The vault resolves the cloud key only for a request that says this: the hooks and the secrets broker never do.
 const RESOLVE_PURPOSE = 'zn-cloud-key';
 const STORES = ['keychain', 'vault'];
-const TLS_REFUSAL = 'NODE_TLS_REJECT_UNAUTHORIZED=0 is set, so zn-gate will not send the saved key over a connection whose certificate is not checked';
 
 /**
  * Why a saved key must not be sent now, or null. The key goes only over a connection checked against the
  * system's certificate authorities: not while the environment turns checking off or adds authorities or code
  * (NODE_TLS_REJECT_UNAUTHORIZED=0, NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, NODE_DEBUG, or NODE_OPTIONS with --require, --import,
  * -r, --use-openssl-ca, --tls-keylog or --inspect*). A key given with --key or ZN_API_KEY is the person's own choice and is not held back.
+ *
+ * The answer is one plain sentence that names the variable and the way to remove it. opts.saved is false
+ * while the key is being connected (nothing is saved yet), so the sentence says "the key", not "the saved key".
  */
-function tlsRefusal(env = process.env) {
-  if (env.NODE_TLS_REJECT_UNAUTHORIZED === '0') return TLS_REFUSAL;
+function tlsRefusal(env = process.env, opts = {}) {
+  const saved = opts.saved !== false;
+  const refuse = (name, why) => require('./messages').environmentRefusal(name, why, saved);
+  if (env.NODE_TLS_REJECT_UNAUTHORIZED === '0') return refuse('NODE_TLS_REJECT_UNAUTHORIZED', 'it switches off the check that the connection really goes to usezn.com');
   for (const name of ['NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE']) {
-    if (env[name]) return name + ' is set, so zn-gate will not send the saved key: the connection could trust other certificate authorities';
+    if (env[name]) return refuse(name, 'it could make the connection trust other certificate authorities');
   }
-  if (env.OPENSSL_CONF) return 'OPENSSL_CONF is set, so zn-gate will not send the saved key: the TLS settings could be changed';
+  if (env.OPENSSL_CONF) return refuse('OPENSSL_CONF', 'it could change the security settings of the connection');
   // Node prints the request headers, Authorization included, when NODE_DEBUG names http, https, tls or net: any value is refused.
   if (typeof env.NODE_DEBUG === 'string' && env.NODE_DEBUG.trim()) {
-    return 'NODE_DEBUG is set, so zn-gate will not use the saved key: Node could print it';
+    return refuse('NODE_DEBUG', 'Node could print the key on the screen');
   }
   if (nodeOptionsList(env.NODE_OPTIONS).some((t) => RISKY_NODE_OPTION.test(optionName(t)))) {
-    return 'NODE_OPTIONS loads code, changes the TLS settings or opens a debugger, so zn-gate will not send the saved key';
+    return refuse('NODE_OPTIONS', 'it can load other code, change the security settings of the connection or open a debugger');
   }
   return null;
 }
@@ -155,6 +159,9 @@ function clearMarker() {
   delete cfg.cloud;
   writeConfig(cfg);
 }
+
+/** Remove only zn's own setting, whatever state the keychain or vault is in. */
+function forgetMarker() { clearMarker(); }
 
 /** True when `zn-gate connect` has stored a key (a cheap file read; no keychain access). */
 function isConnected() {
@@ -296,6 +303,7 @@ module.exports = {
   looksLikeZnKey,
   last4,
   readMarker,
+  forgetMarker,
   isConnected,
   availableStore,
   saveKey,
@@ -303,7 +311,6 @@ module.exports = {
   deleteKey,
   resolveApiKey,
   NoSecureStore,
-  TLS_REFUSAL,
   tlsRefusal,
   VAULT_SECRET,
   RESOLVE_PURPOSE,

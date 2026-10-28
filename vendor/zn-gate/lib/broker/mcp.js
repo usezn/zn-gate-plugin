@@ -7,7 +7,8 @@
  * Tools:
  *   secrets_list           names and policy of the stored secrets, never values
  *   secrets_http_request   zn makes the HTTP request with __ZN_<NAME>__ markers
- *                          replaced, only if the host is in each secret's
+ *                          replaced, only for secrets in mode "proxy", only if
+ *                          the host is in each secret's
  *                          allowHosts, and only in request headers unless the
  *                          secret also allows the URL ("query") or the body
  *                          (allowIn); the response is scrubbed before it returns
@@ -40,7 +41,9 @@ const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 const SERVER_NAME = 'zn-secrets';
 let SERVER_VERSION = '0.0.0';
 try { SERVER_VERSION = require('../../package.json').version; } catch (_) { /* keep default */ }
-const PROTOCOL_VERSION = '2024-11-05';
+const proto = require('../mcp-protocol');
+
+const PROTOCOL_VERSION = proto.LATEST_PROTOCOL_VERSION;
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30000;
@@ -202,7 +205,7 @@ function createSecretsServer(opts = {}) {
     let asked = false;
     for (const m of named) {
       const s = meta.get(m.name);
-      if (!s || s.deny || markers.hostAllowed(s.allowHosts, host)) continue;
+      if (!s || s.deny || (s.mode || 'proxy') !== 'proxy' || markers.hostAllowed(s.allowHosts, host)) continue;
       const open = pickOpening(s.orgPending, 'host', (v) => markers.hostAllowed([v], host));
       const v = await getVault();
       if (open && typeof v.confirmOrgOpening === 'function') {
@@ -228,6 +231,13 @@ function createSecretsServer(opts = {}) {
         await audit({ secret: m.name, mode: s.mode, tool: 'mcp:secrets_http_request', argv0: null, host, decision: 'deny', reason: 'zn cloud key' });
         return denied(m.marker + ' is the key of `zn-gate connect`. Only zn-gate uses it, and revoking it is done in your own terminal (zn-gate disconnect). No request was made.');
       }
+      // Only secrets the user made available to HTTP requests (mode proxy) leave through this tool, whatever their allowHosts say:
+      // an env or file secret is meant for a local program, not for the network.
+      if ((s.mode || 'proxy') !== 'proxy') {
+        await audit({ secret: m.name, mode: s.mode, tool: 'mcp:secrets_http_request', argv0: null, host, decision: 'deny', reason: 'mode_not_proxy:' + s.mode });
+        return denied(m.marker + ' is in ' + s.mode + ' mode, and secrets_http_request only sends secrets in proxy mode. No request was made. ' +
+          'If the API really needs it, the user can change it in their own terminal: zn secret allow ' + m.name + ' --mode proxy');
+      }
       if (!markers.hostAllowed(s.allowHosts, host)) {
         await audit({ secret: m.name, mode: s.mode, tool: 'mcp:secrets_http_request', argv0: null, host, decision: 'deny', reason: 'host not in allowHosts' });
         return denied(m.marker + ' may not be sent to ' + host + ' (allowed: ' + ((s.allowHosts || []).join(', ') || 'none') + '). No request was made.');
@@ -250,7 +260,14 @@ function createSecretsServer(opts = {}) {
     const notice = notices.length ? notices.join(' ') : undefined;
     const used = (m, why) => (warned(m) ? { decision: 'warn', reason: WARN_REASON } : { decision: 'allow', reason: why });
     for (const m of named) {
-      const v = await (await getVault()).resolve(project, m.marker);
+      // The vault checks the mode, the host and the placements again when it hands the value over (purpose http).
+      let v;
+      try {
+        v = await (await getVault()).resolve(project, m.marker, { purpose: 'http', agent, agentTrusted, tool: 'mcp:secrets_http_request', host, placements: placements(m.name) });
+      } catch (err) {
+        if (err && err.code === 'ZN_POLICY_DENIED') return denied(m.marker + ' was refused by the vault: ' + (err.message || 'not allowed here') + ' No request was made.');
+        throw err;
+      }
       if (v == null) return textResult({ error: 'ZN_NOT_FOUND', message: 'secret ' + m.name + ' has no value' }, true);
       values.set(m.name, String(v));
     }
@@ -281,10 +298,10 @@ function createSecretsServer(opts = {}) {
     const truncated = buf.length > MAX_RESPONSE_BYTES;
     const text = buf.subarray(0, MAX_RESPONSE_BYTES).toString('utf8');
     const outHeaders = {};
-    for (const [k, v] of res.headers.entries()) outHeaders[k] = await scrub(v, masker);
+    for (const [k, v] of res.headers.entries()) outHeaders[await scrub(k, masker)] = await scrub(v, masker);
     return textResult({
       status: res.status,
-      statusText: res.statusText,
+      statusText: await scrub(String(res.statusText || ''), masker),
       redirected_to: res.status >= 300 && res.status < 400 ? (outHeaders.location || null) : undefined,
       headers: outHeaders,
       body: await scrub(text, masker),
@@ -438,7 +455,7 @@ function createSecretsServer(opts = {}) {
       }
     }
     for (const m of named) {
-      const v = await (await getVault()).resolve(project, m.marker);
+      const v = await (await getVault()).resolve(project, m.marker, { purpose: 'render', agent, agentTrusted, tool: 'mcp:secrets_render_file' });
       if (v == null) return textResult({ error: 'ZN_NOT_FOUND', message: 'secret ' + m.name + ' has no value' }, true);
       values.set(m.name, String(v));
     }
@@ -520,6 +537,22 @@ function createSecretsServer(opts = {}) {
     }
   }
 
+  // Version agreed in initialize (one client per stdio process); until then the latest.
+  let negotiated = null;
+
+  /** Handles a JSON-RPC batch: an array of replies, or one error when batches are not allowed (only 2025-03-26 has them). */
+  async function handleBatch(messages) {
+    if (!proto.allowsBatching(negotiated) || messages.length === 0) {
+      return { jsonrpc: '2.0', id: null, error: { ...proto.BATCH_REJECTED } };
+    }
+    const replies = [];
+    for (const m of messages) {
+      const r = await handleMessage(m);
+      if (r) replies.push(r);
+    }
+    return replies.length ? replies : null;
+  }
+
   /** Returns the JSON-RPC response object, or null for notifications. */
   async function handleMessage(msg) {
     const { id, method, params } = msg || {};
@@ -527,17 +560,18 @@ function createSecretsServer(opts = {}) {
     const fail = (code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
     switch (method) {
       case 'initialize':
-        return ok({ protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: SERVER_NAME, version: SERVER_VERSION } });
+        negotiated = proto.negotiateProtocolVersion(params);
+        return ok({ protocolVersion: negotiated, capabilities: { tools: {} }, serverInfo: { name: SERVER_NAME, version: SERVER_VERSION } });
       case 'notifications/initialized':
         return null;
       case 'ping':
         return ok({});
       case 'tools/list':
-        return ok({ tools: TOOLS });
+        return ok({ tools: proto.toolsForVersion(TOOLS, negotiated) });
       case 'tools/call': {
         if (!params || typeof params.name !== 'string') return fail(-32602, 'Invalid params: name is required');
         const result = await callTool(params.name, params.arguments || {});
-        if (!result) return fail(-32601, "Tool '" + params.name + "' not found. " + NO_GET);
+        if (!result) return fail(proto.unknownToolCode(negotiated), "Tool '" + params.name + "' not found. " + NO_GET);
         return ok(result);
       }
       default:
@@ -545,7 +579,7 @@ function createSecretsServer(opts = {}) {
     }
   }
 
-  return { handleMessage, callTool, TOOLS };
+  return { handleMessage, handleBatch, callTool, TOOLS };
 }
 
 function startSecretsMcp(opts = {}) {
@@ -561,10 +595,10 @@ function startSecretsMcp(opts = {}) {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }) + '\n');
       return;
     }
-    const res = await server.handleMessage(msg);
+    const res = Array.isArray(msg) ? await server.handleBatch(msg) : await server.handleMessage(msg);
     if (res) process.stdout.write(JSON.stringify(res) + '\n');
   });
   rl.on('close', () => process.exit(0));
 }
 
-module.exports = { createSecretsServer, startSecretsMcp, TOOLS, SERVER_NAME };
+module.exports = { createSecretsServer, startSecretsMcp, TOOLS, SERVER_NAME, PROTOCOL_VERSION };

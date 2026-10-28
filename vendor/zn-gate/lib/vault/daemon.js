@@ -12,15 +12,21 @@
  *   daemon, and a client never sends anything to a squatted pipe.
  * - Newline-delimited JSON. Requests on one connection run in order; vault
  *   writes are serialised.
- * - Policy is enforced here as well as in the engine: `resolve` refuses
- *   destinations that the restoration policy withholds (network commands,
- *   MCP input, versioned files), and every resolve is audited.
+ * - Policy is enforced here as well as in the engine. `resolve` needs a
+ *   context (a restoration destination from the hooks, or a purpose of the
+ *   broker: zn run, an HTTP request, a rendered file) that the caller names
+ *   and the daemon checks against what it holds. Masking runs inside the
+ *   daemon (maskInfo, maskSpans): the scrubber gets positions and secret
+ *   names, never values. The other readers are concrete operations
+ *   (adoptToken, sameSecretValue, readBackup). Every resolve is audited.
  *
  * Limits (documented in the threat model): any process of the same OS user
  * that can read ~/.zn/run/session.key can talk to the daemon, exactly like
- * ssh-agent. Agent hooks deny agent tool calls that touch ~/.zn; the OS user
- * boundary is the real isolation. JS strings cannot be wiped from memory;
- * state is dropped and left to the garbage collector.
+ * ssh-agent, and can name any context. The checks above bind what a request
+ * must say (a host the secret allows, a command and an executable the user
+ * approved, a mode), not who is asking. Agent hooks deny agent tool calls that
+ * touch ~/.zn; the OS user boundary is the real isolation. JS strings cannot
+ * be wiped from memory; state is dropped and left to the garbage collector.
  *
  * The identity reaches the daemon process on stdin, never through argv,
  * environment variables or disk.
@@ -33,18 +39,20 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const store = require('./store');
 const keychain = require('./keychain');
+const winacl = require('./winacl');
 const audit = require('./audit');
 const confirmMod = require('./confirm');
-const { variants } = require('../scrub/exact');
+const { variants, buildMatcher, MIN_LENGTH: MIN_NEEDLE, validateSecretValue } = require('../scrub/exact');
 const exe = require('../exe');
 const { makeTeamOps } = require('../team/daemon-ops');
 const { CODES, znError } = require('../errors');
+const messages = require('../messages');
 
 const PROTOCOL = 1;
 const DEFAULT_TTL_MS = 8 * 3600 * 1000;
 const DEFAULT_IDLE_MS = 30 * 60 * 1000;
 const DEFAULT_TEAM_SYNC_MS = 15 * 60 * 1000;
-const MAX_LINE = 4 * 1024 * 1024;
+const MAX_LINE = 64 * 1024 * 1024;
 const MAX_VALUE = 1024 * 1024;
 const MAX_DETECTED_EXACT = 256;
 const TYPE_RE = /^[A-Z0-9](?:[A-Z0-9_]{0,62}[A-Z0-9])?$/;
@@ -54,19 +62,50 @@ const HOST_RE = /^(?:\*\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*(?::\d{1,5})?$/;
 const COMMAND_RE = /^[A-Za-z0-9_.+\-/ *]{1,128}$/;
 const CLOUD_KEY_SECRET = 'ZN_CLOUD_API_KEY';
 const CLOUD_KEY_PURPOSE = 'zn-cloud-key';
-const DENIED_RESOLVE = new Set(['bash_network', 'mcp_input', 'write_tracked']);
+/* Restoration policy by destination (the hooks' contexts). It is the engine's
+ * POLICY table with one difference (a test checks both): the engine lets an
+ * in-process caller restore into the assistant's own text, but no hook does,
+ * and a value put in front of the model defeats the vault, so the daemon,
+ * which holds the real values, never hands one out for `assistant`.
+ * `detected` is a scrubber token (__ZN_EMAIL_1__), `named` a stored secret
+ * (__ZN_NAME__); only 'restore' hands a value out. */
+const DESTINATION_POLICY = Object.freeze({
+  assistant:     Object.freeze({ detected: 'not_restored', named: 'not_restored' }),
+  write_ignored: Object.freeze({ detected: 'restore', named: 'restore' }),
+  write_tracked: Object.freeze({ detected: 'tracked_file', named: 'tracked_file' }),
+  bash_local:    Object.freeze({ detected: 'restore', named: 'use_broker' }),
+  bash_network:  Object.freeze({ detected: 'network', named: 'network' }),
+  mcp_input:     Object.freeze({ detected: 'mcp_input', named: 'mcp_input' }),
+});
+/* Purposes of the broker. Each one has its own checks in resolveFor():
+ *   run     zn run: an env-mode secret, a command its allowCommands list names, an executable the user approved
+ *   http    secrets_http_request: a host and placements the secret allows
+ *   render  secrets_render_file: a file-mode secret
+ * and the key of `zn-gate connect`, which only zn-gate's own cloud calls read. */
+const BROKER_PURPOSES = Object.freeze(['run', 'http', 'render']);
+const MASK_MAX_TEXTS = 4096;
+const MASK_MAX_CHARS = 16 * 1024 * 1024;
+const MASK_AUDIT_EVERY_MS = 60 * 1000;
+const SAME_VALUE_PER_MINUTE = 120;
+const BACKUP_REFUSED = 'this is a backup of a .env file: only zn env unshadow can read it, after you confirm. Next step: run zn env unshadow in your own terminal.';
+const PROXY_NOT_RESTORED = 'this secret is in proxy mode, so it is never written into a file or a command. Next step: use the secrets_http_request tool, or ask the user to change its mode in their own terminal (zn secret allow).';
+const BACKUP_NAME_RE = /^ENVBAK_X[0-9A-F]{8}D\d{12}$/;
 /* What this vault does beyond the protocol. resolve-policy: resolve() with
  * {withPolicy: true} applies the organization policy and answers
- * {value, policy: RESOLVE_POLICY_VERSION, deny?, warn?, warnReason?}. */
+ * {value, policy: RESOLVE_POLICY_VERSION, deny?, warn?, warnReason?}.
+ * capabilities: resolve needs a context, masking runs in the daemon (maskInfo and maskSpans),
+ * and adoptToken, sameSecretValue and readBackup exist. */
 const RESOLVE_POLICY_VERSION = 1;
 const PACKAGE_VERSION = require('../../package.json').version;
-const VAULT_FEATURES = Object.freeze(['resolve-policy']);
+const VAULT_FEATURES = Object.freeze(['resolve-policy', 'capabilities']);
 const ALLOW_IN = ['header', 'query', 'body'];
 // Commands that run arbitrary code given to them (python3.12, node22, pwsh...):
 // approving one lets any script it runs read the secret. The confirmation
 // says so. One list for the daemon and the CLI, in lib/exe.js.
 const { isInterpreter, isInterpreterPath } = exe;
 
+const markers = require('../broker/markers');
+const { AGENT_IDS } = require('../agents');
 const { endpoint, hmac, safeEqualHex, createClient } = require('./client');
 
 /* ------------------------------------------------------------------ */
@@ -221,6 +260,22 @@ function normArgv0(argv0) {
   return a;
 }
 
+/* Each time a secret's value is set or replaced it gets a new random
+ * generation id. An approval records the generation it was granted for and
+ * counts only for that one, so a new value stored under the same name never
+ * inherits an old approval. */
+function newGeneration() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/* Approval keys are <project>:<secret>:<command>; none of the parts holds a colon. */
+function dropApprovalsOf(secrets, name) {
+  if (!secrets.approvals || typeof secrets.approvals !== 'object') return;
+  for (const key of Object.keys(secrets.approvals)) {
+    if (key.split(':')[1] === name) delete secrets.approvals[key];
+  }
+}
+
 function approvalKey(project, secret, argv0) {
   const s = String(secret || '');
   if (!NAME_RE.test(s)) throw znError(CODES.POLICY_DENIED, 'invalid secret name. Next step: use letters, digits and underscores, for example MY_API_KEY.');
@@ -254,6 +309,102 @@ function widening(prev, next) {
   return out;
 }
 
+/* Tamper mark. The audit log is checked against the checkpoint the vault
+ * keeps in secrets.age. If the log was changed behind the daemon's back
+ * (truncated, replaced), the checkpoint is NOT moved to the new tail: the old
+ * one stays, and this mark is stored in the vault. `zn vault verify` fails
+ * until the user accepts the log with `zn vault verify --acknowledge`. */
+function recordTamper(state, reason, found) {
+  const secrets = state.secrets;
+  if (!secrets || secrets.auditTamper) return;
+  const head = secrets.auditHead;
+  secrets.auditTamper = {
+    at: new Date().toISOString(),
+    reason: String(reason).slice(0, 300),
+    expected: head ? { seq: head.seq, mac: head.mac } : null,
+    found: found || null,
+  };
+  state.dirtySecrets = true;
+  state.serial(() => state.saveSecrets()).catch(() => {});
+}
+
+/* Chain check of the whole log (every MAC, the links, the sequence numbers and
+ * the vault's checkpoint). A failure leaves the persistent tamper mark. The
+ * result is remembered while the file is unchanged (size, mtime, ctime, inode)
+ * and the checkpoint is the same; any append by the daemon drops it, so the
+ * next check reads the whole log again. */
+function logSignature(file) {
+  try {
+    const st = fs.statSync(file);
+    return [st.size, st.mtimeMs, st.ctimeMs, st.ino].join(':');
+  } catch (err) { return 'none'; }
+}
+
+function headKey(secrets) {
+  return secrets.auditHead ? secrets.auditHead.seq + ':' + secrets.auditHead.mac : '';
+}
+
+function chainStatus(state, opts) {
+  const secrets = state.secrets;
+  if (!secrets) throw znError(CODES.LOCKED, 'vault locked');
+  const file = state.paths.auditFile;
+  const t = secrets.auditTamper;
+  if (t) {
+    return {
+      ok: false,
+      tampered: true,
+      records: 0,
+      reason: t.reason,
+      error: 'the audit log was changed behind the vault (noticed ' + t.at + '): ' + t.reason,
+    };
+  }
+  const sig = logSignature(file);
+  const c = state.chainCache;
+  if (!(opts && opts.force) && c && c.sig === sig && c.head === headKey(secrets)) return c.result;
+  state.chainCache = null;
+  let r;
+  try {
+    r = audit.verify({ file, key: Buffer.from(secrets.auditKey, 'hex'), checkpoint: secrets.auditHead });
+  } catch (err) {
+    r = { ok: false, records: 0, error: 'the audit log cannot be read' };
+  }
+  if (!r.ok) {
+    recordTamper(state, r.error + (r.line ? ' (record ' + r.line + ')' : ''), null);
+    return Object.assign({}, r, {
+      tampered: true,
+      reason: secrets.auditTamper.reason,
+      error: 'the audit log was changed behind the vault (noticed ' + secrets.auditTamper.at + '): ' + secrets.auditTamper.reason,
+    });
+  }
+  state.chainCache = { sig, head: headKey(secrets), result: r };
+  return r;
+}
+
+/* Every audit write goes through here: the in-memory head must be the last
+ * record in the file before the daemon appends, and the whole chain must
+ * verify (a change in the middle of the log is not seen by the head alone);
+ * if not, the checkpoint stays and the tamper mark is stored. */
+function appendChecked(state, event, extra) {
+  const secrets = state.secrets;
+  if (!secrets) throw znError(CODES.LOCKED, 'vault locked');
+  const file = state.paths.auditFile;
+  if (!secrets.auditTamper) {
+    const h = audit.checkHead(file, secrets.auditHead);
+    if (!h.ok) recordTamper(state, h.reason, h.found);
+    else {
+      chainStatus(state);
+    }
+  }
+  if (state.opts && typeof state.opts._afterChainCheck === 'function') state.opts._afterChainCheck(); // test seam
+  state.dirtySecrets = true;
+  const rec = audit.append(event, Object.assign({ file, key: Buffer.from(secrets.auditKey, 'hex') }, extra));
+  if (!secrets.auditTamper) secrets.auditHead = { seq: rec.seq, mac: rec.mac };
+  // Never vouch for the file from a stat taken after our own write: a change made as the file grew
+  // would be folded in. The next read, export or upload checks the whole chain again.
+  state.chainCache = null;
+  return rec;
+}
+
 function makeOps(state, ctl) {
   const auditFile = state.paths.auditFile;
   const channel = ctl.channel;
@@ -279,17 +430,131 @@ function makeOps(state, ctl) {
   /* Synchronous on purpose: audit.append is synchronous file I/O, so two
    * appends can never interleave and break the chain. */
   function writeAudit(event) {
-    const secrets = state.secrets;
-    if (!secrets) throw znError(CODES.LOCKED, 'vault locked');
-    const rec = audit.append(event, { file: auditFile, key: Buffer.from(secrets.auditKey, 'hex'), knownValues: state.knownValues() });
-    secrets.auditHead = { seq: rec.seq, mac: rec.mac };
-    state.dirtySecrets = true;
-    return rec;
+    return appendChecked(state, event, { knownValues: state.knownValues() });
   }
 
-  const team = makeTeamOps({ state, writeAudit, confirmOutOfBand, fetchImpl: ctl.fetchImpl, isClosed: () => Boolean(ctl.closed) });
+  const team = makeTeamOps({ state, writeAudit, verifyChain: () => chainStatus(state), confirmOutOfBand, fetchImpl: ctl.fetchImpl, isClosed: () => Boolean(ctl.closed) });
 
-  return {
+  const localOf = (name, s) => ({ name, mode: s.mode, allowHosts: s.allowHosts || [], allowCommands: s.allowCommands || [], allowIn: s.allowIn || ['header'] });
+  // When the masking path last called the vault, for each (agent, tool): one audit record a minute, not one per hook.
+  const maskAudited = new Map();
+  const sameWindow = { start: 0, count: 0 };
+  function noteMask(claim) {
+    const o = claim && typeof claim === 'object' ? claim : {};
+    const who = String(o.agent) + '\0' + String(o.tool);
+    const now = Date.now();
+    if (maskAudited.has(who) && now - maskAudited.get(who) < MASK_AUDIT_EVERY_MS) return;
+    if (maskAudited.size > 256) maskAudited.clear();
+    maskAudited.set(who, now);
+    writeAudit({ mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'allow', reason: 'mask_text' });
+  }
+
+  /* The matcher over every value the masker looks for in one project: the stored secrets (backups are whole files, not
+   * values) and the values the scrubber already detected here (most recent first, so a value found once is caught
+   * again where no pattern matches). Rebuilt when a secret or a detected value changes. */
+  const maskCache = new Map();
+  async function maskStateOf(project) {
+    const secrets = await state.loadSecrets();
+    const p = await state.loadProject(String(project == null ? '' : project));
+    const h = crypto.createHash('sha256');
+    const live = [];
+    for (const [name, s] of Object.entries(secrets.secrets)) {
+      // A value under the minimum comes from an older version (new ones are refused): it is compared exactly.
+      if (s && s.mode !== 'backup' && typeof s.value === 'string' && s.value.length > 0) {
+        live.push([name, s]);
+        h.update(name + '\0' + s.value + '\0');
+      }
+    }
+    h.update('tokens:' + p.byValue.size);
+    const sig = h.digest('hex');
+    const hit = maskCache.get(p.key);
+    if (hit && hit.sig === sig) return hit;
+    const entries = live.map(([name, s]) => (s.value.length >= MIN_NEEDLE
+      ? { name, type: s.type || 'SECRET', values: variants(s.value), vault: true }
+      : { name, type: s.type || 'SECRET', values: [s.value], exactShort: true, vault: true }));
+    for (const [token, value] of Object.entries(p.data.tokens).slice(-MAX_DETECTED_EXACT).reverse()) {
+      if (typeof value !== 'string' || value.length < MIN_NEEDLE) continue;
+      const m = TOKEN_RE.exec(token);
+      entries.push({ type: m[1].replace(/_\d+$/, ''), values: variants(value), vault: true });
+    }
+    let longest = 0;
+    for (const e of entries) for (const v of e.values) if (v.length > longest) longest = v.length;
+    const matcher = buildMatcher(entries);
+    const built = { sig, matcher, names: entries.filter((e) => e.name).map((e) => e.name), longest, shortCount: matcher.shortSize, minNeedle: MIN_NEEDLE };
+    if (maskCache.size > 64) maskCache.clear();
+    maskCache.set(p.key, built);
+    return built;
+  }
+
+  /* resolve for a purpose of the broker. The checks the broker makes before it asks are made again here, on what the
+   * vault itself holds, so a request that skips the broker meets the same limits: the secret's mode, the organization
+   * policy, and the settings and approvals the user gave. They do not tell who is asking: a program of the same user
+   * can name a host, a command and an executable that fit. */
+  async function resolveFor(project, inner, purpose, o) {
+    const refuse = async (reason, message) => {
+      await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'deny', reason });
+      throw znError(CODES.POLICY_DENIED, message);
+    };
+    // A backup is the whole .env that zn env shadow set aside: only readBackup, which the user confirms, gives it out.
+    if (BACKUP_NAME_RE.test(inner)) return refuse('policy:backup', BACKUP_REFUSED);
+    if (/_\d+$/.test(inner)) {
+      return refuse('policy:' + purpose + ':detected', 'this request is for a stored secret, not for a value the scrubber found. Next step: store the value with zn secret adopt first.');
+    }
+    const secrets = await state.loadSecrets();
+    const s = secrets.secrets[inner];
+    if (!s) {
+      await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'deny', reason: 'not_found' });
+      return null;
+    }
+    if (s.mode === 'backup') return refuse('policy:backup', BACKUP_REFUSED);
+    // An agent id the client names decides nothing about a secret. The one thing it can change is which hosts the
+    // organization policy offers to an agent zn can identify, and those only apply once the user approved them here.
+    const agentId = typeof o.agent === 'string' && AGENT_IDS.includes(o.agent) ? o.agent : null;
+    const trusted = purpose === 'http' && o.agentTrusted === true && agentId !== null;
+    const [eff] = await team.effectiveList([localOf(inner, s)], agentId, trusted);
+    if (eff && eff.deny) {
+      return refuse('policy:org_deny', 'secret ' + inner + ' is blocked by your organization policy. Next step: do not use this secret here. If the task needs it, review the organization policy, or, if you are an agent, ask the user.');
+    }
+    const meta = eff || localOf(inner, s);
+    if (purpose === 'run') {
+      if (meta.mode !== 'env') {
+        return refuse('policy:run:mode', 'secret ' + inner + ' is in ' + (meta.mode || 'proxy') + ' mode, so it is never put into a process. Next step: use the secrets_http_request tool for HTTP APIs.');
+      }
+      const argv = Array.isArray(o.argv) && o.argv.length > 0 && o.argv.length <= 1024 && o.argv.every((a) => typeof a === 'string' && a.length <= 32768) ? o.argv : null;
+      const entry = argv ? markers.matchAllowCommands(meta.allowCommands, argv) : null;
+      if (!entry) return refuse('policy:run:command', 'this command is not allowed to use ' + inner + '. Next step: the user can allow it from their own terminal with zn secret allow.');
+      const real = o.exe && typeof o.exe === 'object' ? o.exe.real : null;
+      const fp = o.exe && typeof o.exe === 'object' ? o.exe.fp : null;
+      if (typeof real !== 'string' || !real || real.length > 4096 || !path.isAbsolute(real) || typeof fp !== 'string' || !fp) {
+        return refuse('policy:run:exe', 'zn run did not name the program it opened. Next step: run the command through zn run.');
+      }
+      const approved = await ops.isApproved(project, inner, exe.commandWord(entry).split(/[\\/]/).pop(), exe.approvalPath(real), fp);
+      if (!approved) return refuse('policy:run:not_approved', 'this program is not approved for ' + inner + ' yet. Next step: run it through zn run and confirm it in the zn vault prompt.');
+    } else if (purpose === 'render') {
+      if (meta.mode !== 'file') return refuse('policy:render:mode', 'secret ' + inner + ' is in ' + (meta.mode || 'proxy') + ' mode; only file-mode secrets are written to disk.');
+    } else {
+      // Only a secret the user made available to HTTP requests (proxy mode, the default) leaves through this purpose,
+      // whatever its allowHosts say: an env or file secret is meant for a local program, not for the network.
+      if ((meta.mode || 'proxy') !== 'proxy') {
+        return refuse('policy:http:mode', 'secret ' + inner + ' is in ' + meta.mode + ' mode, so it is never sent over HTTP. Next step: do not use this secret here. If the API really needs it, the user can change its mode in their own terminal with zn secret allow ' + inner + ' --mode proxy.');
+      }
+      const host = typeof o.host === 'string' ? o.host : '';
+      if (!markers.hostAllowed(meta.allowHosts, host)) {
+        return refuse('policy:http:host', 'secret ' + inner + ' may not be sent to ' + (host || 'an unnamed host') + '. Next step: the user can allow the host with zn secret allow.');
+      }
+      const allowIn = Array.isArray(meta.allowIn) ? meta.allowIn : ['header'];
+      const where = Array.isArray(o.placements) && o.placements.every((p) => ALLOW_IN.includes(p)) ? o.placements : null;
+      if (where === null || where.some((p) => !allowIn.includes(p))) {
+        return refuse('policy:http:placement', 'secret ' + inner + ' may only be sent where its settings allow (' + allowIn.join(', ') + '). Next step: the user can widen it with zn secret allow --in.');
+      }
+    }
+    s.lastUsed = new Date().toISOString();
+    state.dirtySecrets = true;
+    await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'allow', reason: purpose });
+    return s.value;
+  }
+
+  const ops = {
     async status() {
       return { unlocked: true, protocol: PROTOCOL, pid: process.pid, expiresAt: new Date(ctl.expiresAt).toISOString(), idleMs: ctl.idleMs, confirm: channel.kind, features: VAULT_FEATURES, version: PACKAGE_VERSION };
     },
@@ -319,21 +584,40 @@ function makeOps(state, ctl) {
       if (!m) throw znError(CODES.POLICY_DENIED, 'invalid token. Next step: use the placeholder exactly as zn gave it, in the form __ZN_NAME__.');
       const o = opts && typeof opts === 'object' ? opts : {};
       const inner = m[1];
-      if (o.destination && DENIED_RESOLVE.has(o.destination)) {
-        await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'deny', reason: 'policy:' + o.destination });
-        throw znError(CODES.POLICY_DENIED, 'destination ' + o.destination + ' does not receive real values. Next step: send the request to a host this secret is allowed for, or use a placeholder instead.');
+      const ordinal = /_(\d+)$/.exec(inner);
+      // What the request says it is for. A purpose wins over a destination; neither is proven by the caller, which is
+      // why each one is checked here against what the vault itself holds.
+      const purpose = typeof o.purpose === 'string' ? o.purpose : null;
+      const dest = !purpose && typeof o.destination === 'string' && Object.prototype.hasOwnProperty.call(DESTINATION_POLICY, o.destination) ? o.destination : null;
+      const refuse = async (reason, message) => {
+        await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'deny', reason });
+        throw znError(CODES.POLICY_DENIED, message);
+      };
+      // A backup is the whole .env that zn env shadow set aside: for every destination and purpose, only readBackup
+      // (which the user confirms on the vault's own channel) gives it out.
+      if (BACKUP_NAME_RE.test(inner)) return refuse('policy:backup', BACKUP_REFUSED);
+      if (dest && DESTINATION_POLICY[dest][ordinal ? 'detected' : 'named'] !== 'restore') {
+        await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'deny', reason: 'policy:' + dest });
+        throw znError(CODES.POLICY_DENIED, 'destination ' + dest + ' does not receive real values. Next step: send the request to a host this secret is allowed for, or use a placeholder instead.');
       }
       // The key `zn-gate connect` keeps here is not handed to hooks, the secrets broker or zn run, so writing its marker
       // in a file or a command never gets the real key back. A program running as the user can still ask for it.
-      if (inner === CLOUD_KEY_SECRET && o.purpose !== CLOUD_KEY_PURPOSE) {
+      if (inner === CLOUD_KEY_SECRET && purpose !== CLOUD_KEY_PURPOSE) {
         await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'deny', reason: 'policy:zn_cloud_key' });
         if (o.withPolicy === true) return { value: null, policy: RESOLVE_POLICY_VERSION };
         throw znError(CODES.POLICY_DENIED, 'this secret is the key of zn-gate connect and is never put into a file or a command. Next step: ask the user to run zn-gate disconnect if it should stop working.');
       }
+      // There is no context-free resolve: a request that names no destination and no purpose, or one this vault does not
+      // know, gets nothing (and the attempt is on the audit log).
+      if (purpose ? (purpose !== CLOUD_KEY_PURPOSE && !BROKER_PURPOSES.includes(purpose)) || (purpose === CLOUD_KEY_PURPOSE && inner !== CLOUD_KEY_SECRET) : !dest) {
+        await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: 'deny', reason: 'policy:no_context' });
+        throw znError(CODES.POLICY_DENIED, 'this request does not say what the value is for. Next step: restore placeholders through the zn hooks, or use zn run or the secrets MCP tools; a program cannot read values directly.');
+      }
+      if (BROKER_PURPOSES.includes(purpose)) return resolveFor(project, inner, purpose, o);
       let value = null;
       let org = null;
       const agentId = typeof o.agent === 'string' ? o.agent : null;
-      const asLocal = (name, s) => ({ name, mode: s.mode, allowHosts: s.allowHosts || [], allowCommands: s.allowCommands || [], allowIn: s.allowIn || ['header'] });
+      const asLocal = localOf;
       // names: the stored secrets the policy blocks (for a detected token, the
       // secrets with the same value): one local audit record each.
       const orgDenied = async (names) => {
@@ -341,14 +625,13 @@ function makeOps(state, ctl) {
         if (o.withPolicy === true) return { value: null, policy: RESOLVE_POLICY_VERSION, deny: true };
         throw znError(CODES.POLICY_DENIED, 'secret ' + inner + ' is blocked by your organization policy. Next step: do not use this secret here. If the task needs it, review the organization policy, or, if you are an agent, ask the user.');
       };
-      const ordinal = /_(\d+)$/.exec(inner);
       if (ordinal) {
         const p = await state.loadProject(String(project == null ? '' : project));
         value = Object.prototype.hasOwnProperty.call(p.data.tokens, token) ? p.data.tokens[token] : null;
         // A detected value that is also a stored secret: the organization
         // policy for that secret applies, so a blocked secret is not put back
         // through the scrubber's token for the same value.
-        if (value !== null && o.destination) {
+        if (value !== null && dest) {
           const secrets = await state.loadSecrets();
           const same = Object.entries(secrets.secrets)
             .filter(([, s]) => s && typeof s.value === 'string' && s.value === value)
@@ -357,6 +640,8 @@ function makeOps(state, ctl) {
             const effs = await team.effectiveList(same, agentId, false);
             const blocked = effs.filter((e) => e && e.deny).map((e) => e.name);
             if (blocked.length) return orgDenied(blocked);
+            const odd = effs.find((e) => e && (e.mode === 'backup' || (e.mode === 'proxy' && (dest === 'write_ignored' || dest === 'bash_local'))));
+            if (odd) return odd.mode === 'backup' ? refuse('policy:backup', BACKUP_REFUSED) : refuse('policy:proxy_mode', PROXY_NOT_RESTORED);
             // A warn rule for that secret: restored with the notice, as for a named marker.
             const warned = effs.find((e) => e && e.warn === true);
             if (warned) org = { warn: true, warnReason: warned.warnReason, warnName: warned.name };
@@ -365,16 +650,19 @@ function makeOps(state, ctl) {
       } else {
         const secrets = await state.loadSecrets();
         const s = secrets.secrets[inner];
+        if (s && s.mode === 'backup') return refuse('policy:backup', BACKUP_REFUSED);
         // A marker the agent hooks put back (they always give a destination):
         // the organization policy applies, as in zn run and the secrets MCP tools.
-        if (s && o.destination) {
+        if (s && dest) {
           const [eff] = await team.effectiveList([asLocal(inner, s)], agentId, false);
           if (eff && eff.deny) return orgDenied([inner]);
+          // A proxy-mode secret is only ever used by the broker's HTTP tool: it is never written into a file by a restore.
+          if (eff && !['env', 'file'].includes(eff.mode) && dest === 'write_ignored') return refuse('policy:proxy_mode', PROXY_NOT_RESTORED);
           if (eff && eff.warn === true) org = { warn: true, warnReason: eff.warnReason };
         }
         if (s) { value = s.value; s.lastUsed = new Date().toISOString(); state.dirtySecrets = true; }
       }
-      await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: value === null ? 'deny' : 'allow', reason: value === null ? 'not_found' : (o.destination || 'unspecified') });
+      await writeAudit({ secret: inner, mode: 'resolve', agent: o.agent, tool: o.tool, decision: value === null ? 'deny' : 'allow', reason: value === null ? 'not_found' : (dest || purpose) });
       // withPolicy: {value, policy, deny?, warn?, warnReason?, warnName?} instead of the bare value.
       return o.withPolicy === true ? Object.assign({ value, policy: RESOLVE_POLICY_VERSION }, value === null ? null : org) : value;
     },
@@ -382,10 +670,20 @@ function makeOps(state, ctl) {
     async setSecret(name, value, meta) {
       const n = checkName(name);
       str(value, 'value');
+      const backup = meta && typeof meta === 'object' && meta.mode === 'backup'; // whole files kept by `zn env shadow`
       return state.serial(async () => {
         const secrets = await state.loadSecrets();
         const prev = secrets.secrets[n];
-        secrets.secrets[n] = Object.assign(cleanMeta(meta), { value, created: prev ? prev.created : new Date().toISOString(), lastUsed: prev ? prev.lastUsed : null });
+        // New values under the minimum are refused; a value an older version stored keeps working.
+        if (!backup && !(prev && prev.value === value)) {
+          const bad = validateSecretValue(value);
+          if (bad) throw znError(CODES.POLICY_DENIED, 'invalid value: ' + bad);
+        }
+        // The same value again is not a new secret: it keeps its generation and its approvals.
+        const sameValue = !!prev && typeof prev.generation === 'string' && prev.generation !== '' && prev.value === value;
+        const generation = sameValue ? prev.generation : newGeneration();
+        if (!sameValue) dropApprovalsOf(secrets, n);
+        secrets.secrets[n] = Object.assign(cleanMeta(meta), { value, generation, created: prev ? prev.created : new Date().toISOString(), lastUsed: prev ? prev.lastUsed : null });
         await writeAudit({ secret: n, mode: 'set', decision: 'allow', reason: prev ? 'updated' : 'created' });
         await state.saveSecrets();
         return true;
@@ -403,6 +701,11 @@ function makeOps(state, ctl) {
       const before = (await state.loadSecrets()).secrets[n];
       if (!before) throw znError(CODES.NOT_FOUND, 'no secret named ' + n + '. Next step: check the name for a typo; if the secret is missing, save it with zn secret set ' + n + ' in your own terminal, or, if you are an agent, ask the user to do it.');
       const target = proposed(before);
+      // A value kept as a backup is not checked for its length; once it becomes a secret it is.
+      if (before.mode === 'backup' && target.mode !== 'backup') {
+        const tooShort = validateSecretValue(before.value);
+        if (tooShort) throw znError(CODES.POLICY_DENIED, 'invalid value: ' + tooShort);
+      }
       const adds = widening(before, target);
       if (adds.length) {
         const interp = (target.allowCommands || []).filter((c) => !(before.allowCommands || []).includes(c) && isInterpreter(c));
@@ -421,6 +724,7 @@ function makeOps(state, ctl) {
         const merged = proposed(prev);
         if (widening(prev, merged).some((x) => !adds.includes(x))) throw znError(CODES.POLICY_DENIED, 'the policy changed while waiting for confirmation; try again. Next step: run the request again.');
         secrets.secrets[n] = Object.assign(merged, { value: prev.value, created: prev.created, lastUsed: prev.lastUsed || null });
+        if (prev.generation) secrets.secrets[n].generation = prev.generation;
         writeAudit({ secret: n, mode: 'set', decision: 'allow', reason: adds.length ? 'policy_widened_confirmed' : 'policy_updated' });
         await state.saveSecrets();
         return true;
@@ -437,6 +741,13 @@ function makeOps(state, ctl) {
       const secrets = await state.loadSecrets();
       const rec = secrets.approvals && secrets.approvals[approvalKey(project, secret, argv0)];
       if (!rec || typeof rec !== 'object' || !rec.exe) return false;
+      // The approval counts only for the value it was granted for. One recorded
+      // before generations existed has none, so it is asked for again once.
+      const current = secrets.secrets[String(secret)];
+      if (!current || typeof current.generation !== 'string' || current.generation === '' || rec.gen !== current.generation) {
+        writeAudit({ secret: String(secret), mode: 'env', argv0, decision: 'deny', reason: 'value_changed' });
+        return false;
+      }
       if (typeof exePath !== 'string' || rec.exe !== exePath) {
         writeAudit({ secret: String(secret), mode: 'env', argv0, decision: 'deny', reason: exePath ? 'exe_changed' : 'exe_not_found' });
         return false;
@@ -464,6 +775,7 @@ function makeOps(state, ctl) {
       if (openFp != null && openFp !== fp) throw znError(CODES.POLICY_DENIED, 'the executable changed while it was being checked. Next step: run the command again; if it keeps changing, check where the program is installed.');
       const cmd = normArgv0(argv0);
       const loaded = await state.loadSecrets();
+      const generationAsked = loaded.secrets[String(secret)] ? loaded.secrets[String(secret)].generation || null : null;
       if (!loaded.secrets[String(secret)]) throw znError(CODES.NOT_FOUND, 'no secret named ' + secret + '. Next step: check the name for a typo; if the secret is missing, save it with zn secret set ' + secret + ' in your own terminal, or, if you are an agent, ask the user to do it.');
       const prev = loaded.approvals && loaded.approvals[key];
       const changed = prev && typeof prev === 'object' && prev.exe && (prev.exe !== exePath || prev.fp !== fp);
@@ -491,8 +803,12 @@ function makeOps(state, ctl) {
       return state.serial(async () => {
         const secrets = await state.loadSecrets();
         if (fingerprint(exePath) !== fp) throw znError(CODES.POLICY_DENIED, 'the executable changed while waiting for confirmation. Next step: run the command again.');
+        const current = secrets.secrets[String(secret)];
+        if (!current) throw znError(CODES.NOT_FOUND, 'no secret named ' + secret + '. Next step: check the name for a typo; if the secret is missing, save it with zn secret set ' + secret + ' in your own terminal, or, if you are an agent, ask the user to do it.');
+        if ((current.generation || null) !== generationAsked) throw znError(CODES.POLICY_DENIED, 'the secret changed while waiting for confirmation. Next step: run the command again.');
+        if (!current.generation) current.generation = newGeneration();
         if (!secrets.approvals || typeof secrets.approvals !== 'object') secrets.approvals = {};
-        secrets.approvals[key] = { ts: new Date().toISOString(), exe: exePath, fp };
+        secrets.approvals[key] = { ts: new Date().toISOString(), exe: exePath, fp, gen: current.generation };
         writeAudit({ secret: String(secret), mode: 'env', argv0, decision: 'ask:yes', reason: changed ? 'changed_exe_reapproved' : 'first_use_approved' });
         await state.saveSecrets();
         return true;
@@ -534,6 +850,7 @@ function makeOps(state, ctl) {
     teamJoin: team.teamJoin,
     teamLeave: team.teamLeave,
     teamInfo: team.teamInfo,
+    teamHookInfo: team.teamHookInfo,
     teamSync: team.teamSync,
     confirmOrgOpening: team.confirmOrgOpening,
 
@@ -543,29 +860,104 @@ function makeOps(state, ctl) {
         const secrets = await state.loadSecrets();
         if (!Object.prototype.hasOwnProperty.call(secrets.secrets, n)) return false;
         delete secrets.secrets[n];
+        dropApprovalsOf(secrets, n);
         await writeAudit({ secret: n, mode: 'remove', decision: 'allow' });
         await state.saveSecrets();
         return true;
       });
     },
 
-    async exactValues(project) {
-      const secrets = await state.loadSecrets();
-      const out = [];
-      for (const [name, s] of Object.entries(secrets.secrets)) {
-        // Backups (whole files kept by `zn env shadow`) are not values to search for.
-        if (s && s.mode !== 'backup' && typeof s.value === 'string' && s.value.length >= 8) out.push({ name, type: s.type || 'SECRET', values: variants(s.value) });
+    /* Masking happens here, so the real values never leave the daemon. The
+     * scrubber (hooks, prompts, MCP results, the streaming scrubber) asks
+     * where the vault's values occur in a text and gets positions, types and
+     * secret names back: never a value, an encoding of one or a hash. The
+     * calls are recorded (at most one record a minute for each agent and
+     * tool). The calls are not rate limited and take megabytes of text, so
+     * anyone who can call them can test guesses against the vault (hundreds of
+     * thousands a second); they cannot read a value out. */
+    async maskInfo(project, claim) {
+      noteMask(claim);
+      const m = await maskStateOf(project);
+      // shortCount: how many values under the minimum (from older versions) are compared exactly. A count, never a value.
+      return { names: m.names, longest: m.longest, count: m.matcher.size, shortCount: m.shortCount };
+    },
+
+    async maskSpans(project, texts, claim) {
+      if (!Array.isArray(texts) || texts.length > MASK_MAX_TEXTS) throw znError(CODES.POLICY_DENIED, 'too many texts. Next step: send fewer texts in one request.');
+      let total = 0;
+      for (const t of texts) {
+        if (typeof t !== 'string') throw znError(CODES.POLICY_DENIED, 'invalid text. Next step: send strings.');
+        total += t.length;
       }
-      // Values already detected in this project (most recent first): once a
-      // value was found, it is caught again even where no pattern matches.
-      const p = await state.loadProject(String(project == null ? '' : project));
-      const entries = Object.entries(p.data.tokens).slice(-MAX_DETECTED_EXACT).reverse();
-      for (const [token, value] of entries) {
-        if (typeof value !== 'string' || value.length < 8) continue;
-        const m = TOKEN_RE.exec(token);
-        out.push({ type: m[1].replace(/_\d+$/, ''), values: variants(value) });
+      if (total > MASK_MAX_CHARS) throw znError(CODES.POLICY_DENIED, 'text too long. Next step: send it in smaller pieces.');
+      noteMask(claim);
+      const m = await maskStateOf(project);
+      return { spans: texts.map((t) => (t.length < m.minNeedle && m.shortCount === 0 ? [] : m.matcher.find(t))) };
+    },
+
+
+    /* zn secret adopt: store a value the scrubber found as a named secret.
+     * The value goes from one table of the vault to another and never to the caller. */
+    async adoptToken(project, token, name, meta) {
+      const m = TOKEN_RE.exec(String(token || ''));
+      if (!m || !/_\d+$/.test(m[1])) throw znError(CODES.POLICY_DENIED, 'invalid token. Next step: give a placeholder the scrubber made, such as __ZN_AWS_KEY_1__.');
+      const n = checkName(name);
+      return state.serial(async () => {
+        const p = await state.loadProject(String(project == null ? '' : project));
+        const value = Object.prototype.hasOwnProperty.call(p.data.tokens, String(token)) ? p.data.tokens[String(token)] : null;
+        if (typeof value !== 'string' || value.length === 0) throw znError(CODES.NOT_FOUND, String(token) + ' is not known for this project. Next step: check the placeholder name.');
+        const tooShort = validateSecretValue(value);
+        if (tooShort) throw znError(CODES.POLICY_DENIED, 'invalid value: ' + tooShort);
+        const secrets = await state.loadSecrets();
+        if (secrets.secrets[n]) throw znError(CODES.POLICY_DENIED, n + ' already exists. Next step: pick another name.');
+        // A new secret gets its own generation, as setSecret gives one: an approval never carries over from an older secret of that name.
+        dropApprovalsOf(secrets, n);
+        secrets.secrets[n] = Object.assign(cleanMeta(meta), { value, generation: newGeneration(), created: new Date().toISOString(), lastUsed: null });
+        await writeAudit({ secret: n, mode: 'set', decision: 'allow', reason: 'adopted' });
+        await state.saveSecrets();
+        return true;
+      });
+    },
+
+    /* Is this the value stored under that name? Answers yes or no, never the value (zn secret import and
+     * zn env shadow). Each answer is recorded and the daemon answers at most SAME_VALUE_PER_MINUTE a minute. That limit
+     * only covers this call: maskSpans answers the same question for any text, without a limit (see the threat model). */
+    async sameSecretValue(name, value) {
+      const n = str(name, 'name', 64);
+      str(value, 'value');
+      const now = Date.now();
+      if (now - sameWindow.start >= 60 * 1000) { sameWindow.start = now; sameWindow.count = 0; }
+      if (++sameWindow.count > SAME_VALUE_PER_MINUTE) {
+        writeAudit({ secret: NAME_RE.test(n) ? n : undefined, mode: 'resolve', decision: 'deny', reason: 'policy:compare_rate' });
+        throw znError(CODES.POLICY_DENIED, 'too many comparisons in a minute. Next step: wait a minute and try again.');
       }
-      return out;
+      const stored = (await state.loadSecrets()).secrets[n];
+      let same = false;
+      if (stored && typeof stored.value === 'string') {
+        const a = crypto.createHash('sha256').update(stored.value).digest();
+        const b = crypto.createHash('sha256').update(value).digest();
+        same = crypto.timingSafeEqual(a, b);
+      }
+      writeAudit({ secret: NAME_RE.test(n) ? n : undefined, mode: 'resolve', decision: 'allow', reason: 'compare' });
+      return same;
+    },
+
+    /* zn env unshadow: the user gets the original .env text back. Plain values go out of the vault,
+     * so the user confirms on the daemon's own channel, and only the copies `zn env shadow` made can be read. */
+    async readBackup(project, name, file) {
+      const n = str(name, 'name', 64);
+      if (!BACKUP_NAME_RE.test(n)) throw znError(CODES.POLICY_DENIED, 'invalid backup name. Next step: use the name zn env shadow printed.');
+      const stored = (await state.loadSecrets()).secrets[n];
+      if (!stored || stored.mode !== 'backup' || typeof stored.value !== 'string') throw znError(CODES.NOT_FOUND, n + ' not found. Next step: check the name zn env shadow printed.');
+      await confirmOutOfBand({
+        kind: 'file',
+        title: 'write the original values of ' + path.basename(String(file || '.env')) + ' back in plain text?',
+        warnings: ['zn env unshadow takes the values out of the vault and writes them in clear text.'],
+        fields: [['Backup', n], ['File', path.basename(String(file || '.env'))], ['Project', String(project)]],
+        footer: 'If you did not just run zn env unshadow, choose Deny.',
+      }, { secret: n, mode: 'file' });
+      writeAudit({ secret: n, mode: 'file', decision: 'ask:yes', reason: 'backup_read_confirmed' });
+      return stored.value;
     },
 
     async audit(event) {
@@ -574,13 +966,70 @@ function makeOps(state, ctl) {
     },
 
     async auditVerify() {
+      await state.loadSecrets();
+      // The encrypted vault remembers the last record (sequence number and
+      // MAC): a lost tail or a replaced one is reported, and the warning is stored.
+      const secrets = state.secrets;
+      const r = audit.verify({ file: auditFile, key: Buffer.from(secrets.auditKey, 'hex'), checkpoint: secrets.auditHead });
+      if (!r.ok && !secrets.auditTamper) recordTamper(state, r.error + (r.line ? ' (record ' + r.line + ')' : ''), null);
+      const t = secrets.auditTamper;
+      if (!t) return r;
+      return Object.assign({}, r, {
+        ok: false,
+        tampered: true,
+        error: 'the audit log was changed behind the vault (noticed ' + t.at + '): ' + t.reason,
+      });
+    },
+
+    /* The audit log for display: verified first. A log that does not verify is
+     * refused (and the tamper mark is stored), never shown. */
+    async auditRead(args) {
+      await state.loadSecrets();
+      const c = chainStatus(state);
+      if (!c.ok) return { ok: false, tampered: c.tampered === true, error: c.error, reason: c.reason, events: [] };
+      const a = args && typeof args === 'object' ? args : {};
+      return { ok: true, records: c.records, events: audit.read({ file: auditFile, since: a.since, limit: a.limit }) };
+    },
+
+    /* The audit log for export (OTLP): verified first, refused otherwise. */
+    async auditExport(args) {
+      await state.loadSecrets();
+      const c = chainStatus(state);
+      if (!c.ok) return { ok: false, tampered: c.tampered === true, error: c.error, line: c.line };
+      const a = args && typeof args === 'object' ? args : {};
+      const r = require('../team/otel').exportAuditFile({ auditFile, since: a.since, installId: a.installId, orgId: a.orgId });
+      return Object.assign({ ok: true }, r);
+    },
+
+    /* The user accepts the log as it is now, after looking into the change.
+     * Needs the vault's own confirmation channel (an agent cannot answer it),
+     * and refuses when the chain itself does not verify. */
+    async auditAcknowledge() {
       const secrets = await state.loadSecrets();
-      const res = audit.verify({ file: auditFile, key: Buffer.from(secrets.auditKey, 'hex') });
-      // Truncation check: the encrypted vault remembers the last record.
-      if (res.ok && secrets.auditHead && res.records < secrets.auditHead.seq) {
-        return { ok: false, records: res.records, error: 'log truncated (vault expects ' + secrets.auditHead.seq + ' records)' };
-      }
-      return res;
+      const t = secrets.auditTamper;
+      if (!t) return { ok: true, cleared: false };
+      await confirmOutOfBand({
+        kind: 'audit_ack',
+        title: 'accept the audit log as it is now?',
+        warnings: ['The vault noticed that the audit log was changed behind it. Accepting makes the log as it is now the reference again; the earlier gap stays unexplained.'],
+        fields: [['Noticed', t.at], ['What', t.reason]],
+        footer: 'If you did not just ask for this in your own terminal, choose Deny.',
+      }, { decision: 'deny', reason: 'audit_ack' });
+      return state.serial(async () => {
+        const cur = state.secrets;
+        const key = Buffer.from(cur.auditKey, 'hex');
+        const chain = audit.verify({ file: auditFile, key });
+        if (!chain.ok) {
+          throw znError(CODES.POLICY_DENIED, 'the audit log does not verify on its own (' + chain.error + '), so it cannot be accepted. Next step: keep a copy of ~/.zn/audit.jsonl as evidence; to start a new log on purpose, see zn vault reset.');
+        }
+        const last = audit.lastRecord(auditFile);
+        cur.auditHead = last ? { seq: last.seq, mac: last.mac } : null;
+        delete cur.auditTamper;
+        state.chainCache = null;
+        appendChecked(state, { decision: 'warn', reason: 'audit_tamper_acknowledged' }, {});
+        await state.saveSecrets();
+        return { ok: true, cleared: true };
+      });
     },
 
     async lock() {
@@ -588,6 +1037,26 @@ function makeOps(state, ctl) {
       return true;
     },
   };
+  return ops;
+}
+
+/* POSIX: the socket, the session key and the directory that holds them must be owned by the daemon's user and closed to
+ * group and others. The directory is always checked; a file is checked when it exists (a stale one before the daemon
+ * starts), and must exist when `strict`. Windows relies on the ACL the user profile gives ~/.zn (see the threat model). */
+function assertPrivateEndpoint(ep, strict) {
+  if (!ep.unix || typeof process.getuid !== 'function') return;
+  const me = process.getuid();
+  const dir = path.dirname(ep.address);
+  for (const file of [dir, ep.address, ep.keyFile]) {
+    let st;
+    try { st = fs.lstatSync(file); } catch (err) {
+      if (err.code === 'ENOENT' && file !== dir && !strict) continue;
+      throw znError(CODES.POLICY_DENIED, 'the vault will not start: cannot check ' + path.basename(file) + ' (' + (err.code || 'error') + '). Next step: check the permissions of ' + dir + ' (it must be yours, mode 0700).');
+    }
+    if (st.isSymbolicLink() || st.uid !== me || (st.mode & 0o077) !== 0) {
+      throw znError(CODES.POLICY_DENIED, 'the vault will not start: ' + path.basename(file) + ' is not private to your user. Next step: check the permissions of ' + dir + ' (it must be yours, mode 0700).');
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -608,7 +1077,9 @@ async function serve(opts) {
   store.ensureLayout(o);
   const ep = endpoint(o);
 
-  if (await isRunning(o)) throw znError(CODES.POLICY_DENIED, 'vault already unlocked. Next step: nothing to do. To unlock again, run zn lock in your own terminal first, or, if you are an agent, ask the user to do it.');
+  if (await isRunning(o)) throw znError(CODES.POLICY_DENIED, messages.vaultAlreadyUnlocked());
+  // Before anything is bound or written: the folder (and any stale socket or key in it) must be private to this user.
+  assertPrivateEndpoint(ep);
   if (ep.unix) { try { fs.unlinkSync(ep.address); } catch (err) { /* stale socket */ } }
 
   const state = new VaultState(o.identity, recipient, o);
@@ -642,7 +1113,11 @@ async function serve(opts) {
   // zn Team: refresh the organization policy and upload the audit log while
   // unlocked (soon after unlock, then every teamSyncMs). No-op outside a team.
   const teamSyncMs = o.teamSyncMs === 0 ? 0 : (o.teamSyncMs || DEFAULT_TEAM_SYNC_MS);
-  const teamSync = () => { if (!closed && state.secrets && state.secrets.team) ops.teamSync({}).catch(() => {}); };
+  // Nobody is waiting for this one: teamSync records its own failures (last_sync, one local alert) before they reach this catch.
+  const teamSync = () => {
+    const pendingRevocation = state.secrets && Array.isArray(state.secrets.pendingRevocations) && state.secrets.pendingRevocations.length > 0;
+    if (!closed && state.secrets && (state.secrets.team || pendingRevocation)) ops.teamSync({}).catch(() => {});
+  };
   const teamTimer = teamSyncMs ? setInterval(teamSync, teamSyncMs) : null;
   const teamFirst = teamSyncMs ? setTimeout(teamSync, 5000) : null;
   if (teamTimer) teamTimer.unref();
@@ -660,11 +1135,11 @@ async function serve(opts) {
     try {
       await state.serial(async () => {
         if (state.secrets) {
-          const secrets = state.secrets;
-          const rec = audit.append({ mode: reason === 'lock' ? 'lock' : 'expire', decision: 'allow', reason },
-            { file: state.paths.auditFile, key: Buffer.from(secrets.auditKey, 'hex') });
-          secrets.auditHead = { seq: rec.seq, mac: rec.mac };
-          await state.saveSecrets();
+          try {
+            appendChecked(state, { mode: reason === 'lock' ? 'lock' : 'expire', decision: 'allow', reason }, {});
+          } finally {
+            await state.saveSecrets();
+          }
         }
       });
     } catch (err) { /* best effort */ }
@@ -714,6 +1189,7 @@ async function serve(opts) {
             return;
           }
           stage = 'ready';
+          if (!closed) bumpIdle();
           send({ ok: true });
           continue;
         }
@@ -747,18 +1223,62 @@ async function serve(opts) {
       resolve();
     });
   }).catch((err) => {
-    if (err && err.code === 'EADDRINUSE') throw znError(CODES.POLICY_DENIED, 'vault already unlocked. Next step: nothing to do. To unlock again, run zn lock in your own terminal first, or, if you are an agent, ask the user to do it.');
+    if (err && err.code === 'EADDRINUSE') throw znError(CODES.POLICY_DENIED, messages.vaultAlreadyUnlocked());
     throw err;
   });
   if (ep.unix) fs.chmodSync(ep.address, 0o600);
-  store.writePrivateFile(ep.keyFile, sessionKey.toString('hex'));
-  bumpIdle();
+  // Node cannot read the peer's credentials (SO_PEERCRED) from a Unix socket, so the kernel's file permissions are
+  // the peer check: the socket is checked before the session key is written, and all three again after.
+  // Windows: the key file and the pipe get explicit owner-only permissions, read back.
+  // If any of these cannot be set or checked, the daemon does not stay up.
+  try {
+    if (ep.unix) assertPrivateEndpoint(ep);
+    store.writePrivateFile(ep.keyFile, sessionKey.toString('hex'));
+    if (!ep.unix) {
+      const acl = o.winacl || winacl;
+      acl.ensurePrivate(ep.keyFile, { dir: false });
+      acl.ensurePipe(ep.address);
+    }
+    assertPrivateEndpoint(ep, true);
+  } catch (err) { await shutdown('lock'); throw err; }
+  let unlockFailure = null;
+  let adoptedRecords = 0;
   await state.serial(async () => {
-    const rec = audit.append({ mode: 'unlock', decision: 'allow', reason: 'ttl:' + Math.round(ttlMs / 60000) + 'm' },
-      { file: state.paths.auditFile, key: Buffer.from(state.secrets.auditKey, 'hex') });
-    state.secrets.auditHead = { seq: rec.seq, mac: rec.mac };
-    await state.saveSecrets();
+    // Check the log against the vault's checkpoint BEFORE the unlock record is
+    // written: that record would otherwise continue from whatever tail is there.
+    try {
+      const pre = chainStatus(state, { force: true });
+      // A failed check has stored the tamper mark (chainStatus).
+      if (pre.ok && !state.secrets.auditTamper) {
+        // The log verifies and carries the checkpoint record. Records after it were written
+        // before a crash or a restored secrets.age could save the newer checkpoint: adopt them.
+        const tail = audit.lastRecord(state.paths.auditFile);
+        const prior = state.secrets.auditHead;
+        if (tail && prior && Number.isInteger(tail.seq) && tail.seq > prior.seq) adoptedRecords = tail.seq - prior.seq;
+        if (tail) state.secrets.auditHead = { seq: tail.seq, mac: tail.mac };
+      }
+    } catch (err) {
+      recordTamper(state, 'the audit log cannot be read', null);
+    }
+    try {
+      // Make every adoption visible in the log: those records were written but never checkpointed.
+      if (adoptedRecords > 0) appendChecked(state, { mode: 'unlock', decision: 'warn', reason: 'audit_tail_adopted_after_unclean_shutdown:' + adoptedRecords }, {});
+      appendChecked(state, { mode: 'unlock', decision: 'allow', reason: 'ttl:' + Math.round(ttlMs / 60000) + 'm' }, {});
+    } catch (err) {
+      unlockFailure = err;
+    } finally {
+      await state.saveSecrets();
+    }
   });
+  if (unlockFailure) {
+    // The log cannot be continued (its last line is unreadable): do not leave a half-started daemon.
+    await shutdown('error');
+    throw znError(CODES.LOCKED, 'the audit log cannot be read, so the vault stays locked. The vault keeps a warning about it. Next step: keep a copy of ~/.zn/audit.jsonl as evidence; to start a new log on purpose, see zn vault reset.');
+  }
+  // The idle clock starts only now that the daemon is ready to serve, not
+  // before the first (possibly slow) write above: otherwise a slow disk can
+  // expire the session before the first client connects.
+  if (!closed) bumpIdle();
 
   return { address: ep.address, close: () => shutdown('lock'), expiresAt: ctl.expiresAt };
 }
@@ -785,7 +1305,7 @@ async function isRunning(opts) {
  */
 async function unlock(opts) {
   const o = opts || {};
-  if (await isRunning(o)) throw znError(CODES.POLICY_DENIED, 'vault already unlocked. Next step: nothing to do. To unlock again, run zn lock in your own terminal first, or, if you are an agent, ask the user to do it.');
+  if (await isRunning(o)) throw znError(CODES.POLICY_DENIED, messages.vaultAlreadyUnlocked());
   let created = false;
   let identity;
   if (!keychain.readMeta(o)) {
@@ -807,13 +1327,13 @@ async function unlock(opts) {
     env,
   });
   const ready = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(znError(CODES.LOCKED, 'daemon did not start in time')), 20000);
+    const timer = setTimeout(() => reject(znError(CODES.LOCKED, messages.vaultStartTimeout())), 20000);
     child.once('message', (m) => {
       clearTimeout(timer);
       if (m && m.ready) resolve(m);
       else reject(znError((m && m.code) || CODES.LOCKED, (m && m.message) || 'daemon failed to start'));
     });
-    child.once('exit', (code) => { clearTimeout(timer); reject(znError(CODES.LOCKED, 'daemon exited during start (' + code + ')')); });
+    child.once('exit', (code) => { clearTimeout(timer); reject(znError(CODES.LOCKED, messages.vaultStartExited(code))); });
   });
   child.stdin.end(JSON.stringify({ identity }) + '\n');
   identity = null;
@@ -832,7 +1352,7 @@ async function unlock(opts) {
  */
 async function unlockForeground(opts) {
   const o = opts || {};
-  if (await isRunning(o)) throw znError(CODES.POLICY_DENIED, 'vault already unlocked. Next step: nothing to do. To unlock again, run zn lock in your own terminal first, or, if you are an agent, ask the user to do it.');
+  if (await isRunning(o)) throw znError(CODES.POLICY_DENIED, messages.vaultAlreadyUnlocked());
   let created = false;
   let identity;
   if (!keychain.readMeta(o)) {
@@ -891,4 +1411,4 @@ if (require.main === module && process.argv.includes('--serve')) {
   daemonMain(process.argv.slice(2));
 }
 
-module.exports = { serve, unlock, unlockForeground, lock, isRunning, endpoint, DEFAULT_TTL_MS, DEFAULT_IDLE_MS, PROTOCOL };
+module.exports = { serve, unlock, unlockForeground, lock, isRunning, endpoint, DEFAULT_TTL_MS, DEFAULT_IDLE_MS, PROTOCOL, DESTINATION_POLICY, assertPrivateEndpoint };

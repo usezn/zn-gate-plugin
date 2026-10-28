@@ -5,6 +5,10 @@
  * a sensitive name (API_KEY, DB_PASSWORD, authToken...) and the value is at
  * least 8 characters and is not a placeholder, a reference or code.
  *
+ * Also caught: values in backticks, JSON pasted with escaped quotes
+ * (\"api_key\": \"...\"), quoted values with spaces or escaped quotes,
+ * `setx NAME value` and `Authorization: Bearer|Basic <token>` headers.
+ *
  * Unlike the structured layer, the value does not have to look random: a
  * person typing a credential into a prompt rarely pastes a template, and a
  * blocked prompt only has to be rephrased. Tool calls and tool output never
@@ -19,10 +23,22 @@ const { looksNonSecret } = require('./exact');
 const MAX_PROMPT = 1024 * 1024;  // longer prompts: only the first 1 MiB is checked here
 const MIN_VALUE = 8;
 
-/* NAME, optionally quoted, then `=` or `:`, then the value, optionally
- * quoted. The name must not follow a word character, `$`, `${`, `.` or `-`
- * (shell and code references such as $API_KEY, ${API_KEY}, env.API_KEY). */
-const ASSIGN_RE = /(?<![A-Za-z0-9_$.-])(?<!\$\{)(["']?)([A-Za-z_][A-Za-z0-9_-]{1,127})\1[ \t]*(=|:)[ \t]*(["']?)([^\s"'`]{1,512})/g;
+/* NAME, optionally quoted (also with escaped quotes, as in pasted JSON logs),
+ * then `=` or `:`, then the value, optionally quoted. The name must not
+ * follow a word character, `$`, `${`, `.` or `-` (shell and code references
+ * such as $API_KEY, ${API_KEY}, env.API_KEY). The value token stops at
+ * whitespace and quotes; a backslash is kept unless it escapes a quote. */
+const NAME_QUOTE = '((?:\\\\{0,2}["\'])?)';
+const VALUE_QUOTE = '((?:\\\\{0,2}["\'`])?)';
+const VALUE_TOKEN = '((?:[^\\s"\'`\\\\]|\\\\(?!["\'`])){1,512})';
+const NAME = '([A-Za-z_][A-Za-z0-9_-]{1,127})';
+const ASSIGN_RE = new RegExp('(?<![A-Za-z0-9_$.-])(?<!\\$\\{)' + NAME_QUOTE + NAME + '\\1[ \\t]*(=|:)[ \\t]*' + VALUE_QUOTE + VALUE_TOKEN, 'g');
+
+/* `setx NAME value` (Windows): no separator, the value follows the name. */
+const SETX_RE = new RegExp('(?<![A-Za-z0-9_$.-])setx[ \\t]+(?:/[mM][ \\t]+)?' + NAME_QUOTE + NAME + '\\1[ \\t]+' + VALUE_QUOTE + VALUE_TOKEN, 'gi');
+
+/* `Authorization: Bearer <token>`, also quoted, escaped or after `-H`. */
+const AUTH_RE = new RegExp('(?<![A-Za-z0-9_$.-])(?:proxy-)?authorization(?:\\\\{0,2}["\'])?[ \\t]*[:=][ \\t]*(?:\\\\{0,2}["\'`])?(?:bearer|basic|token)[ \\t]+([A-Za-z0-9._~+/=-]{8,512})', 'gi');
 
 /* Values that are references or code, not credentials. */
 const REFERENCE_RE = /^(?:process\.env|os\.environ|os\.getenv|env\.|secrets\.|vars\.|config\.|settings\.|self\.|this\.|arn:)/i;
@@ -62,27 +78,108 @@ function promptValue(v, sep) {
   return true;
 }
 
+/* Closing index of a quoted value that starts at `from`, on the same line,
+ * or -1. A plain quote can be escaped inside the value with a backslash; an
+ * escaped opener (\", pasted JSON) closes only on the same escaped quote. */
+function closeOf(t, from, opener) {
+  const q = opener[opener.length - 1];
+  const limit = Math.min(t.length, from + 513);
+  if (opener.length > 1) {
+    const i = t.indexOf(opener, from);
+    if (i < 0 || i > limit) return -1;
+    return /[\r\n]/.test(t.slice(from, i)) ? -1 : i;
+  }
+  for (let i = from; i < limit; i++) {
+    const c = t[i];
+    if (c === '\n' || c === '\r') return -1;
+    if (c === '\\' && i + 1 < limit) { i++; continue; }
+    if (c === q) return i;
+  }
+  return -1;
+}
+
+/* A quoted value that holds spaces or escaped quotes. Looser on characters
+ * than promptValue, but after `:` a value with only letters and spaces is
+ * prose ("password: \"must be long\""). */
+function quotedValue(v, sep) {
+  if (v.length < MIN_VALUE || v.length > 512) return false;
+  if (/[^\x20-\x7e]/.test(v) || /^\s|\s$/.test(v)) return false;
+  if (/^[$%<{[(*&!|>@~=-]/.test(v) || /__ZN_[A-Z0-9_]+__/.test(v)) return false;
+  if (REFERENCE_RE.test(v) || /[(){}[\]<>;|]/.test(v)) return false;
+  if (isPlaceholder(v) || DEMO_RE.test(v) || looksNonSecret(v)) return false;
+  const words = v.split(/ +/);
+  if (words.length > 8) return false;
+  if (words.some((w) => w.length > 3 && isPlaceholder(w))) return false;
+  if (sep === ':' && !/[0-9\\!@#%^&*+=_~/.-]/.test(v)) return false;
+  return true;
+}
+
+/* Another assignment inside the quotes: the quotes belong to something else. */
+const OTHER_ASSIGN_RE = /(?:^| )[A-Za-z_][A-Za-z0-9_-]*[=:]/;
+
+function result(start, end, name) {
+  return { start, end, type: 'CREDENTIAL', name: name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/-/g, '_').toUpperCase(), source: 'pattern' };
+}
+
+/* Judge one NAME / separator / value candidate. `token` is the first
+ * whitespace-free piece of the value, `opener` the quote in front of it. */
+function judge(t, name, sep, opener, valueStart, token, nameQuoted) {
+  if (sep === ':' && !nameQuoted && !identifierLike(name)) return null;  // a quoted key is never prose
+  let raw = null;
+  if (opener) {
+    const close = closeOf(t, valueStart, opener);
+    if (close > valueStart) {
+      const inner = t.slice(valueStart, close);
+      if (inner !== token) {
+        if (inner.length < MIN_VALUE || OTHER_ASSIGN_RE.test(inner)) return null;
+        raw = inner;
+      }
+    }
+  }
+  if (!sensitiveKey(name)) return null;
+  if (raw !== null) return quotedValue(raw, sep) ? result(valueStart, valueStart + raw.length, name) : null;
+  if (/(?:\.\.\.|…)$/.test(token)) return null;   // elided: "zn_live_..."
+  const value = trimTrailing(token);
+  if (!promptValue(value, sep)) return null;
+  return result(valueStart, valueStart + value.length, name);
+}
+
+/* Bearer / Basic credential: random-looking, not a placeholder or reference. */
+const AUTH_PLACEHOLDER_RE = /^(?:your|my|an?|the|insert|put|paste|token|api|key|secret|access|auth|bearer|xxx|redacted)[-_a-z]*$/i;
+function authToken(v) {
+  if (v.length < MIN_VALUE || /(?:\.\.\.|…)$/.test(v)) return false;
+  if (/__ZN_[A-Z0-9_]+__/.test(v) || isPlaceholder(v) || DEMO_RE.test(v) || looksNonSecret(v)) return false;
+  if (AUTH_PLACEHOLDER_RE.test(v) || /^[-_.=*x]+$/i.test(v) || REFERENCE_RE.test(v)) return false;
+  return /[0-9]/.test(v) || v.length >= 20 || (/[a-z]/.test(v) && /[A-Z]/.test(v) && v.length >= 16);
+}
+
 function findPromptAssignments(text) {
   const out = [];
   if (typeof text !== 'string' || text.length < MIN_VALUE) return out;
   const t = text.length > MAX_PROMPT ? text.slice(0, MAX_PROMPT) : text;
-  ASSIGN_RE.lastIndex = 0;
   let m;
+  ASSIGN_RE.lastIndex = 0;
   while ((m = ASSIGN_RE.exec(t)) !== null) {
-    const name = m[2];
-    const sep = m[3];
     const start = m.index + m[0].length - m[5].length;
+    const r = judge(t, m[2], m[3], m[4], start, m[5], !!m[1]);
     // A rejected candidate may hide one inside its value
     // (https://host/path?api_key=...): scan again from the value.
-    const retry = () => { ASSIGN_RE.lastIndex = start; };
-    if (sep === ':' && !m[1] && !identifierLike(name)) { retry(); continue; }  // a quoted key is never prose
-    if (!sensitiveKey(name)) { retry(); continue; }
-    if (/(?:\.\.\.|…)$/.test(m[5])) { retry(); continue; }   // elided: "zn_live_..."
-    const value = trimTrailing(m[5]);
-    if (!promptValue(value, sep)) { retry(); continue; }
-    out.push({ start, end: start + value.length, type: 'CREDENTIAL', name: name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/-/g, '_').toUpperCase(), source: 'pattern' });
+    if (r) out.push(r); else ASSIGN_RE.lastIndex = start;
   }
-  return out;
+  SETX_RE.lastIndex = 0;
+  while ((m = SETX_RE.exec(t)) !== null) {
+    const start = m.index + m[0].length - m[4].length;
+    const r = judge(t, m[2], '=', m[3], start, m[4], true);
+    if (r) out.push(r); else SETX_RE.lastIndex = start;
+  }
+  AUTH_RE.lastIndex = 0;
+  while ((m = AUTH_RE.exec(t)) !== null) {
+    const start = m.index + m[0].length - m[1].length;
+    const tok = trimTrailing(m[1]);
+    if (authToken(tok)) out.push(result(start, start + tok.length, 'AUTHORIZATION'));
+  }
+  out.sort((a, b) => a.start - b.start);
+  return out.filter((r, i) => i === 0 || r.start !== out[i - 1].start);
 }
 
 module.exports = { findPromptAssignments };

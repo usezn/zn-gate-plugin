@@ -11,6 +11,50 @@ const path = require('path');
 const { writeFileAtomic } = require('../broker/files');
 const { shQuote, portablePath, windowsCommand, windowsCommandScript } = require('../shell-quote');
 
+/**
+ * How a JSON file was written, so it can be written back the same way:
+ * { eol: '\n' | '\r\n', indent: number of spaces | '\t', bom: boolean, trailingNewline: boolean }.
+ * A file that does not exist (or is blank) gets zn's usual format: LF, two spaces, a final newline.
+ */
+const DEFAULT_STYLE = Object.freeze({ eol: '\n', indent: 2, bom: false, trailingNewline: true });
+
+function detectStyle(text) {
+  const bom = text.charCodeAt(0) === 0xFEFF;
+  const body = bom ? text.slice(1) : text;
+  const style = { ...DEFAULT_STYLE, bom };
+  const nl = body.indexOf('\n');
+  if (nl < 0) return style; // one line (minified): written out the usual way
+  style.eol = body[nl - 1] === '\r' ? '\r\n' : '\n';
+  const m = /\n([ \t]+)\S/.exec(body);
+  if (m) style.indent = m[1][0] === '\t' ? '\t' : Math.min(m[1].length, 10);
+  style.trailingNewline = /\n$/.test(body);
+  return style;
+}
+
+/** JSON text for data in the given style (default: LF, two spaces, final newline). */
+function formatJson(data, style = DEFAULT_STYLE) {
+  let out = JSON.stringify(data, null, style.indent);
+  if (style.eol !== '\n') out = out.replace(/\n/g, style.eol);
+  if (style.trailingNewline) out += style.eol;
+  return (style.bom ? '\uFEFF' : '') + out;
+}
+
+// The style each parsed object was read in; writeJson and stringifyJson look it up, so callers keep passing plain data.
+const STYLES = new WeakMap();
+
+/** Parses JSON text (a leading BOM is allowed) and remembers its style for the data object. Throws SyntaxError. */
+function parseJson(text) {
+  const style = detectStyle(text);
+  const data = JSON.parse(style.bom ? text.slice(1) : text);
+  if (data !== null && typeof data === 'object') STYLES.set(data, style);
+  return data;
+}
+
+/** JSON text for data, in the style it was read in (see parseJson) or the default one. */
+function stringifyJson(data) {
+  return formatJson(data, STYLES.get(data) || DEFAULT_STYLE);
+}
+
 function readJson(file) {
   let text;
   try {
@@ -19,10 +63,10 @@ function readJson(file) {
     if (err.code === 'ENOENT') return {};
     throw err;
   }
-  if (!text.trim()) return {};
+  if (!text.replace(/^\uFEFF/, '').trim()) return {};
   let data;
   try {
-    data = JSON.parse(text);
+    data = parseJson(text);
   } catch (err) {
     throw new Error('cannot parse ' + file + ': ' + err.message + ' (left unchanged)');
   }
@@ -58,7 +102,7 @@ function writeJson(file, data) {
   const target = realFile(file);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const mode = fs.existsSync(target) ? fs.statSync(target).mode & 0o777 : 0o644;
-  writeFileAtomic(target, JSON.stringify(data, null, 2) + '\n', mode);
+  writeFileAtomic(target, stringifyJson(data), mode);
 }
 
 /** A path as one sh word (single quotes; see lib/shell-quote.js). */
@@ -91,7 +135,7 @@ function hookCommand(agentId, opts = {}) {
  */
 function hookCommandWindows(agentId, opts = {}) {
   if ((opts.scope || 'user') === 'project') return 'zn hook ' + agentId;
-  return windowsCommand(opts.nodePath || process.execPath, [opts.runnerPath || runnerPath()], [agentId]);
+  return windowsCommand(opts.nodePath || process.execPath, [opts.runnerPath || runnerPath()], [agentId], { encoded: opts.encodedCommand === true });
 }
 
 /**
@@ -101,10 +145,14 @@ function hookCommandWindows(agentId, opts = {}) {
  */
 function isOurs(command, agentId) {
   if (typeof command !== 'string') return false;
+  // zn's launcher script (lib/agents/launcher.js): '<dir>/zn-hook-<agent>.sh' <Event>
+  if (new RegExp("zn-hook-" + agentId + "\\.sh'? [A-Za-z]+\\s*$").test(command)) return true;
+  // The project hook with its own start guard (lib/agents/launcher.js projectShCommand).
+  if (require('./launcher').isProjectGuard(command, agentId)) return true;
   const re = new RegExp('(\\bhook ' + agentId + '|hooks[\\\\/]runner\\.js["\']? ' + agentId + ')\\s*$');
   if (re.test(command)) return true;
   const script = windowsCommandScript(command);
   return script !== null && re.test(script);
 }
 
-module.exports = { readJson, hooksOf, backup, writeJson, quoteArg, runnerPath, hookCommand, hookCommandWindows, isOurs };
+module.exports = { readJson, parseJson, stringifyJson, formatJson, detectStyle, hooksOf, backup, writeJson, quoteArg, runnerPath, hookCommand, hookCommandWindows, isOurs };

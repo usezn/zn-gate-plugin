@@ -3,6 +3,7 @@
 
 const crypto = require('crypto');
 const { RULES, BY_ID, RANK, SECURITY_SEVERITY } = require('./rules');
+const { AGENT_PLACES } = require('./index');
 
 const DOCS_URL = 'https://github.com/usezn/zn/blob/main/docs/audit.md';
 
@@ -17,7 +18,12 @@ function summarize(result, failOn) {
     failOn,
     failed,
     agents: result.agents,
+    agentStatus: (result.agents || []).map((a) => {
+      const n = (result.agentFiles || {})[a] || 0;
+      return { agent: a, files: n, checked: n > 0 };
+    }),
     truncated: Boolean(result.truncated),
+    skippedDirs: (result.skippedDirs || []).length,
   };
 }
 
@@ -39,6 +45,7 @@ function toJson(result, meta) {
       fix: f.fix,
       references: f.references,
     })),
+    skippedDirs: (result.skippedDirs || []).map((d) => ({ dir: d.dir, reason: d.reason })),
     summary: summarize(result, meta.failOn),
   }, null, 2) + '\n';
 }
@@ -78,9 +85,26 @@ function toText(result, meta) {
   let tail = total + ' (' + counts.critical + ' critical, ' + counts.high + ' high, ' + counts.medium + ' medium, ' + counts.low + ' low) in ' + s.files + ' file' + (s.files === 1 ? '' : 's') + '.';
   if (meta.failOn === 'none') tail += ' Not failing (--fail-on none).';
   else tail += s.failed ? ' Failing: severity >= ' + meta.failOn + '.' : ' Nothing at or above ' + meta.failOn + '.';
-  if (s.findings === 0) tail = 'No findings in ' + s.files + ' agent file' + (s.files === 1 ? '' : 's') + '.';
+  // An agent that was asked for but had nothing to read is said so out loud:
+  // "no findings" would read as "checked and clean".
+  const missed = result.explicitAgents ? s.agentStatus.filter((a) => !a.checked).map((a) => a.agent) : [];
+  if (s.findings === 0) {
+    tail = s.files === 0
+      ? 'Nothing was checked: no agent instruction or config files were found.'
+      : (missed.length ? 'No findings in the ' + s.files + ' file' + (s.files === 1 ? '' : 's') + ' that ' + (s.files === 1 ? 'was' : 'were') + ' read.' : 'No findings in ' + s.files + ' agent file' + (s.files === 1 ? '' : 's') + '.');
+  }
   lines.push(s.failed ? paint('31;1', tail) : tail);
+  for (const a of missed) {
+    lines.push(a + ': not checked (no instruction or config files found where zn looks: ' + (AGENT_PLACES[a] || 'its usual places') + ')');
+  }
   if (result.truncated) lines.push('Note: the scan stopped early (see ZNA020); some files were not checked.');
+  const dirs = result.skippedDirs || [];
+  if (dirs.length) {
+    lines.push('');
+    lines.push('Directories not read (' + dirs.length + '):');
+    for (const d of dirs.slice(0, 20)) lines.push('  ' + safeText(d.dir) + ' (' + d.reason + ')');
+    if (dirs.length > 20) lines.push('  ... and ' + (dirs.length - 20) + ' more');
+  }
   return lines.join('\n') + '\n';
 }
 
@@ -156,4 +180,4 @@ function toSarif(result, meta) {
   }, null, 2) + '\n';
 }
 
-module.exports = { toJson, toText, toSarif, summarize, BY_ID };
+module.exports = { toJson, toText, toSarif, summarize, safeText, BY_ID };

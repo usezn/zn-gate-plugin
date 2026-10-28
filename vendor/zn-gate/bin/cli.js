@@ -12,7 +12,7 @@
   var msg = 'zn-gate needs Node.js 18 or later, and this is Node.js ' + process.version + '.\n' +
     'Install the LTS version from https://nodejs.org/ (or run: nvm install --lts), then run the command again.\n';
   var agentRun = { hook: 1, run: 1, mcp: 1, 'secrets-mcp': 1, 'mcp-shield': 1, shield: 1 };
-  if (agentRun.hasOwnProperty(process.argv[2])) {
+  if (Object.prototype.hasOwnProperty.call(agentRun, process.argv[2])) {
     process.stderr.write('Warning: ' + msg);
     return;
   }
@@ -20,17 +20,33 @@
   process.exit(1);
 })();
 
+// Output piped into a reader that closes early (for example `zn-gate check | head -1`) fails with EPIPE.
+// Later writes are dropped quietly and the command finishes with the exit status it would have had.
+// Any other stdout error is still thrown, as before.
+let stdoutClosed = false;
+process.stdout.on('error', (err) => {
+  if (err && (err.code === 'EPIPE' || (stdoutClosed && err.code === 'ERR_STREAM_DESTROYED'))) {
+    stdoutClosed = true;
+    return;
+  }
+  throw err;
+});
+
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { startMcpServer } = require('../lib/mcp');
 const { startMcpShield } = require('../lib/shield');
-const { scanEnvironments, configureEnvironments } = require('../lib/init');
-const { logEvidence, verifyEvidenceLedger, getEvidenceStats, exportEvidenceLedger, startEvidenceUi, recoveryHint, EVIDENCE_FILE } = require('../lib/evidence');
+const { configureEnvironments } = require('../lib/init');
+const { verifyEvidenceLedger, getEvidenceStats, exportEvidenceLedger, startEvidenceUi, recoveryHint, EVIDENCE_FILE } = require('../lib/evidence');
 const { analyze, analyzeLocal, isCloudEnabled, resolveEndpoint, usesStoredKey, RULES_VERSION } = require('../lib/client');
 const { evaluate, redactSecrets, redactScanSecrets, redactScanRules, SECRET_PATTERNS } = require('../lib/rules');
 const { SCRUB_RULES_VERSION } = require('../lib/scrub/patterns');
 const { AUDIT_RULES_VERSION } = require('../lib/audit/rules');
 const { styles, sym, ruleLine } = require('../lib/term');
+const mcpSecrets = require('../lib/mcp-secrets');
+const { pruneInfo, SCAN_DIRS } = require('../lib/prune');
+const { safeText } = require('../lib/audit/report');
 // Colors are decided once per run: NO_COLOR, TERM=dumb or a stdout that is not a terminal turn them off.
 const col = styles(process.stdout, process.env);
 
@@ -38,14 +54,14 @@ const col = styles(process.stdout, process.env);
 // scan never sees BEGIN and END together, so these run on the whole file.
 const MULTILINE_SECRET_RULES = SECRET_PATTERNS
   .filter((p) => p.id === 'secret:private_key')
-  .map((p) => ({ id: p.id, pattern: p.pattern, header: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ }));
+  .map((p) => ({ id: p.id, pattern: p.pattern, header: /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/ }));
 
 // A BEGIN marker with no END (a key cut short when pasted or truncated): the
 // lines after it that look like PEM headers or base64 are treated as key
 // material, up to the first empty or other line (an encrypted key has one
 // empty line after its Proc-Type / DEK-Info headers, which is kept).
-const KEY_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
-const KEY_END = /-----END [A-Z ]*PRIVATE KEY-----/;
+const KEY_BEGIN = /-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
+const KEY_END = /-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----/;
 const KEY_BODY = /^(?:[A-Za-z0-9+/=]{16,}|[A-Za-z-]+: )/;
 const KEY_HEADER = /^[A-Za-z-]+: /;
 const TRUNCATED_KEY_REASON = 'Exposed credential detected by DLP filter (private key without an END marker)';
@@ -222,12 +238,18 @@ SECRETS (values stay on this machine; agents only see __ZN_<NAME>__ markers):
   secret import FILE  Copy the secret values of a .env file into the vault
   secret adopt TOKEN  Store a value the scrubber detected (e.g. AWS_KEY_1) as a named secret
   env shadow [FILE]   Move .env values into the vault and leave markers in the file
-  run -- <command>    Run a command with markers replaced by values (allowed commands only)
+  run -- <command>    Run a command with secrets in its environment (allowed commands only)
                       and its output masked [--secrets A,B to set env vars]
+                      (a marker in the command's arguments is refused, never filled in)
   secret log          Show the local audit log of secret use [--since 1h] (same as vault log)
   hooks install <agent> [--project]
-                      Install zn's hooks for claude-code, codex, cursor or opencode
+                      Install zn's hooks for ${require('../lib/agents').listAdapters().join(', ')}
                       (zn-gate init picks the right setup for each agent)
+  hooks uninstall <agent> [--project]
+                      Remove zn's hooks for that agent again
+  uninstall           Remove zn-gate from this computer in one step: the Claude Code plugin, zn's
+                      hooks, wrapped MCP servers. Shows the plan first; the vault is only deleted if
+                      you confirm it separately [--dry-run]. Your own terminal only
   check               Show that zn blocks your agent from reading a fake secret
                       (also: doctor). Safe: a temporary folder, nothing is sent
   connect             Optional: turn on the cloud check for analyze_prompt. Opens usezn.com,
@@ -252,7 +274,11 @@ OPTIONS:
                       512-token windows, up to 20) or off (first 512 tokens only)
   --all, --code       Include source code files in security scan
   --include <exts>    Custom extensions to scan (e.g. .rst,.xml)
+  --allow-partial     scan: exit 0 even when some files or folders were not read
+                      (they are still listed). Reading no file at all stays an error (exit 3)
   --exclude <dirs>    Additional directories to exclude (e.g. fixtures,legacy)
+  --include-home      Also check your own MCP configs (Claude Desktop, Claude Code, Cursor, Codex,
+                      Gemini, Antigravity, OpenCode, Amazon Q) for passwords and keys written in plain text
   --verbose           Enable debug logging to stderr
   -h, --help          Show this help message
 
@@ -264,6 +290,8 @@ VAULT (local, encrypted with age; the key stays in the OS keychain):
   vault log           Show the audit log of secret use [--since 1h]; checks the chain when unlocked
   vault verify        Verify the HMAC-chained audit log of secret use
   vault forget [dir]  Forget the token map of a project (vault locked)
+  vault reset         Lost the passphrase? Set the old vault aside and start empty (your terminal only)
+  vault purge         Delete the vault, every backup and the token maps for good [--yes] (your terminal only)
   vault log export --otlp
                       Export the audit log as OpenTelemetry logs (OTLP/JSON Lines)
                       [--since 7d] [--out FILE]
@@ -273,11 +301,14 @@ TEAM (zn Team: organization policy and audit upload; needs the vault unlocked):
   team status         Organization, policy version and upload state [--json]
   team sync           Download the policy and upload the audit log now
   team leave          Disconnect this machine (confirmed outside the agent)
+  team managed-config Print the managed settings an admin deploys with MDM (nothing is written)
+                      [--agent claude-code|cursor|codex|all] [--os macos|linux|windows|all] [--managed-hooks-only] [--exclusive-mcp] [--json]
 
 INIT --wrap-mcp OPTIONS (each one also selects --wrap-mcp):
   --dry-run           Scan environments and preview changes without modifying configs
   --shadow            Wrap servers in non-blocking shadow mode (alerts logged without drops)
-  --revert            Restore pre-zn backups for all detected configurations
+  --revert            Put back the MCP configs saved before wrapping (does not remove hooks or the
+                      plugin: use zn-gate uninstall for that)
 
 EVIDENCE OPTIONS:
   --verify            Verify the SHA-256 hash chain across all records
@@ -369,15 +400,77 @@ ${ruleLine(process.env, 77)}\n
   }
 }
 
+// The user's own MCP configuration files that exist on this computer.
+function homeMcpFiles() {
+  const home = os.homedir();
+  const xdg = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+  const codexHome = process.env.CODEX_HOME || path.join(home, '.codex');
+  const claudeDesktop = process.platform === 'win32'
+    ? path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'Claude', 'claude_desktop_config.json')
+    : process.platform === 'darwin'
+      ? path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json')
+      : path.join(xdg, 'Claude', 'claude_desktop_config.json');
+  const candidates = [
+    claudeDesktop,
+    path.join(home, '.claude.json'),
+    path.join(home, '.cursor', 'mcp.json'),
+    path.join(codexHome, 'config.toml'),
+    path.join(home, '.gemini', 'settings.json'),
+    path.join(home, '.gemini', 'antigravity', 'mcp_config.json'),
+    path.join(home, '.gemini', 'config', 'mcp_config.json'),
+    path.join(xdg, 'opencode', 'opencode.json'),
+    path.join(xdg, 'opencode', 'opencode.jsonc'),
+    path.join(home, '.aws', 'amazonq', 'mcp.json'),
+  ];
+  // A file is read only when its real path (every link followed) is inside the home folder.
+  let realHome = home;
+  try { realHome = fs.realpathSync(home); } catch (e) { /* keep home */ }
+  return candidates.filter((f) => {
+    try {
+      const rel = path.relative(realHome, fs.realpathSync(f));
+      if (rel.startsWith('..') || path.isAbsolute(rel)) return false;
+      return fs.statSync(f).isFile();
+    } catch (e) { return false; }
+  });
+}
+
+// A file as shown in a report: relative to the current directory; one of the
+// user's own MCP configs (--include-home) outside it is shown as ~/...
+function displayPath(filePath, homeFiles) {
+  if (homeFiles && homeFiles.has(filePath)) {
+    let realHome = os.homedir();
+    try { realHome = fs.realpathSync(realHome); } catch (e) { /* keep it */ }
+    const fromHome = path.relative(realHome, realFolderOf(filePath));
+    if (!fromHome.startsWith('..') && !path.isAbsolute(fromHome)) return '~/' + fromHome.split(path.sep).join('/');
+  }
+  return relativeToCwd(filePath);
+}
+
+// The folder of a path with every link followed (the name itself is kept), or
+// the path unchanged when it cannot be resolved.
+function realFolderOf(p) {
+  const abs = path.resolve(p);
+  try { return path.join(fs.realpathSync(path.dirname(abs)), path.basename(abs)); } catch (e) { return abs; }
+}
+
+// A path relative to the current directory. Both sides are resolved first: on
+// macOS the temporary folder is /var/..., a link to /private/var/..., and the
+// current directory is reported as /private/var/..., so comparing them as
+// they are gives "../../private/var/...".
+function relativeToCwd(filePath) {
+  let cwd = process.cwd();
+  try { cwd = fs.realpathSync(cwd); } catch (e) { /* keep it */ }
+  return path.relative(cwd, realFolderOf(filePath));
+}
+
 function scanDirectory(targetPath, includeCode = false, options = {}) {
-  const IGNORED_DIRS = new Set([
-    'node_modules', '.git', '.next', 'dist', 'build', '.turbo', 'vendor',
-    '.idea', '.vscode', 'test', 'tests', '__tests__', 'target',
-  ]);
+  const IGNORED_DIRS = SCAN_DIRS;
+  // Names the user passes with --exclude are skipped everywhere and never reported.
+  const userExcluded = new Set();
   if (options.exclude) {
     options.exclude.split(',').forEach(d => {
       const trimmed = d.trim();
-      if (trimmed) IGNORED_DIRS.add(trimmed);
+      if (trimmed) userExcluded.add(trimmed);
     });
   }
   
@@ -397,11 +490,16 @@ function scanDirectory(targetPath, includeCode = false, options = {}) {
   // Files that match the scan but are not read, reported in the summary.
   const skipped = [];
   filesToScan.skipped = skipped;
+  // Directories that are not entered, reported next to the skipped files.
+  const skippedDirs = [];
+  filesToScan.skippedDirs = skippedDirs;
 
-  function walk(current) {
+  function walk(current, isRoot = false) {
     let stat;
     try {
-      stat = fs.lstatSync(current);
+      // The folder or file the user named is followed when it is a link; links
+      // found inside the tree are never followed (loops, escapes).
+      stat = isRoot ? fs.statSync(current) : fs.lstatSync(current);
     } catch (e) {
       return;
     }
@@ -409,29 +507,47 @@ function scanDirectory(targetPath, includeCode = false, options = {}) {
 
     if (stat.isDirectory()) {
       const base = path.basename(current);
-      if (IGNORED_DIRS.has(base)) return;
+      // The directory you pass is always read, whatever its name.
+      if (current !== targetPath) {
+        if (userExcluded.has(base)) return;
+        if (IGNORED_DIRS.has(base)) {
+          const pruned = pruneInfo(base, path.dirname(current));
+          if (pruned) {
+            if (!pruned.silent) skippedDirs.push({ dir: current, reason: pruned.reason });
+            return;
+          }
+        }
+      }
       let entries = [];
       try {
         entries = fs.readdirSync(current);
       } catch (e) {
+        // A folder that cannot be listed is reported, not skipped in silence: its files were not scanned.
+        skippedDirs.push({ dir: current, reason: 'cannot be read' });
         return;
       }
+      // Editor settings are not scanned; the MCP servers of VS Code are.
+      if (base.toLowerCase() === '.vscode') entries = entries.filter((e) => e.toLowerCase() === 'mcp.json');
       for (const entry of entries) {
         walk(path.join(current, entry));
       }
-    } else if (stat.isFile()) {
+    } else {
       const ext = path.extname(current).toLowerCase();
       const base = path.basename(current).toLowerCase();
-      const isCandidate = SCANNABLE_EXTS.has(ext) || base.startsWith('.env') || KEY_FILE_NAMES.has(path.basename(current));
-      if (isCandidate && stat.size < 2 * 1024 * 1024) {
+      // The file you name is read whatever its extension.
+      const isCandidate = isRoot || SCANNABLE_EXTS.has(ext) || base.startsWith('.env') || KEY_FILE_NAMES.has(path.basename(current));
+      if (!isCandidate) return;
+      if (!stat.isFile()) {
+        skipped.push({ file: current, reason: 'not a regular file' });
+      } else if (stat.size < 2 * 1024 * 1024) {
         filesToScan.push(current);
-      } else if (isCandidate) {
+      } else {
         skipped.push({ file: current, reason: '2 MiB or larger' });
       }
     }
   }
 
-  walk(targetPath);
+  walk(targetPath, true);
   return filesToScan;
 }
 
@@ -449,9 +565,22 @@ async function handleScan(targetPath, options) {
   }
 
   const files = scanDirectory(resolved, options.includeCode, options);
+  const homeFiles = new Set();
+  const mcpOnly = new Set();
+  if (options.includeHome) {
+    for (const f of homeMcpFiles()) {
+      homeFiles.add(f);
+      if (files.includes(f)) continue;
+      let size = 0;
+      try { size = fs.statSync(f).size; } catch (e) { continue; }
+      if (size < 2 * 1024 * 1024) files.push(f);
+      else if (size < 64 * 1024 * 1024) { files.push(f); mcpOnly.add(f); } // ~/.claude.json grows with history: only the MCP credential check runs on it, not the other rules
+      else files.skipped.push({ file: f, reason: '64 MiB or larger' });
+    }
+  }
   if (format === 'text') process.stdout.write(`
 ${sym(process.env, '🛡️', undefined, '  ')}zn-gate Static Security Audit
-Target  : ${resolved}
+Target  : ${safeText(resolved)}
 Scope   : ${options.includeCode ? 'All files (prompts + code)' : 'Prompt templates, docs, configs (use --code to scan source)'}
 Files   : ${files.length} file(s) queued for audit\n
 `);
@@ -462,8 +591,9 @@ Files   : ${files.length} file(s) queued for audit\n
   let notRead = 0;
 
   for (const filePath of files) {
-    const relPath = path.relative(process.cwd(), filePath);
+    const relPath = displayPath(filePath, homeFiles);
     let content = '';
+    let mcpFound = [];
     try {
       const raw = fs.readFileSync(filePath);
       if (path.extname(filePath).toLowerCase() === '.key' && !hasUtf16Bom(raw) && raw.subarray(0, BINARY_SNIFF).includes(0)) {
@@ -478,7 +608,13 @@ Files   : ${files.length} file(s) queued for audit\n
       continue;
     }
 
-    const lines = content.split('\n');
+    // The MCP check runs first and its values are masked, so no other rule prints one.
+    if (mcpSecrets.isMcpConfigPath(filePath)) {
+      mcpFound = mcpSecrets.findMcpConfigSecretSpans(content, { file: filePath });
+      content = mcpSecrets.maskMcpValues(content, mcpFound);
+    }
+    const generic = !mcpOnly.has(filePath);
+    const lines = generic ? content.split('\n') : [];
     // Line of a character offset, numbered like the line pass (split on \n).
     const starts = [0];
     for (const l of lines) starts.push(starts[starts.length - 1] + l.length + 1);
@@ -493,7 +629,7 @@ Files   : ${files.length} file(s) queued for audit\n
     // not look like a key, so it would not be redacted).
     const blocks = [];
     const keyLines = new Set();
-    for (const r of MULTILINE_SECRET_RULES) {
+    for (const r of (generic ? MULTILINE_SECRET_RULES : [])) {
       const rx = new RegExp(r.pattern.source, r.pattern.flags.includes('g') ? r.pattern.flags : r.pattern.flags + 'g');
       let m;
       while ((m = rx.exec(content)) !== null) {
@@ -557,10 +693,31 @@ Files   : ${files.length} file(s) queued for audit\n
       // Only the BEGIN marker, never the key material.
       findings.push({ file: relPath, line: b.line, rule: b.rule, reason: b.reason || 'Exposed credential detected by DLP filter', type: 'secret_leak', sample: b.header, next_step: secretNextStep(relPath, b.rule) });
     }
+
+    // MCP servers: every credential the MCP check found is a finding of its own; the
+    // other rules ran on the text with those values masked (lib/mcp-secrets.js).
+    for (const m of mcpFound) {
+      if (m.silent) continue;
+      totalFindings++;
+      findings.push({ file: relPath, line: m.line, rule: mcpSecrets.RULE_ID, reason: mcpSecrets.mcpReason(m.kind), type: 'secret_leak', sample: mcpSecrets.mcpSample(m.kind, m.name), next_step: mcpSecrets.mcpNextStep(m.kind, m.name) });
+    }
   }
 
   const totalSecrets = findings.filter((f) => f.type === 'secret_leak').length;
   const totalThreats = totalFindings - totalSecrets;
+  // An empty or partial result is not a clean one. Findings exit 1; otherwise a
+  // scan that read no file, or skipped a file or folder it should have read,
+  // exits 3, unless --allow-partial accepts the skipped ones.
+  const nothingScanned = `No files were scanned in ${targetPath || '.'}`;
+  const unreadDirs = files.skippedDirs.filter((d) => d.reason === 'cannot be read').length;
+  const incomplete = files.skipped.length + unreadDirs > 0;
+  const incompleteNote = `${files.skipped.length} file(s) and ${unreadDirs} folder(s) were not read`;
+  const coverageExit = () => {
+    if (totalFindings > 0) return 1;
+    if (files.length - notRead === 0) return 3;
+    if (incomplete && !options.allowPartial) return 3;
+    return 0;
+  };
 
   if (format === 'github') {
     // CI logs are public: rule, reason and location only, never the line.
@@ -572,35 +729,47 @@ Files   : ${files.length} file(s) queued for audit\n
       }
     }
     for (const s of files.skipped) {
-      process.stdout.write(`::notice file=${ghProperty(path.relative(process.cwd(), s.file))},title=Not scanned::${ghMessage(s.reason)}\n`);
+      process.stdout.write(`::notice file=${ghProperty(displayPath(s.file, homeFiles))},title=Not scanned::${ghMessage(s.reason)}\n`);
     }
-    process.stdout.write(`\n[zn-gate] Scanned ${files.length - notRead} files (${files.skipped.length} not scanned). Found ${totalSecrets} secrets and ${totalThreats} security threats.\n`);
-    if (totalFindings > 0) process.exitCode = 1;
+    for (const s of files.skippedDirs) {
+      process.stdout.write(`::notice file=${ghProperty(displayPath(s.dir, homeFiles))},title=Directory not scanned::${ghMessage(s.reason)}\n`);
+    }
+    if (files.length - notRead === 0) process.stdout.write(`::warning title=Nothing scanned::${ghMessage(nothingScanned)}\n`);
+    if (totalFindings === 0 && incomplete) process.stdout.write(`::warning title=Incomplete scan::${ghMessage(incompleteNote + (options.allowPartial ? ' (accepted with --allow-partial)' : ': exit code 3, use --allow-partial to accept'))}\n`);
+    const dirNote = files.skippedDirs.length ? ` and ${files.skippedDirs.length} director${files.skippedDirs.length === 1 ? 'y' : 'ies'} skipped` : '';
+    process.stdout.write(`\n[zn-gate] Scanned ${files.length - notRead} files (${files.skipped.length} not scanned${dirNote}). Found ${totalSecrets} secrets and ${totalThreats} security threats.\n`);
+    process.exitCode = coverageExit();
     return;
   }
   if (format === 'json') {
     process.stdout.write(JSON.stringify({
       total_files: files.length - notRead,
       total_skipped: files.skipped.length,
+      total_skipped_dirs: files.skippedDirs.length,
       // Every finding, secrets included (as before); total_secrets counts the secrets alone.
       total_threats: totalFindings,
       total_secrets: totalSecrets,
+      // true when a file or folder that should have been read was not (exit 3 unless --allow-partial).
+      incomplete,
       threats: findings.map((f) => {
         const out = { file: f.file, line: f.line, rule: f.rule, reason: f.reason, type: f.type, content: f.sample };
         if (f.next_step) out.next_step = f.next_step;
         return out;
       }),
-      skipped: files.skipped.map((s) => ({ file: path.relative(process.cwd(), s.file), reason: s.reason })),
+      skipped: files.skipped.map((s) => ({ file: displayPath(s.file, homeFiles), reason: s.reason })),
+      skipped_dirs: files.skippedDirs.map((s) => ({ dir: displayPath(s.dir, homeFiles), reason: s.reason })),
+      ...(files.length - notRead === 0 ? { warning: nothingScanned } : {}),
     }, null, 2) + '\n');
-    if (totalFindings > 0) process.exitCode = 1;
+    process.exitCode = coverageExit();
     return;
   }
 
+  if (files.length - notRead === 0) process.stdout.write(`${sym(process.env, '!', col.yellow)}${col.yellow(safeText(nothingScanned))}\n\n`);
   if (findings.length > 0) {
     process.stdout.write(`Findings (${findings.length}):\n`);
     for (const f of findings) {
       const label = f.type === 'secret_leak' ? 'Secret found' : 'Threat';
-      process.stdout.write(`  ${sym(process.env, '✖', col.red)}${f.file}:${f.line} ${label}\n`);
+      process.stdout.write(`  ${sym(process.env, '✖', col.red)}${safeText(f.file)}:${f.line} ${label}\n`);
       process.stdout.write(`    ${col.gray('Rule:')} ${f.rule} (${f.reason || 'Security threat detected'})\n`);
       process.stdout.write(`    ${col.gray('Line:')} ${f.sample}\n`);
       if (f.next_step) process.stdout.write(`    ${f.next_step}\n`);
@@ -611,12 +780,13 @@ Files   : ${files.length} file(s) queued for audit\n
   const resultParts = [];
   if (totalSecrets) resultParts.push(`${totalSecrets} SECRET(S) FOUND`);
   if (totalThreats) resultParts.push(`${totalThreats} THREAT(S) FOUND`);
-  let status = 'Clean workspace';
+  let status = files.length - notRead === 0 ? 'No files were read: this is not a clean result' : 'Clean workspace';
   if (totalThreats) status = 'Review and neutralize detected vectors';
   else if (totalSecrets) status = 'Move the secrets out of these files (see "Next" for each one)';
+  else if (incomplete && files.length - notRead > 0) status = options.allowPartial ? `Partial coverage accepted with --allow-partial (${incompleteNote})` : `Incomplete: ${incompleteNote}. Exit code 3; use --allow-partial to accept`;
   process.stdout.write(`
 ${ruleLine(process.env, 77)}
-Audit Result : ${totalFindings === 0 ? col.green('PASSED - NO THREATS DETECTED') : col.red(`FAILED - ${resultParts.join(', ')}`)}
+Audit Result : ${totalFindings === 0 ? (files.length - notRead === 0 ? col.yellow('NOTHING SCANNED') : incomplete ? col.yellow(options.allowPartial ? 'PASSED - NO THREATS DETECTED (PARTIAL COVERAGE)' : 'INCOMPLETE - SOME FILES WERE NOT READ') : col.green('PASSED - NO THREATS DETECTED')) : col.red(`FAILED - ${resultParts.join(', ')}`)}
 Files Scanned: ${files.length - notRead}
 Files Skipped: ${files.skipped.length}${files.skipped.length ? ' (not read: see below)' : ''}
 Status       : ${status}
@@ -624,19 +794,25 @@ ${ruleLine(process.env, 77)}\n
 `);
   if (files.skipped.length) {
     process.stdout.write(`Not scanned (${files.skipped.length}):\n`);
-    for (const s of files.skipped.slice(0, 20)) process.stdout.write(`  ${path.relative(process.cwd(), s.file)} (${s.reason})\n`);
+    for (const s of files.skipped.slice(0, 20)) process.stdout.write(`  ${safeText(displayPath(s.file, homeFiles))} (${safeText(s.reason)})\n`);
     if (files.skipped.length > 20) process.stdout.write(`  ... and ${files.skipped.length - 20} more\n`);
+    process.stdout.write('\n');
+  }
+  if (files.skippedDirs.length) {
+    process.stdout.write(`Directories not scanned (${files.skippedDirs.length}):\n`);
+    for (const s of files.skippedDirs.slice(0, 20)) process.stdout.write(`  ${safeText(displayPath(s.dir, homeFiles))} (${safeText(s.reason)})\n`);
+    if (files.skippedDirs.length > 20) process.stdout.write(`  ... and ${files.skippedDirs.length - 20} more\n`);
     process.stdout.write('\n');
   }
 
   // exitCode, not process.exit(): a large report written to a pipe must be
   // flushed completely before the process ends.
-  if (totalFindings > 0) process.exitCode = 1;
+  process.exitCode = coverageExit();
 }
 
 // Secrets broker and agent hooks. Dispatched before the global option parsing
 // so flags after `zn run --` belong to the child command, untouched.
-const BROKER_COMMANDS = new Set(['run', 'hook', 'secrets-mcp', 'secret', 'secrets', 'env', 'hooks']);
+const BROKER_COMMANDS = new Set(['run', 'hook', 'secrets-mcp', 'secret', 'secrets', 'env', 'hooks', 'uninstall']);
 
 // `zn audit` reviews the agent configs of a directory. The secret-use log it
 // showed in 1.5 is `zn vault log` (alias `zn secret log`); lib/audit/cli.js
@@ -727,6 +903,12 @@ async function main() {
     process.exitCode = await runReachCommand(args.slice(1));
     return;
   }
+  // Help of the vault commands and of env shadow: their own usage, not the general help.
+  const subHelp = require('../lib/vault/help').helpFor(args);
+  if (subHelp) {
+    process.stdout.write(subHelp.join('\n') + '\n');
+    return;
+  }
   // zn Team and the OpenTelemetry export of the audit log. exitCode (not
   // process.exit) so a large export is flushed completely through a pipe.
   if (args[0] === 'team') {
@@ -734,7 +916,7 @@ async function main() {
     return;
   }
   if (args[0] === 'vault' && args[1] === 'log' && args[2] === 'export') {
-    process.exitCode = require('../lib/team/cli').runLogExport(args.slice(3));
+    process.exitCode = await require('../lib/team/cli').runLogExport(args.slice(3));
     return;
   }
   if (args[0] === 'vault' && args[1] === 'log') {
@@ -743,7 +925,7 @@ async function main() {
     return;
   }
 
-  if (BROKER_COMMANDS.has(args[0]) && !(args.length === 2 && (args[1] === '-h' || args[1] === '--help'))) {
+  if (BROKER_COMMANDS.has(args[0]) && (args[0] === 'uninstall' || !(args.length === 2 && (args[1] === '-h' || args[1] === '--help')))) {
     await runBrokerCommand(args[0], args.slice(1));
     return;
   }
@@ -752,7 +934,7 @@ async function main() {
     process.exit(0);
   }
 
-  if (args.includes('-V') || args.includes('--version') || args[0] === 'version') {
+  if (args.includes('-V') || args.includes('--version') || args[0] === 'version' || args[0] === '-v') {
     process.stdout.write(`zn-gate ${VERSION} (rules engine: ${RULES_VERSION}; scrub rules: ${SCRUB_RULES_VERSION}; audit rules: ${AUDIT_RULES_VERSION})\n`);
     process.exit(0);
   }
@@ -774,6 +956,8 @@ async function main() {
     port: 3100,
     tail: 20,
     includeCode: args.includes('--code') || args.includes('--all'),
+    includeHome: args.includes('--include-home'),
+    allowPartial: args.includes('--allow-partial'),
     include: null,
     exclude: null,
   };
@@ -848,7 +1032,7 @@ ${ruleLine(process.env, 60)}\n`);
     });
 
     for (const act of actions) {
-      const mark = act.status === 'error' ? sym(process.env, '✖', col.red) : act.status === 'manual_required' ? sym(process.env, '!', col.yellow) : sym(process.env, '✔', col.green);
+      const mark = act.status === 'error' ? sym(process.env, '✖', col.red) : act.status === 'manual_required' || act.status === 'skipped_unsafe' ? sym(process.env, '!', col.yellow) : sym(process.env, '✔', col.green);
       process.stdout.write(`  ${mark}${act.env.padEnd(20)} [${act.status}] ${act.serversCount ? act.serversCount + ' servers' : ''}${act.shadow ? ' (shadow mode)' : ''}\n`);
       if (act.backup) {
         process.stdout.write(`    ${sym(process.env, '↳', col.gray)}${col.gray('backup: ' + act.backup)}\n`);
@@ -969,6 +1153,15 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
     process.env.ZN_STATS = 'off'; // the test read is not counted in zn-gate stats
     const zc = require('../lib/check');
     process.exitCode = zc.report(await zc.check({}));
+    try {
+      const cfg = require('../lib/rules').loadCustomConfig(true);
+      if (cfg.errors.length > 0) {
+        process.stdout.write('Project rules: ' + cfg.file + ' has ' + cfg.errors.length + ' error' + (cfg.errors.length > 1 ? 's' : '') + ', so zn-gate blocks until it is fixed:\n');
+        for (const e of cfg.errors.slice(0, 20)) process.stdout.write('  - ' + e + '\n');
+        process.stdout.write('Edit ' + cfg.file + ' or delete it.\n\n');
+        process.exitCode = 1;
+      }
+    } catch (_) { /* the check never fails on the rules file */ }
     return;
   }
 
@@ -1046,6 +1239,29 @@ ${sym(process.env, '🛡️', undefined, '  ')}zn-gate Status:
         for (const n of notes) process.stdout.write('  Claude Code     : ' + n + '\n');
         if (notes.length) process.stdout.write('\n');
       }
+    } catch (_) { /* status never fails on this check */ }
+    // zn installed through the organization's managed configuration (read-only).
+    try {
+      const mp = require('../lib/agents/managed-policy');
+      for (const [id, label] of [['claude-code', 'Claude Code'], ['codex', 'Codex CLI'], ['cursor', 'Cursor']]) {
+        let there = false;
+        try { there = Boolean(require('../lib/agents').getAdapter(id).detect()); } catch (_) { there = false; }
+        const m = there ? mp.managedInstall(id) : null;
+        if (m) process.stdout.write('  ' + label.padEnd(16) + ': zn is installed (managed): ' + m.files.join(', ') + '\n\n');
+      }
+    } catch (_) { /* status never fails on this check */ }
+    // Cursor's enterprise hooks.json (read-only).
+    try {
+      if (require('../lib/agents/cursor').detect()) {
+        const notes = require('../lib/agents/managed-policy').cursorPolicyWarnings();
+        for (const n of notes) process.stdout.write('  Cursor          : ' + n + '\n');
+        if (notes.length) process.stdout.write('\n');
+      }
+    } catch (_) { /* status never fails on this check */ }
+    // An end-of-life or unpatched Node.js (a warning only: it never changes the exit status).
+    try {
+      const adv = require('../lib/node-support').nodeAdvice(process.versions.node);
+      if (adv) process.stdout.write('  Node.js         : ' + adv.message + '\n\n');
     } catch (_) { /* status never fails on this check */ }
     process.exit(0);
   }

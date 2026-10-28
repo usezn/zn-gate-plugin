@@ -1,8 +1,8 @@
 {
   "name": "zn-gate",
   "displayName": "zn-gate",
-  "version": "1.13.1",
-  "description": "Local security layer for Claude Code: keeps secret values out of what Claude sends to the model, adds a secrets MCP server that uses credentials without revealing them, and checks untrusted text for prompt injection with local rules.",
+  "version": "1.14.1",
+  "description": "Local security layer for Claude Code: keeps secret values out of what Claude sends to the model and blocks tool calls that would read or send a secret.",
   "icon": "./icon.png",
   "author": {
     "name": "usezn",
@@ -22,15 +22,5 @@
   "documentationUrl": "https://usezn.com/docs",
   "supportUrl": "https://github.com/usezn/zn/issues",
   "privacyPolicyUrl": "https://usezn.com/privacy",
-  "termsOfServiceUrl": "https://usezn.com/terms",
-  "userConfig": {
-    "api_key": {
-      "type": "string",
-      "title": "zn API key (optional)",
-      "description": "A Pro or Team API key from usezn.com/dashboard. With a key, the analyze_prompt tool also asks the zn cloud classifier, and the text it checks (secrets redacted first) is sent to api.usezn.com. Leave it empty to keep everything on this machine.",
-      "sensitive": true,
-      "required": false,
-      "default": ""
-    }
-  }
+  "termsOfServiceUrl": "https://usezn.com/terms"
 }

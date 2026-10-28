@@ -8,8 +8,10 @@
  *  - zn's own state (~/.zn) is off limits to agents, for reads and writes.
  *  - Commands that manage secrets (`zn secret set`, `zn env shadow`, ...)
  *    must be run by the user, never by an agent.
- *  - Bash commands with named markers are wrapped in `zn run --`, which
- *    applies allowCommands, first-use approval and output masking.
+ *  - Bash commands with named markers in their arguments are refused with
+ *    guidance: an argument is visible in the process list, so the secret goes
+ *    to the program as an environment variable (`zn run --secrets NAME --`),
+ *    which applies allowCommands, first-use approval and output masking.
  *
  * Hooks are a guardrail, not a sandbox: a determined process can always
  * find another way to read a file. The goal is that secret values never
@@ -22,12 +24,11 @@ const path = require('path');
 const dotenv = require('../broker/dotenv');
 const markers = require('../broker/markers');
 const { realTargetOf } = require('../broker/files');
-const { powershellQuote, portablePath } = require('../shell-quote');
 const { znCommand } = require('../zn-command');
 
 // Version of the policy rules (credential paths, zn home, secret commands,
 // command wrapping). Bump it when a rule changes; see CONTRIBUTING.md.
-const POLICY_RULES_VERSION = '2026-10-18.31';
+const POLICY_RULES_VERSION = '2026-10-26.7';
 
 /* ------------------------------ paths ------------------------------ */
 
@@ -71,6 +72,7 @@ const CREDENTIAL_RES = [
   [/(^|\/)\.kube\/config$/, 'Kubernetes credentials'],
   [/(^|\/)\.config\/gcloud\/(credentials\.db|access_tokens\.db|application_default_credentials\.json)$/, 'Google Cloud credentials'],
   [/(^|\/)\.azure\/(accessTokens\.json|msal_token_cache\.json)$/, 'Azure credentials'],
+  [/(^|\/)\.zcode\/v2\/provider_config\.json$/, 'Zcode model provider credentials'],
 ];
 
 // Credential-file variables. A path given through one of them, or equal to
@@ -85,9 +87,35 @@ const AGENT_CONFIG_RES = [
   [/(^|\/)\.claude\/settings[^/]*\.json$/, 'Claude Code settings'],
   [/(^|\/)\.codex\/[^/]*$/, 'Codex hooks and configuration'],
   [/(^|\/)\.cursor\/hooks\.json$/, 'Cursor hooks'],
+  [/(^|\/)\.agents\/hooks\.json$/, 'Antigravity hooks'],
+  [/(^|\/)\.gemini\/config\/hooks\.json$/, 'Antigravity hooks'],
+  [/(^|\/)\.gemini\/antigravity-cli\/settings\.json$/, 'Antigravity settings and permissions'],
+  [/(^|\/)\.github\/hooks\/[^/]*\.json$/, 'GitHub Copilot hooks'],
+  [/(^|\/)\.github\/copilot\/settings(\.local)?\.json$/, 'GitHub Copilot settings'],
+  [/(^|\/)\.copilot\/(hooks\/[^/]*|settings(\.local)?\.json|config\.json)$/, 'GitHub Copilot hooks and settings'],
+  [/(^|\/)github-copilot\/policy\.d\/[^/]*$/, 'GitHub Copilot policy hooks'],
+  [/(^|\/)\.gemini\/settings\.json$/, 'Gemini CLI settings and hooks'],
+  [/(^|\/)gemini-cli\/settings\.json$/, 'Gemini CLI system settings'],
+  [/(^|\/)\.zcode\/(cli\/)?config\.json$/, 'Zcode settings and hooks'],
   [/(^|\/)opencode\.jsonc?$/, 'OpenCode configuration'],
   [/(^|\/)\.(config\/)?opencode\/plugins?\//, 'OpenCode plugins'],
   [/(^|\/)\.opencode\/plugins?\//, 'OpenCode plugins'],
+];
+
+// The agents' plugin folders and plugin state, as paths relative to the home folder (a project's own .gemini or
+// .claude/plugins folder is not the agent's): an installed plugin runs its hooks, so changing or removing one (or its
+// list of installed plugins) changes or switches off the hooks that check the agent, zn's plugin included. The second
+// pattern is Antigravity's plugin switches and the folders that hold the ZCode and Antigravity configuration and
+// plugins, which cannot be removed, moved or created as such (the other files in them stay writable). Two patterns
+// keep the check as fast as before (it runs on every path of every call).
+// The agents' plugin folders and plugin state under the home folder, for their real places (a linked ~/.claude or
+// ~/.claude/plugins): the folders whose contents are protected, and the entries protected themselves.
+const HOME_PLUGIN_TREES = ['.claude/plugins', '.codex/plugins', '.cursor/plugins', '.zcode/cli/plugins', '.gemini/config/plugins',
+  '.gemini/antigravity-cli/plugins'];
+const HOME_PLUGIN_STATE = ['.gemini/config/config.json', '.zcode', '.zcode/cli', '.gemini', '.gemini/config', '.gemini/antigravity-cli'];
+const HOME_PLUGIN_RES = [
+  [/^(\.claude|\.codex|\.cursor|\.zcode\/cli|\.gemini\/config|\.gemini\/antigravity-cli)\/plugins(\/|$)/, 'the agent plugins'],
+  [/^(\.gemini\/config\/config\.json|\.zcode(\/cli)?|\.gemini(\/config|\/antigravity-cli)?)$/, 'the agent configuration and plugin state'],
 ];
 
 // Windows and macOS file systems are case-insensitive by default. Read on each
@@ -95,7 +123,56 @@ const AGENT_CONFIG_RES = [
 function caseInsensitive() {
   return process.platform === 'win32' || process.platform === 'darwin';
 }
-const keyOf = (s) => (caseInsensitive() ? s.toLowerCase() : s);
+// macOS reports names like "José" decomposed (NFD) while a typed path is usually composed (NFC),
+// and its file systems treat both as the same folder, so every comparison uses NFC.
+const keyOf = (s) => {
+  const n = s.normalize('NFC');
+  return caseInsensitive() ? n.toLowerCase() : n;
+};
+// NTFS alternate data streams: `.env::$DATA`, `credentials:stream` and `dir::$INDEX_ALLOCATION` all name the file
+// or folder itself. A colon cannot be part of a Windows name, so on win32 everything after the first colon of a
+// path segment is a stream (a drive letter stays). Elsewhere a colon is a valid name character, so only the
+// explicit `::$DATA` style suffix is dropped.
+const ADS_TYPE_RE = /(?::[^\\/:*?"<>|]*)?:\$(?:DATA|INDEX_ALLOCATION|BITMAP)$/i;
+function stripStreams(text) {
+  if (typeof text !== 'string') return text;
+  const win = process.platform === 'win32';
+  if (!win && text.indexOf(':') < 0) return text;
+  return text.split(/([\\/]+)/).map((seg, i) => {
+    if (win) {
+      if (/^[A-Za-z]:$/.test(seg)) return seg;
+      if (i === 0 && /^[A-Za-z]:/.test(seg)) return seg.slice(0, 2) + dropTrailingDotsSpaces(seg.slice(2).replace(/:.*$/, ''));
+      return dropTrailingDotsSpaces(seg.replace(/:.*$/, ''));
+    }
+    return seg.replace(ADS_TYPE_RE, '');
+  }).join('');
+}
+// Windows drops trailing dots and spaces from a name, so `settings.json.` and `settings.json ` open `settings.json`.
+// A name made only of dots (`.`, `..`) is left alone. Scanned from the end, so a long run cannot cost more than its length.
+function dropTrailingDotsSpaces(seg) {
+  let end = seg.length;
+  while (end > 0 && (seg.charCodeAt(end - 1) === 46 || seg.charCodeAt(end - 1) === 32)) end--;
+  if (end === seg.length) return seg;
+  if (/^\.*$/.test(seg)) return seg;
+  return seg.slice(0, end);
+}
+// An 8.3 short name: up to six characters, `~`, digits, and an optional extension of up to three (`SETTIN~1.JSO`,
+// `CLAUDE~1`). The long name it stands for cannot be read from the text, so on win32 it is checked as a pattern
+// (`{,.}settin*.jso*`) against the protected names, like a typed glob.
+const SHORT_NAME_RE = /^([^~\s.:*?"<>|\\/]{1,6})~[0-9]{1,6}(?:\.([^.\s:*?"<>|\\/]{1,3}))?$/;
+function shortNameGlob(text) {
+  if (process.platform !== 'win32' || typeof text !== 'string' || text.indexOf('~') < 0) return null;
+  let found = false;
+  let lastShort = false;
+  const out = text.split(/([\\/]+)/).map((seg) => {
+    const m = SHORT_NAME_RE.exec(seg);
+    if (!/^[\\/]*$/.test(seg)) lastShort = !!m;
+    if (!m) return seg;
+    found = true;
+    return '{,.}' + m[1] + '*' + (m[2] ? '.' + m[2] + '*' : '');
+  }).join('');
+  return found ? { glob: out, lastShort } : null;
+}
 /** The pattern, ignoring case where the platform does. */
 const ci = (re) => (caseInsensitive() && !re.flags.includes('i') ? new RegExp(re.source, re.flags + 'i') : re);
 
@@ -148,6 +225,20 @@ function keysOf(p) {
   return [...new Set([keyOf(slash(p)), keyOf(slash(realTargetOf(p)))])];
 }
 
+// The home folder and the project root are resolved once per process: a hook process checks one call, and the
+// other users of the policy (tests, the broker) pass the same few folders again and again.
+const ROOT_KEYS = new Map();
+function rootKeysOf(p) {
+  const k = String(p);
+  let v = ROOT_KEYS.get(k);
+  if (!v) {
+    if (ROOT_KEYS.size > 256) ROOT_KEYS.clear();
+    v = keysOf(p);
+    ROOT_KEYS.set(k, v);
+  }
+  return v;
+}
+
 /**
  * Agent configuration: the directories that hold hook and plugin settings
  * (in the home directory, the project and the locations the environment
@@ -157,21 +248,46 @@ function agentContext(home, cwd, env) {
   const dirs = new Set();
   const files = new Set();
   const rel = ['.claude', '.codex', '.cursor', '.opencode', path.join('.config', 'opencode')];
-  for (const root of [home, projectRootOf(cwd)]) {
+  const projectRoot = projectRootOf(cwd);
+  for (const root of [home, projectRoot]) {
     for (const r of rel) for (const k of keysOf(path.join(root, r))) dirs.add(k);
   }
   const at = (p) => path.resolve(cwd, expandHome(p, home));
-  if (env.CODEX_HOME) for (const k of keysOf(at(env.CODEX_HOME))) dirs.add(k);
+  // Plugin folders under a moved configuration folder (the folder names there do not match the patterns): built from
+  // the keys already resolved for that folder, so no other file system call.
+  const plugins = new Set();
+  // The home folder as typed and where it really leads (a linked home), for ~/.zn and the home plugin folders. A
+  // relative HOME names no real place: the user's own home folder from the system is used as well.
+  const homes = new Set(rootKeysOf(path.resolve(home)));
+  if (!path.isAbsolute(String(home))) {
+    try { for (const k of rootKeysOf(os.userInfo().homedir)) homes.add(k); } catch (_) { /* no user record */ }
+  }
+  // Where each plugin folder and plugin state entry under the home folder really is: a linked configuration folder
+  // (dotfiles) or plugin folder puts them outside the home folder, where the home-relative patterns do not see them.
+  const state = new Set();
+  for (const r of HOME_PLUGIN_TREES) for (const k of keysOf(path.join(home, r))) plugins.add(k);
+  for (const r of HOME_PLUGIN_STATE) for (const k of keysOf(path.join(home, r))) state.add(k);
+  if (env.CODEX_HOME) {
+    for (const k of keysOf(at(env.CODEX_HOME))) { dirs.add(k); plugins.add(k + '/plugins'); }
+    for (const k of keysOf(path.join(at(env.CODEX_HOME), 'plugins'))) plugins.add(k);
+  }
   // Claude Code keeps its settings here when the variable is set, and zn installs its hooks there.
-  if (env.CLAUDE_CONFIG_DIR) for (const k of keysOf(at(env.CLAUDE_CONFIG_DIR))) dirs.add(k);
+  if (env.CLAUDE_CONFIG_DIR) {
+    for (const k of keysOf(at(env.CLAUDE_CONFIG_DIR))) { dirs.add(k); plugins.add(k + '/plugins'); }
+    for (const k of keysOf(path.join(at(env.CLAUDE_CONFIG_DIR), 'plugins'))) plugins.add(k);
+  }
   if (env.OPENCODE_CONFIG_DIR) for (const k of keysOf(at(env.OPENCODE_CONFIG_DIR))) dirs.add(k);
   if (env.XDG_CONFIG_HOME) for (const k of keysOf(path.join(at(env.XDG_CONFIG_HOME), 'opencode'))) dirs.add(k);
   if (env.OPENCODE_CONFIG) for (const k of keysOf(at(env.OPENCODE_CONFIG))) files.add(k);
+  // Claude Code keeps every plugin file and its plugin state under this folder when the variable is set.
+  if (env.CLAUDE_CODE_PLUGIN_CACHE_DIR) for (const k of keysOf(at(env.CLAUDE_CODE_PLUGIN_CACHE_DIR))) plugins.add(k);
+  // Antigravity's workspace plugins: only at the root of the project, as typed and where it really leads.
+  for (const k of rootKeysOf(projectRoot)) plugins.add(k + '/.agents/plugins');
   // Roots that hold agent configuration: removing or moving them removes it.
   // Only the directory itself is protected (listing it or reading it is fine).
   const roots = new Set(keysOf(path.join(home, '.config')));
   if (env.XDG_CONFIG_HOME) for (const k of keysOf(at(env.XDG_CONFIG_HOME))) roots.add(k);
-  return { dirs: [...dirs], files, roots: [...roots] };
+  return { dirs: [...dirs], files, roots: [...roots], plugins: [...plugins], homes: [...homes], state };
 }
 
 /** Everything a classification needs, from the options of one call. */
@@ -187,18 +303,74 @@ function contextOf(opts = {}) {
 /**
  * Classify a resolved absolute path. `ctx` comes from contextOf.
  */
+/* The protected class of a path relative to a home folder (.zn, the plugin folders and the plugin state), or null. */
+function homeRelClass(rel) {
+  const r = String(rel).replace(/^(?:\.\/)+/, '').replace(/\/+$/, '');
+  if (ci(/^\.zn(\/|$)/).test(r)) return { kind: 'zn_state', reason: 'zn keeps its vault and audit log in ~/.zn' };
+  for (const [re, reason] of HOME_PLUGIN_RES) if (ci(re).test(r)) return { kind: 'agent_config', reason };
+  return null;
+}
+
+/* A write target zn cannot place on disk that may still name ~/.zn or an agent's plugins: a prefix that is a variable
+   the environment does not set, a command substitution or another user's ~name (each may be a home folder), or a
+   relative path after a cd (into the home folder, or to a place zn cannot follow). Returns the class or null. */
+function protectedElsewhere(text, opts) {
+  const t = slash(text);
+  const m = /^(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\([^)]*\)|`[^`]*`|~[A-Za-z0-9._-]+)\/(.*)$/.exec(t)
+    // ${H}.zn: the variable's value may end with a slash.
+    || /^\$\{[A-Za-z_][A-Za-z0-9_]*\}(.+)$/.exec(t)
+    // The end of a substitution the shell split off ($(echo ~)/x reads as "$(echo" and "~)/x").
+    || /^[^/]*[)`]\/(.*)$/.exec(t);
+  // A variable the environment (or the command itself) sets was already expanded by the classification.
+  const v = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)/.exec(t);
+  const known = v && (opts.env || process.env)[v[1]] && !(opts.unknownVars && opts.unknownVars.has(v[1]));
+  if (m && !known) {
+    const c = homeRelClass(m[1]);
+    if (c) return c;
+  }
+  // The word right after a substitution's closing bracket ($(echo ~)/.zn leaves /.zn): its start is the output of
+  // another command, which may be the home folder.
+  const cmdText = opts.cmdText || '';
+  if (t.startsWith('/') && (cmdText.includes(')' + text) || cmdText.includes('`' + text))) {
+    const c = homeRelClass(t.slice(1));
+    if (c) return c;
+  }
+  const bases = opts.cdBases;
+  if (!bases || !bases.moved || path.isAbsolute(t) || /^[~$`%]/.test(t)) return null;
+  const cwd = path.resolve(opts.cwd || process.cwd());
+  for (const b of bases.dirs) {
+    if (b === cwd) continue;
+    const c = classifyPath(path.join(b, text), opts);
+    if (c && (c.kind === 'zn_state' || c.kind === 'agent_config')) return c;
+  }
+  // A cd zn cannot follow (cd $DIR, cd -) may lead to the home folder.
+  return bases.unknown ? homeRelClass(t) : null;
+}
+
 function classifyResolved(abs, ctx) {
   const { home, creds, agent } = ctx;
   const s = keyOf(slash(abs));
   const h = keyOf(slash(path.resolve(home)));
-  if (s === h + '/.zn' || s.startsWith(h + '/.zn/')) return { kind: 'zn_state', reason: 'zn keeps its vault and audit log in ~/.zn' };
+  const homes = agent.homes || [h];
+  for (const h of homes) {
+    const prefix = h.endsWith('/') ? h : h + '/';          // a home of "/" is its own prefix
+    if (s === prefix + '.zn' || s.startsWith(prefix + '.zn/')) return { kind: 'zn_state', reason: 'zn keeps its vault and audit log in ~/.zn' };
+  }
   for (const [re, reason] of AGENT_CONFIG_RES) if (ci(re).test(s)) return { kind: 'agent_config', reason };
+  for (const h of homes) {
+    const prefix = h.endsWith('/') ? h : h + '/';
+    if (!s.startsWith(prefix)) continue;
+    const c = homeRelClass(s.slice(prefix.length));
+    if (c) return c;
+  }
   // The directory itself (`cd ~/.claude`, `mv ~/.codex`, `rm -r ~/.cursor`) and the files directly in it.
   if (agent.dirs.includes(s) || agent.roots.includes(s)) return { kind: 'agent_config', reason: 'an agent configuration directory' };
   if (agent.dirs.some((d) => s.startsWith(d + '/') && !s.slice(d.length + 1).includes('/'))) {
     return { kind: 'agent_config', reason: 'a file in an agent configuration directory' };
   }
   if (agent.files.has(s)) return { kind: 'agent_config', reason: 'the agent configuration file the environment names' };
+  if ((agent.plugins || []).some((d) => s === d || s.startsWith(d + '/'))) return { kind: 'agent_config', reason: 'the agent plugins' };
+  if (agent.state && agent.state.has(s)) return { kind: 'agent_config', reason: 'the agent configuration and plugin state' };
   if (s.endsWith('.pub')) return null;
   if (creds.files.has(s)) return { kind: 'credential', reason: 'a file named by a credential environment variable' };
   for (const d of creds.dirs) if (s === d || s.startsWith(d + '/')) return { kind: 'credential', reason: 'a directory named by a credential environment variable' };
@@ -217,7 +389,29 @@ function classifyResolved(abs, ctx) {
 function resolvedOf(p, opts = {}) {
   const home = opts.home || os.homedir();
   const cwd = opts.cwd || process.cwd();
-  return path.resolve(cwd, expandEnv(expandHome(p, home), opts.env || process.env).text);
+  return path.resolve(cwd, stripStreams(expandEnv(expandHome(p, home), opts.env || process.env).text));
+}
+
+/**
+ * The path a typed path names when every ".." is applied to the real place its left side leads to (links followed),
+ * not to the text before it. null when the path has no "..". A part that does not exist is followed as written.
+ */
+function physicalDotDot(text, cwd) {
+  if (typeof text !== 'string' || !/(^|[\\/])\.\.([\\/]|$)/.test(text)) return null;
+  const full = path.isAbsolute(text) ? text : cwd + path.sep + text;
+  const rootDir = path.parse(full).root;
+  let cur = rootDir;
+  for (const seg of full.slice(rootDir.length).split(/[\\/]+/)) {
+    if (!seg || seg === '.') continue;
+    if (seg === '..') {
+      let real = cur;
+      try { real = fs.realpathSync(cur); } catch (_) { /* not there: followed as written */ }
+      cur = path.dirname(real);
+    } else {
+      cur = path.join(cur, seg);
+    }
+  }
+  return cur;
 }
 
 /**
@@ -237,11 +431,21 @@ function classifyPath(p, opts = {}) {
   if (expanded.agentVar) {
     return { kind: 'agent_config', reason: 'the path comes from $' + expanded.agentVar + ', the agent configuration location' };
   }
+  expanded.text = stripStreams(expanded.text);
   const abs = path.resolve(ctx.cwd, expanded.text);
-  for (const candidate of new Set([abs, realTargetOf(abs)])) {
+  const candidates = new Set([abs, realTargetOf(abs)]);
+  // ag/../hooks.json, with ag a link to .agents/skills, names .agents/hooks.json: ".." is applied to where the link leads.
+  const physical = physicalDotDot(expanded.text, ctx.cwd);
+  if (physical) { candidates.add(physical); candidates.add(realTargetOf(physical)); }
+  for (const candidate of candidates) {
     const c = classifyResolved(candidate, ctx);
     if (c) return c;
   }
+  // A short name hides the long one: it counts as protected when it could stand for a protected file or folder.
+  const short = shortNameGlob(expanded.text);
+  // When the last name is written out, a .env there is judged by its own content (readDenial), not by the pattern.
+  // A last name that is itself a glob (`*`, `.e*`) names whatever it matches, a plain .env included: no skipping then.
+  if (short) return globClass(short.glob, short.lastShort || GLOB_RE.test(expanded.text) ? opts : { ...opts, skipDotenv: true });
   return null;
 }
 
@@ -251,13 +455,18 @@ const GLOB_RE = /[*?[\]{}]/;
 // The first comma is matched by [^{},]*, so the pattern has one way to match and cannot backtrack.
 const BRACE_RE = /\{([^{},]*,[^{}]*)\}/;
 
+// A brace list has at least two alternatives, so more than 6 lists in one word always pass the default limit of 64.
+// The recursion stops there instead of following one level per list (a word with 20000 lists overflowed the stack).
+const BRACE_MAX_DEPTH = 8;
+
 /** Alternatives of a word with brace lists (`a{b,c}` -> ab, ac); null when there are too many. */
-function expandBraces(s, limit = 64) {
+function expandBraces(s, limit = 64, depth = 0) {
   const m = BRACE_RE.exec(s);
   if (!m) return [s];
+  if (depth >= BRACE_MAX_DEPTH) return null;
   const out = [];
   for (const alt of m[1].split(',')) {
-    const rest = expandBraces(s.slice(0, m.index) + alt + s.slice(m.index + m[0].length), limit);
+    const rest = expandBraces(s.slice(0, m.index) + alt + s.slice(m.index + m[0].length), limit, depth + 1);
     if (rest === null) return null;
     for (const x of rest) {
       out.push(x);
@@ -466,12 +675,12 @@ function globClass(word, opts = {}) {
     if (e.agentVar) return { kind: 'agent_config', reason: 'a pattern built from $' + e.agentVar };
     const abs = slash(path.resolve(ctx.cwd, e.text));
     // Any pattern whose last name starts with .env names a .env file.
-    if (keyOf(path.posix.basename(abs)).startsWith('.env')) return { kind: 'credential', reason: 'a pattern that matches a .env file' };
+    if (!opts.skipDotenv && keyOf(path.posix.basename(abs)).startsWith('.env')) return { kind: 'credential', reason: 'a pattern that matches a .env file' };
     const re = globRegExp(keyOf(abs));
     if (re.impossible) continue;
     for (const ex of examples) {
       const c = classifyResolved(ex, ctx);
-      if (c && re.test(keyOf(slash(ex)))) {
+      if (c && !(opts.skipDotenv && c.kind === 'dotenv') && re.test(keyOf(slash(ex)))) {
         return c.kind === 'dotenv' ? { kind: 'credential', reason: 'a pattern that matches a .env file' } : c;
       }
     }
@@ -483,6 +692,7 @@ function globClass(word, opts = {}) {
         const c = classifyResolved(cand, ctx);
         // A key file match is judged by its content (keyFileGlobDenial); a protected file found later still wins.
         if (c && c.kind === 'keyfile') { keyHit = keyHit || c; continue; }
+        if (c && opts.skipDotenv && c.kind === 'dotenv') continue;
         if (c) return c.kind === 'dotenv' ? { kind: 'credential', reason: 'a pattern that matches a .env file' } : c;
       }
     }
@@ -633,7 +843,7 @@ function keyFileGlobDenial(p, c, opts) {
 /* Reads of credential files: what was refused, why, and how to use a value instead. */
 function credentialDenial(p, c) {
   return 'zn: ' + p + ' was not read because zn treats it as holding secrets (' + c.reason + '), and secret values never go to the model. ' +
-    'If a command needs a value, ask the user to run `' + znCommand('secret set NAME') + '`, then write __ZN_NAME__ where the value goes.';
+    'If a command needs a value, ask the user to run `' + znCommand('secret set NAME') + '`, then run the command with `' + znCommand('run --secrets NAME -- <command>') + '` so the program gets it as an environment variable.';
 }
 
 function agentConfigDenial(p, c) {
@@ -645,6 +855,302 @@ function writeDenial(p, opts = {}) {
   const c = classifyPath(p, opts);
   if (c && c.kind === 'zn_state') return vaultMessage(opts);
   if (c && c.kind === 'agent_config') return agentConfigDenial(p, c);
+  return null;
+}
+
+/* ------------------- agent memory and instruction files ------------------- */
+
+/*
+ * The files where a coding agent keeps persistent memory and standing instructions. The agent reads them at the
+ * start of later sessions, so text written there keeps working after the session, the skill or the tool that wrote it
+ * is gone. This is the one list: change it here only. Reads are always allowed; writes ask the user (or are refused
+ * in strict mode, see instructionWritesOf in runner.js).
+ *
+ *   by file name, in any folder: MEMORY.md, SOUL.md, AGENTS.md, CLAUDE.md (also ~/.claude/CLAUDE.md),
+ *     CLAUDE.local.md, GEMINI.md, .cursorrules, .windsurfrules
+ *   by place: .cursor/rules/* (any depth), .github/copilot-instructions.md,
+ *     and the Claude Code memory folders <claude dir>/projects/<project>/memory/*
+ */
+const INSTRUCTION_FILE_NAMES = ['MEMORY.md', 'SOUL.md', 'AGENTS.md', 'CLAUDE.md', 'CLAUDE.local.md', 'GEMINI.md', '.cursorrules', '.windsurfrules'];
+const INSTRUCTION_FILE_RES = [
+  /(^|\/)\.cursor\/rules\/[^/]/,
+  /(^|\/)\.github\/copilot-instructions\.md$/,
+];
+
+/** Whether a resolved absolute path is one of the instruction files above. `ctx` comes from contextOf. */
+function isInstructionFile(abs, ctx) {
+  const s = keyOf(slash(abs));
+  const base = path.basename(s);
+  if (INSTRUCTION_FILE_NAMES.some((n) => keyOf(n) === base)) return true;
+  if (INSTRUCTION_FILE_RES.some((re) => ci(re).test(s))) return true;
+  // <claude dir>/projects/<project>/memory/<file>, for ~/.claude, the project's .claude and CLAUDE_CONFIG_DIR.
+  return ctx.agent.dirs.some((d) => s.startsWith(d + '/projects/') && /^[^/]+\/memory\/[^/]/.test(s.slice(d.length + 10)));
+}
+
+// On win32 a NEW file written under its 8.3 short name (`AGENTS~1.MD`) cannot be resolved, because it does not exist
+// yet. The short name of an instruction file is built from the first six letters of its name (a leading dot is
+// dropped: `.cursorrules` is `CURSOR~1`), so a short name with such a start and the same extension is reviewed. A
+// short name made from a hash (`COP3F1~1.MD`) shows nothing of the long one, so it is reviewed in a folder that holds
+// instruction files (`.github`). Anything else, like `NOTES~1.MD`, stays allowed. This only asks; it never denies more.
+const SHORT_INSTRUCTION_NAMES = INSTRUCTION_FILE_NAMES.concat(['copilot-instructions.md']).map((n) => {
+  const t = n.replace(/^\.+/, '');
+  const dot = t.lastIndexOf('.');
+  const base = (dot > 0 ? t.slice(0, dot) : t).replace(/[.\s]/g, '');
+  return { base: base.slice(0, 6).toUpperCase(), ext: (dot > 0 ? t.slice(dot + 1) : '').slice(0, 3).toUpperCase() };
+});
+function isShortInstructionName(abs) {
+  if (process.platform !== 'win32') return false;
+  const parts = slash(abs).split('/');
+  const m = SHORT_NAME_RE.exec(parts[parts.length - 1]);
+  if (!m) return false;
+  const pre = m[1].toUpperCase();
+  const ext = (m[2] || '').toUpperCase();
+  if (pre.length >= 4 && SHORT_INSTRUCTION_NAMES.some((n) => n.ext === ext && n.base.startsWith(pre))) return true;
+  const parent = (parts[parts.length - 2] || '').toLowerCase();
+  const inFolder = parent === '.github' || /^github~[0-9]+$/.test(parent) ||
+    (parts.length > 2 && parts[parts.length - 3].toLowerCase() === '.cursor' && parent === 'rules');
+  return inFolder && (ext === 'MD' || ext === '');
+}
+
+// Folders whose long name an 8.3 short name in the MIDDLE of a path can stand for (`CURSOR~1/rules/x.mdc` is
+// .cursor/rules/x.mdc). A short name is its first six letters (a leading dot dropped), `~` and a number, so a folder
+// segment that starts like one of these is read as that folder and the path is judged again with the long name, the
+// way classifyPath reads a short segment as a pattern for the protected names.
+const SHORT_INSTRUCTION_FOLDERS = ['.cursor', '.github', '.claude'];
+function isInstructionUnderShortFolder(abs, ctx) {
+  if (process.platform !== 'win32') return false;
+  const parts = slash(abs).split('/');
+  const choices = parts.map((seg, i) => {
+    const m = i < parts.length - 1 ? SHORT_NAME_RE.exec(seg) : null;
+    if (!m || m[2]) return [seg];
+    const pre = m[1].toUpperCase();
+    const longs = SHORT_INSTRUCTION_FOLDERS.filter((f) => f.replace(/^\.+/, '').slice(0, 6).toUpperCase() === pre);
+    return longs.length ? [seg].concat(longs) : [seg];
+  });
+  const branching = choices.filter((c) => c.length > 1).length;
+  if (branching === 0) return false;
+  // More short folders than we expand (2^6 = 64 paths at most): ask rather than drop some of them unread.
+  if (branching > 6) return true;
+  let combos = [''];
+  choices.forEach((c, i) => {
+    const next = [];
+    for (const base of combos) for (const alt of c) next.push(i ? base + '/' + alt : alt);
+    combos = next;
+  });
+  return combos.some((c) => isInstructionFile(c, ctx));
+}
+
+/** Whether a typed path names an instruction file, as typed or where it really leads (links followed). */
+function isInstructionPath(p, opts = {}) {
+  if (typeof p !== 'string' || !p) return false;
+  const ctx = contextOf(opts);
+  const expanded = expandEnv(expandHome(p, ctx.home), ctx.env);
+  // Windows drops trailing dots and spaces (and a stream suffix) from every name, so `AGENTS.md.` opens AGENTS.md:
+  // the same normalization as classifyPath, on the text, so it also holds for a file that does not exist yet.
+  expanded.text = stripStreams(expanded.text);
+  const abs = path.resolve(ctx.cwd, expanded.text);
+  const candidates = new Set([abs, realTargetOf(abs)]);
+  const physical = physicalDotDot(expanded.text, ctx.cwd);
+  if (physical) { candidates.add(physical); candidates.add(realTargetOf(physical)); }
+  for (const candidate of candidates) {
+    if (isInstructionFile(candidate, ctx) || isShortInstructionName(candidate) || isInstructionUnderShortFolder(candidate, ctx)) return true;
+  }
+  return false;
+}
+
+/**
+ * null when `p` is not an instruction file, else {file, ask, deny}: the messages for a write to it
+ * (ask: the user decides; deny: strict mode).
+ */
+function instructionWriteNotice(p, opts = {}) {
+  if (!isInstructionPath(p, opts)) return null;
+  // The name comes from the agent: no control characters, and short, in a message the user reads.
+  const shown = String(p).replace(/[\u0000-\u001f\u007f-\u009f]/g, '?');
+  const file = shown.length > 80 ? shown.slice(0, 79) + '…' : shown;
+  return {
+    file,
+    ask: 'zn: this writes to ' + file + ', which your agent reads as standing instructions in later sessions. Approve only if you asked for this change.',
+    deny: 'zn: this writes to ' + file + ', which your agent reads as standing instructions in later sessions, and zn is set to block that. Ask the user to make this change.',
+  };
+}
+
+// Programs that write the files they are given. cp, mv and the like write only their last argument; sed and perl
+// only with an in-place flag; the others any file argument. A redirect target counts for every command.
+const INSTRUCTION_WRITERS = new Set(['tee', 'cp', 'mv', 'install', 'rsync', 'ln', 'dd', 'truncate', 'touch', 'sed', 'perl', 'ex', 'ed', 'patch',
+  'set-content', 'add-content', 'out-file', 'sc', 'ac', 'ni', 'new-item', 'copy-item', 'move-item', 'copy', 'move', 'ren', 'rename-item']);
+const INSTRUCTION_DEST_LAST = new Set(['cp', 'mv', 'install', 'rsync', 'ln', 'copy', 'move', 'copy-item', 'move-item', 'ren', 'rename-item']);
+const IN_PLACE_RE = /^(?:-[A-Za-z]*i|--in-place)/;
+const INSTRUCTION_CHECKS_MAX = 64;
+
+// Words that run the next command: the command word is the first one after them (and their options).
+// Each maps to the options that take a value.
+const INSTRUCTION_WRAPPERS = new Map([
+  ['sudo', new Set(['-u', '-g', '-h', '-p', '-C', '-U', '-D', '-R', '-T', '--user', '--group', '--host'])],
+  ['doas', new Set(['-u', '-C'])],
+  ['env', new Set(['-u', '-C', '-S'])],
+  ['xargs', new Set(['-n', '-I', '-L', '-P', '-d', '-E', '-s', '-a'])],
+  ['nice', new Set(['-n'])],
+  ['time', new Set(['-f', '-o'])],
+  ['command', new Set()], ['builtin', new Set()], ['exec', new Set()], ['nohup', new Set()], ['chronic', new Set()],
+  ['timeout', new Set(['-k', '-s', '--kill-after', '--signal'])],
+  ['stdbuf', new Set(['-i', '-o', '-e', '--input', '--output', '--error'])],
+  ['ionice', new Set(['-c', '-n', '-p', '-P', '-u', '--class', '--classdata'])],
+  ['then', new Set()], ['do', new Set()], ['else', new Set()], ['if', new Set()], ['while', new Set()], ['until', new Set()],
+  ['!', new Set()], ['{', new Set()],
+]);
+
+/** Index in `seg` of the command word of a simple command (after VAR=value, sudo, env, nohup, time, xargs...); -1 if none. */
+function commandWordAt(seg, progs) {
+  let i = 0;
+  while (i < progs.length) {
+    if (seg[i].redirectTarget || /^[A-Za-z_][A-Za-z0-9_]*=/.test(seg[i].text)) { i++; continue; }
+    const takesValue = INSTRUCTION_WRAPPERS.get(progs[i]);
+    if (!takesValue) return i;
+    const wrapper = progs[i];
+    i++;
+    while (i < progs.length && seg[i].text.length > 1 && seg[i].text.startsWith('-')) i += takesValue.has(seg[i].text) ? 2 : 1;
+    if (wrapper === 'timeout') i++; // its first argument is the duration
+  }
+  return -1;
+}
+
+// Downloaders that write the file named by an output option. The value-taking short options (other than the
+// output one) end a cluster such as `-sSo`: what follows them is their value.
+const INSTRUCTION_DOWNLOADERS = {
+  curl: { long: '--output', short: 'o', valued: 'AbcCdDeEFHKmPQrtTuUwxXyYz' },
+  wget: { long: '--output-document', short: 'O', valued: 'abBeFHiIlnoPQtTUwX' },
+};
+
+/** The files a `curl` or `wget` command writes with -o/--output or -O/--output-document. */
+function downloadTargets(name, rest) {
+  const spec = INSTRUCTION_DOWNLOADERS[name];
+  const out = [];
+  for (let i = 0; i < rest.length; i++) {
+    const x = rest[i];
+    if (x === spec.long) {
+      if (i + 1 < rest.length) out.push(rest[i + 1]);
+      i++;
+    } else if (x.startsWith(spec.long + '=')) {
+      out.push(x.slice(spec.long.length + 1));
+    } else if (/^-[A-Za-z]/.test(x)) {
+      for (let k = 1; k < x.length; k++) {
+        if (x[k] === spec.short) {
+          const attached = x.slice(k + 1);
+          if (attached) out.push(attached);
+          else if (i + 1 < rest.length) { out.push(rest[i + 1]); i++; }
+          break;
+        }
+        if (spec.valued.includes(x[k])) break;
+      }
+    }
+  }
+  return out;
+}
+
+const PS_COPY_MOVE = new Set(['copy', 'move', 'copy-item', 'move-item']);
+
+/** The value of PowerShell's -Destination (any unambiguous prefix, also -Destination:value), or null. */
+function psDestinationOf(rest) {
+  for (let i = 0; i < rest.length; i++) {
+    const m = /^-des(?:t(?:i(?:n(?:a(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)?(?::(.*))?$/i.exec(rest[i]);
+    if (m) return m[1] ? m[1] : (i + 1 < rest.length ? rest[i + 1] : null);
+  }
+  return null;
+}
+
+/** The target directory named with -t DIR or --target-directory[=]DIR, or null. */
+function targetDirectoryOf(rest) {
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === '-t' || rest[i] === '--target-directory') return i + 1 < rest.length ? rest[i + 1] : null;
+    if (rest[i].startsWith('--target-directory=')) return rest[i].slice('--target-directory='.length);
+  }
+  return null;
+}
+
+/** When `dest` is a directory (named with a trailing separator, forced by -t, or existing now), where each source lands in it. */
+function intoDirectory(dest, sources, forced, opts) {
+  let isDir = forced || /[\\/]$/.test(dest);
+  if (!isDir) {
+    try {
+      const ctx = contextOf(opts);
+      isDir = fs.statSync(path.resolve(ctx.cwd, expandEnv(expandHome(dest, ctx.home), ctx.env).text)).isDirectory();
+    } catch (_) { isDir = false; }
+  }
+  if (!isDir) return [];
+  const base = dest.replace(/[\\/]+$/, '');
+  const landed = [];
+  for (const src of sources) {
+    const name = src.replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+    if (name && name !== '.' && name !== '..') landed.push(base + '/' + name);
+  }
+  return landed;
+}
+
+/** The first notice for a word of a shell command that writes an instruction file; null when none does. */
+function instructionWriteInWords(readings, opts) {
+  const seen = new Set();
+  for (const reading of readings) {
+    const segments = new Map();
+    for (const w of reading) {
+      if (!segments.has(w.seq)) segments.set(w.seq, []);
+      segments.get(w.seq).push(w);
+    }
+    for (const seg of segments.values()) {
+      const progs = seg.map((x) => x.text.split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, ''));
+      const at = commandWordAt(seg, progs);
+      const candidates = [];
+      for (const w of seg) if (w.redirectTarget) candidates.push(w.text);
+      if (at >= 0 && INSTRUCTION_DOWNLOADERS[progs[at]] && Object.prototype.hasOwnProperty.call(INSTRUCTION_DOWNLOADERS, progs[at])) {
+        candidates.push(...downloadTargets(progs[at], seg.slice(at + 1).map((x) => x.text)));
+      } else if (at >= 0 && INSTRUCTION_WRITERS.has(progs[at])) {
+        const name = progs[at];
+        const rest = seg.slice(at + 1).map((x) => x.text);
+        const args = rest.filter((x) => x && !x.startsWith('-') && !/^[0-9]*[<>]/.test(x));
+        if (name === 'dd') {
+          for (const x of rest) if (x.startsWith('of=')) candidates.push(x.slice(3));
+        } else if ((name === 'sed' || name === 'perl') && !rest.some((x) => IN_PLACE_RE.test(x))) {
+          // These only read their files without an in-place flag.
+        } else if (INSTRUCTION_DEST_LAST.has(name)) {
+          // Copy-Item -Path a -Destination b: the destination is named, whatever its place.
+          const psDest = PS_COPY_MOVE.has(name) ? psDestinationOf(rest) : null;
+          const dir = psDest !== null ? null : targetDirectoryOf(rest);
+          if (psDest !== null) {
+            candidates.push(psDest, ...intoDirectory(psDest, args.filter((x) => x !== psDest), false, opts));
+          } else if (dir !== null) {
+            // -t DIR: every other argument is a source, written into DIR.
+            const at = args.indexOf(dir);
+            const sources = args.filter((_, j) => j !== at);
+            candidates.push(...intoDirectory(dir, sources, true, opts));
+          } else if (args.length > 1) {
+            const dest = args[args.length - 1];
+            candidates.push(dest, ...intoDirectory(dest, args.slice(0, -1), false, opts));
+          }
+        } else {
+          candidates.push(...args);
+        }
+      }
+      for (const text of candidates) {
+        if (!text || seen.has(text)) continue;
+        seen.add(text);
+        if (seen.size > INSTRUCTION_CHECKS_MAX || overBudget(opts.budget, 1)) return null;
+        const n = instructionWriteNotice(text, opts);
+        if (n) return n;
+      }
+    }
+  }
+  return null;
+}
+
+// The files an `apply_patch` sent as a shell command adds or updates (or moves to).
+const SHELL_PATCH_WRITES_RE = /^\*\*\* (?:(?:Add|Update) File|Move to): (.+)$/gm;
+function instructionWriteInPatch(cmd, opts) {
+  if (!/^\s*apply_patch\b/.test(String(cmd))) return null;
+  let seen = 0;
+  for (const m of String(cmd).matchAll(SHELL_PATCH_WRITES_RE)) {
+    if (++seen > SHELL_PATCH_FILES_NAMED) break;
+    const n = instructionWriteNotice(m[1].trim(), opts);
+    if (n) return n;
+  }
   return null;
 }
 
@@ -712,6 +1218,8 @@ function scanFirstCommand(cmd, posix = false) {
       continue;
     }
     if (ch === '`' || (ch === '$' && s[i + 1] === '(')) { substitution = true; pushChar(ch, i); continue; }
+    // `>|` is one redirection (it overrides noclobber), not a `>` followed by a pipe.
+    if (ch === '|' && s[i - 1] === '>' && cur && cur.end === i && !cur.text.endsWith('>>')) { pushChar(ch, i); continue; }
     if (ch === ';' || ch === '&' || ch === '|' || ch === '\n' || ch === '(' || ch === ')') {
       endWord();
       return { end: i, words, substitution, operator: ch, unterminated: false };
@@ -721,6 +1229,41 @@ function scanFirstCommand(cmd, posix = false) {
   }
   endWord();
   return { end: s.length, words, substitution, operator: null, unterminated: quote !== null };
+}
+
+// `>` or `>>` as a word of its own, with an optional fd or `*` (PowerShell: all streams) in front.
+const REDIRECT_OP_WORD_RE = /^(?:[0-9]*|\*)(?:>\||>>?)$/;
+// The same operator glued to the end of a word (`x>` in `echo x> file`), read on the raw source so a quoted ">" is not one.
+const GLUED_END_RE = /(?<![\\<>&])(?:>\||>>?)$/;
+// What can stand in front of a redirect operator without being a word of its own: a file descriptor, `*` (PowerShell:
+// all streams) or a bash `{name}` descriptor.
+const REDIRECT_FD_PREFIX_RE = /^(?:[0-9]*|\*|\{[A-Za-z_][A-Za-z0-9_]*\})$/;
+/**
+ * `x>file`, `x>>file`, `"x">file`: find the first `>` of a raw word that is neither quoted nor escaped, in one pass
+ * over the word. Returns {at, len} (the operator) or null when the word holds no such operator, has `<` before it,
+ * or the operator is a descriptor copy (`>&2`) or the end of the word (a redirect whose target is the next word).
+ */
+function gluedRedirect(raw) {
+  let quote = null;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (quote === "'") { if (ch === "'") quote = null; continue; }
+    if (ch === '\\') { i++; continue; }
+    if (quote === '"') { if (ch === '"') quote = null; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === '<') return null;
+    if (ch !== '>') continue;
+    const len = raw[i + 1] === '>' || raw[i + 1] === '|' ? 2 : 1; // `>|` overrides noclobber
+    const next = raw[i + len];
+    if (i === 0 || next === undefined || next === '&' || next === '>') return null;
+    return { at: i, len };
+  }
+  return null;
+}
+// The text of a piece of a raw word, quotes removed the way the scanner removes them.
+function dequoteFragment(frag, posix) {
+  const w = scanFirstCommand(frag, posix).words;
+  return w.length ? w[0].text : '';
 }
 
 /** Every word of the whole command (rough), with a flag for > / >> targets and the command name of its segment. */
@@ -740,9 +1283,33 @@ function allWords(cmd, posix = false) {
     for (let k = 0; k < scan.words.length; k++) {
       const w = scan.words[k];
       const prev = k > 0 ? scan.words[k - 1].text : '';
-      const isRedirTarget = /^[0-9]*>>?$/.test(prev) || /^[0-9]*>>?./.test(w.text);
+      const prevRaw = k > 0 ? rest.slice(scan.words[k - 1].start, scan.words[k - 1].end) : '';
+      const raw = rest.slice(w.start, w.end);
+      // The operator can sit at the end of the word before (`echo x> file`, `echo x>> file`) or inside the word
+      // (`echo x>file`): a redirect whatever the program, bash, cmd.exe or PowerShell.
+      const glued = gluedRedirect(raw);
+      const prefixRaw = glued ? raw.slice(0, glued.at) : '';
+      // A descriptor in front (`2>x`, `{fd}>x`) belongs to the operator; any other prefix is an argument of its own.
+      const gluedOp = glued !== null && !REDIRECT_FD_PREFIX_RE.test(prefixRaw);
+      const afterOp = REDIRECT_OP_WORD_RE.test(prev) || GLUED_END_RE.test(prevRaw);
+      const isRedirTarget = afterOp || /^(?:[0-9]*|\*)(?:>\||>>?)./.test(w.text) || glued !== null;
+      let t = w.text;
+      let targetRaw = raw;
+      if (glued) {
+        targetRaw = raw.slice(glued.at + glued.len);
+        t = dequoteFragment(targetRaw, posix);
+        // `cat ~/.ssh/id_rsa>x` reads the file before it writes x: the part before the operator is checked as a word.
+        if (gluedOp) out.push({ text: dequoteFragment(prefixRaw, posix), redirectTarget: afterOp, head, seq: guard, sub, gitArgs, git: gi >= 0 });
+      }
       // Input redirections: <file, 0<file, <>file (read and write), {fd}<file.
-      out.push({ text: w.text.replace(/^[0-9]*>>?/, '').replace(/^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?<>?/, ''), redirectTarget: isRedirTarget, head, seq: guard, sub, gitArgs, git: gi >= 0 });
+      t = t.replace(/^(?:[0-9]*|\*)(?:>\||>>?)/, '').replace(/^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?<>?/, '');
+      // A drive path after a redirect (cmd.exe and PowerShell write them with "\"): the backslashes are separators,
+      // not shell escapes, so the target is read as typed (C:\Users\me\.claude\*.json keeps its "\*").
+      if (isRedirTarget) {
+        const typed = targetRaw.replace(/^(?:[0-9]*|\*)(?:>\||>>?)/, '');
+        if (/^[A-Za-z]:\\/.test(typed) && !/['"]/.test(typed)) t = typed;
+      }
+      out.push({ text: t, redirectTarget: isRedirTarget, head, seq: guard, sub, gitArgs, git: gi >= 0 });
     }
     rest = rest.slice(scan.end + 1);
   }
@@ -761,15 +1328,94 @@ function commandName(words) {
 // (less and tree are not here: tree writes its output with -o, less can run commands.)
 const READ_ONLY_CMDS = new Set(['cat', 'head', 'tail', 'more', 'grep', 'egrep', 'fgrep', 'rg', 'ls', 'stat', 'wc', 'diff',
   'file', 'bat', 'jq', 'type', 'gc', 'get-content', 'select-string', 'findstr', 'dir', 'pwd', 'echo']);
-const AGENT_CONFIG_MENTION_RE = /\.claude\/settings|\.codex\/|\.cursor\/hooks|opencode\.jsonc?|\.opencode\/|\.config\/opencode\//i;
+const AGENT_CONFIG_MENTION_RE = /\.claude\/settings|\.codex\/|\.cursor\/hooks|\.gemini\/config\/hooks|\.copilot\/(?:hooks|settings|config)|\.github\/hooks|\.github\/copilot\/settings|github-copilot\/policy\.d|\.gemini\/settings|gemini-cli\/settings|\.zcode\/(?:cli\/)?config|antigravity-cli\/settings|opencode\.jsonc?|\.opencode\/|\.config\/opencode\//i;
+// .agents is shared with other tools (Codex reads .agents/skills; Antigravity keeps rules and workflows there), so
+// only the folder itself, its hooks file, globs or ".." inside it, and changing into it count as touching the hook.
+// Written as three linear pieces (the one pattern it replaces retried the whole rest of a word at every `.agents/` in it):
+// the folder named on its own, a start `.agents/`, and what may follow a start (names, then hooks.json, `..` or a glob).
+const AGENTS_BARE_RE = /(?<=^|[\/\s"'=:])\.agents\/*(?=$|[\s"';&|)])/i;
+const AGENTS_START_RE = /(?<=^|[\/\s"'=:])\.agents\//gi;
+const AGENTS_TAIL_RE = /^(?:[^\s"'\/]*\/)*(?:hooks\.json|\.\.(?=$|[\/\s"';&|)])|[^\s"'\/]*[*?[{$`])/i;
+const AGENTS_BREAK_RE = /[\s"']/g;
+/** Same answer as the single pattern the three above replace, in time linear in the word. */
+function agentsDirRiskyRe(t) {
+  if (AGENTS_BARE_RE.test(t)) return true;
+  AGENTS_START_RE.lastIndex = 0;
+  let m;
+  while ((m = AGENTS_START_RE.exec(t)) !== null) {
+    const from = m.index + m[0].length;
+    if (AGENTS_TAIL_RE.test(t.slice(from))) return true;
+    // The tail of a start covers the rest of its word, so later starts in the same word cannot do better: go on after it.
+    AGENTS_BREAK_RE.lastIndex = from;
+    const brk = AGENTS_BREAK_RE.exec(t);
+    if (!brk) break;
+    AGENTS_START_RE.lastIndex = brk.index;
+  }
+  return false;
+}
+const AGENTS_DIR_ANY_RE = /(?:^|[\/\s"'=:])\.agents(?:\/|$|[\s"';&|)])/i;
+// Commands that make a link: through a link, ".." no longer means what it says, so any mention of .agents counts.
+const LINK_CMDS = new Set(['ln', 'mklink']);
+
+const AGENTS_SEG_RE = /(^|\/)\.agents(\/|$)/i;
+// A word like ag/../hooks.json: ".." after a name, which a link can turn into a path outside the folder it seems to be in.
+const MID_DOTDOT_RE = /[^\/\\\s]\/\.\.(?:[\/\\]|$)/;
+const AGENTS_PROTECTED = 'zn: this command would change agent hook or plugin settings, which is protected. Ask the user to make this change.';
+
+/** Whether a writing word touches the .agents hook folder (see the notes above); w.link comes from markLinkWords. */
+function agentsDirRisky(t, w) {
+  // The first pattern is quadratic on long input: a word longer than a path can be is refused unchecked.
+  if (t.length > 4096) return /\.agents/i.test(t);
+  if (agentsDirRiskyRe(t)) return true;
+  if (!AGENTS_DIR_ANY_RE.test(t)) return false;
+  return CD_CMDS.has(bareHead(w.head).toLowerCase()) || w.link === true;
+}
+
+const LINK_WRAPPERS = new Set(['env', 'sudo', 'doas', 'command', 'exec', 'nohup', 'time', 'busybox', 'xargs', 'nice', 'builtin', 'stdbuf', 'timeout', '!', '{', 'then', 'do', 'else']);
+
+/**
+ * Marks (w.link) every word of a simple command that makes a link: ln, mklink, cp -s, New-Item with a link type,
+ * after env, sudo, command, exec, nohup, time, busybox or xargs, with a path in front of the name or quotes in it.
+ * The options are read only from that command's own words. A link made some other way (an interpreter) is not seen here;
+ * a link that already exists is followed instead (physicalDotDot, cdBasesOf).
+ */
+function markLinkWords(readings) {
+  for (const r of readings) {
+    let i = 0;
+    while (i < r.length) {
+      let j = i;
+      while (j < r.length && r[j].seq === r[i].seq) j++;
+      const clean = r.slice(i, j).map((x) => String(x.text).replace(/['"]/g, '').replace(/^\(+|[;)}]+$/g, ''));
+      let k = 0;
+      let head = '';
+      for (; k < clean.length; k++) {
+        const x = clean[k];
+        if (!x || x.startsWith('-') || ASSIGNMENT_RE.test(x)) continue;
+        const base = path.basename(slash(x)).toLowerCase().replace(/\.exe$/, '');
+        if (LINK_WRAPPERS.has(base)) continue;
+        head = base;
+        break;
+      }
+      const rest = clean.slice(k + 1);
+      const link = LINK_CMDS.has(head) ||
+        ((head === 'cp' || head === 'gcp') && rest.some((x) => /^-[A-Za-z]*[sl][A-Za-z]*$/.test(x) || x === '--symbolic-link' || x === '--link')) ||
+        ((head === 'new-item' || head === 'ni') && rest.some((x) => /symboliclink|junction|hardlink/i.test(x))) ||
+        (head === 'cmd' && rest.some((x) => LINK_CMDS.has(x.toLowerCase())));
+      if (link) for (let m = i; m < j; m++) r[m].link = true;
+      i = j;
+    }
+  }
+}
 
 const RESERVED_WORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'until', 'do', 'done', 'case', 'esac', 'function', '{', '}', '!', '[[', 'time', 'coproc', 'select', 'eval', 'exec', 'source', '.', 'sudo', 'doas', 'env', 'xargs', 'nohup', 'command', 'builtin', 'export', 'declare', 'local', 'readonly', 'typeset', 'alias', 'set', 'unset', 'let']);
 const ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
- * Prefix the first simple command with `zn run --` so the broker applies
- * policy, approval and masking. Only when every named marker is inside the
- * first simple command; anything else is refused with guidance.
+ * Commands with named markers. A marker in a command's arguments is never
+ * filled in (the value would show in the process list and in command-line
+ * logs), so such a command is refused with the way to pass the secret as an
+ * environment variable instead. A command the agent already started with
+ * `zn run` is left to the broker, which applies the same rule.
  * Returns {ok: true, command} or {ok: false, reason}.
  */
 function wrapWithZnRun(cmd, znRunPrefix) {
@@ -778,8 +1424,8 @@ function wrapWithZnRun(cmd, znRunPrefix) {
   if (named.length === 0) return { ok: true, command: s, wrapped: false };
   const scan = scanFirstCommand(s);
   const tail = s.slice(scan.end);
-  const guidance = ' zn fills in secrets only in the first command of a Bash call: run that command on its own, ' +
-    'with __ZN_NAME__ where the value goes (for example: psql "postgres://app:__ZN_DB_PASSWORD__@db/app" -c "select 1").';
+  const guidance = ' Next step: give the program the secret as an environment variable with `' + znCommand('run --secrets NAME -- <command>') + '` ' +
+    'and have the program read it from there (for example psql reads PGPASSWORD). For web requests, use the secrets_http_request tool of the zn "secrets" MCP server.';
   if (scan.unterminated) return { ok: false, reason: 'zn: this command has a quote that is not closed, so zn cannot read it. Close the quote and try again.' };
   if (markers.findNamedMarkers(tail).length > 0) {
     return { ok: false, reason: 'zn: this command uses a secret after its first command.' + guidance };
@@ -807,7 +1453,7 @@ function wrapWithZnRun(cmd, znRunPrefix) {
   if (/(^|[\\/])(zn|zn-gate)(\.js|\.cmd)?$/.test(first.text) && scan.words[k + 1] && scan.words[k + 1].text === 'run') {
     return { ok: true, command: s, wrapped: false };
   }
-  return { ok: true, command: s.slice(0, first.start) + znRunPrefix + ' ' + s.slice(first.start), wrapped: true };
+  return { ok: false, reason: 'zn: a secret marker in the arguments of a command is not filled in, because the value would show in the process list and in command-line logs.' + guidance };
 }
 
 /* ---------------------------- PowerShell ---------------------------- */
@@ -873,23 +1519,18 @@ function scanPowerShell(cmd) {
   return { words, simple };
 }
 
-function psQuote(s) {
-  return powershellQuote(portablePath(s));
-}
-
 /**
- * PowerShell counterpart of wrapWithZnRun. Commands with named markers are
- * only wrapped when the whole line is one native command with plain
- * arguments; anything else (cmdlets, aliases, pipelines, variables) is
- * refused, because zn cannot rewrite it safely.
- * opts: {nodePath, runJs, agent}
+ * PowerShell counterpart of wrapWithZnRun. A command with named markers is
+ * refused, with the way to pass the secret as an environment variable
+ * instead; a command already started with `zn run` is left to the broker.
+ * opts: {nodePath, runJs, agent} (kept for callers; nothing is rewritten)
  */
 function wrapPowerShell(cmd, opts) {
   const s = String(cmd);
   const named = markers.findNamedMarkers(s);
   if (named.length === 0) return { ok: true, command: s, wrapped: false };
-  const guidance = ' Next step: start the command with the program name and put the secret in its arguments, for example: ' +
-    "psql 'postgres://app:__ZN_DB_PASSWORD__@db/app' -c 'select 1'. For web requests, use the secrets_http_request tool of the zn \"secrets\" MCP server instead.";
+  const guidance = ' Next step: give the program the secret as an environment variable with `' + znCommand('run --secrets NAME -- <command>') + '` ' +
+    'and have the program read it from there (for example psql reads PGPASSWORD). For web requests, use the secrets_http_request tool of the zn "secrets" MCP server instead.';
   const scan = scanPowerShell(s);
   if (!scan.simple || scan.words.length === 0) {
     return { ok: false, reason: 'zn: this PowerShell command uses a pipeline, a variable or a script block, so zn cannot safely put a secret into it.' + guidance };
@@ -909,8 +1550,7 @@ function wrapPowerShell(cmd, opts) {
   if ((base === 'zn' || base === 'zn-gate') && scan.words[1] && scan.words[1].text === 'run') {
     return { ok: true, command: s, wrapped: false };
   }
-  const prefix = '& ' + psQuote(opts.nodePath) + ' ' + psQuote(opts.runJs) + ' --agent ' + String(opts.agent).replace(/[^a-z0-9-]/g, '') + ' --';
-  return { ok: true, command: prefix + ' ' + s.slice(scan.words[0].start), wrapped: true };
+  return { ok: false, reason: 'zn: a secret marker in the arguments of a command is not filled in, because the value would show in the process list and in command-line logs.' + guidance };
 }
 
 const NETWORK_RE = /(^|[\s;&|(`$'"])(curl|wget|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|rsync|ftp|tftp|http|https|httpie|xh|Invoke-WebRequest|Invoke-RestMethod|iwr|irm)(?=$|[\s;&|)'"])|\bgit\s+(push|fetch|pull|clone|remote|ls-remote)\b|\b(npm|pnpm|yarn)\s+publish\b|\b(docker|podman)\s+(push|login)\b|\bhttps?:\/\/|\/dev\/(tcp|udp)\//i;
@@ -924,7 +1564,7 @@ function hasNetworkSignals(cmd) {
 }
 
 // The program is zn, zn-gate (also with a version: npx -y zn-gate@1.6.0, pnpm dlx zn-gate@latest) or the bin file.
-const ZN_ADMIN_RE = /(^|[\s;&|(`$'"\\\/])((?:zn|zn-gate(?:@[^\s"'`;&|]+)?|cli\.js))(\.cmd|\.js|\.ps1)?["']?\s+(?:--\s+)?(secret\s+(set|get|rm|remove|import|adopt|approve|allow|reveal|link)|env\s+(shadow|unshadow)|unlock|lock|connect|disconnect|hooks\s+(install|uninstall)|init(?![^\n;&|#`$()'"<>\\]{0,512}[ \t]--(?:wrap-mcp|dry-run|revert|shadow)(?=[ \t\n]|$))|stats(?:\s+(?:-{1,2}[^\s-]\S*|\d+))*\s+share\s+on|["']?pins["']?\s+["']?approve)\b/i;
+const ZN_ADMIN_RE = /(^|[\s;&|(`$'"\\\/])((?:zn|zn-gate(?:@[^\s"'`;&|]+)?|cli\.js))(\.cmd|\.js|\.ps1)?["']?\s+(?:--\s+)?(secret\s+(set|get|rm|remove|import|adopt|approve|allow|reveal|link)|env\s+(shadow|unshadow)|unlock|lock|uninstall|vault\s+(?:reset|purge)|connect|disconnect|hooks\s+(install|uninstall)|init(?![^\n;&|#`$()'"<>\\]{0,512}[ \t]--(?:wrap-mcp|dry-run|revert|shadow)(?=[ \t\n]|$))|stats(?:\s+(?:-{1,2}[^\s-]\S*|\d+))*\s+share\s+on|["']?pins["']?\s+["']?approve)\b/i;
 
 // `npm exec` (and `npm x`) keeps the options after the package for itself unless a `--` comes first, so
 // `npm exec zn-gate init --dry-run` runs the guided init: the options do not count there. Checked per simple
@@ -956,7 +1596,8 @@ function adminCommand(cmd) {
 const SHELL_SCAN_CAP = 100 * 1024; // characters
 function vaultMessage(opts = {}) {
   return 'zn blocked this: ~/.zn is where zn keeps your secrets, so agents may not read or change it. ' +
-    'Next step: to use a secret in a command, write __ZN_NAME__ where the value goes (zn fills it in); to add one, ask the user to run `' +
+    'Next step: to use a secret in a command, run it with `' + znCommand('run --secrets NAME -- <command>', opts) + '` so the program gets the value as an environment variable; ' +
+    'for a web request, use the secrets_http_request tool with __ZN_NAME__ where the value goes; to add a secret, ask the user to run `' +
     znCommand('secret set NAME', opts) + '` in their own terminal.';
 }
 const TOO_LONG_MESSAGE = 'zn: this command is too long for zn to check (over 100 KB), so it was blocked. Next step: tell the user; do not resend it in parts.';
@@ -1536,7 +2177,7 @@ const KEYCHAIN_LIB_LOAD_RE = /(?:require\s*\(|import\s*\(|\bimport\s|\bfrom\s)/;
 // zn-gate's own client modules count only by their full path (node_modules, a global install or packages/zn-gate): a
 // project's own lib/client is no business of ours. A relative ./lib/client inside zn-gate itself is not covered.
 // Matching ignores case (macOS and Windows load ZN-GATE/LIB/CLIENT) and drops `/./` segments first.
-const KEYCHAIN_LIB_NAME_RE = /(?:cloud-key(?![A-Za-z0-9_-])|vault[\\/]+keychain|zn-gate[\\/]+lib[\\/]+(?:vault[\\/]+)?client(?![A-Za-z0-9_-]))/i;
+const KEYCHAIN_LIB_NAME_RE = /(?:cloud-key(?![A-Za-z0-9_-])|vault[\\/]+keychain|zn-gate(?:@[A-Za-z0-9._+-]*){0,6}(?:[\\/]+[0-9][A-Za-z0-9._+-]*)?[\\/]+lib[\\/]+(?:vault[\\/]+)?client(?![A-Za-z0-9_-]))/i;
 const KEYCHAIN_DOT_RE = /[\\/]\.(?=[\\/])/g;
 // A name written with escapes (\x2f, \x2F, \u{2f}, \057) is the same name once the shell or the interpreter decodes
 // it, so the name is also looked for in decoded copies. The decoded copies only add matches. One pass, no backtracking.
@@ -1553,9 +2194,30 @@ function keychainUnescape(t, re = KEYCHAIN_ESC_RE) {
 const KEYCHAIN_SHELL_JOIN_RE = /\\\r?\n|['"]/g;
 // A name that merely ends in zn-gate/lib/client (acme-zn-gate/lib/client) is refused on purpose: no left boundary, so a
 // trick that leaves a letter before the name cannot get past the rule.
+// A name built in the command is the same name: a `+` or `.concat(` between two quoted pieces ('zn-' + 'gate/lib/client'),
+// and a `,` between two quoted pieces in path.join('zn-gate', 'lib', 'client') or ['zn-gate', 'lib', 'client'].join('/')
+// (read as a separator, and also as nothing for .join('')). Any whitespace, line break, line continuation or escaped quote
+// may sit between the pieces, also after the shell decodes \x27. A Bun or Deno cache folder with a version is the same
+// module. Each pattern is anchored on a quote, so it runs in linear time.
+// Not covered, on purpose: a comment or parentheses between the pieces, `${"..."}` interpolation, a name assembled from
+// variables or with String.fromCharCode, a URL-encoded name (%2D; require does not decode it), fullwidth look-alike
+// letters (require does not fold them) and Windows 8.3 short names. This is a barrier, not a boundary.
+const KEYCHAIN_CONCAT_RE = /\\?['"`][\s\\]*(?:\+|\.concat\()[\s\\]*['"`]/g;
+const KEYCHAIN_LIST_RE = /\\?['"`][\s\\]*,[\s\\]*['"`]/g;
 const keychainLibName = (t) => {
-  const j = t.replace(KEYCHAIN_SHELL_JOIN_RE, '');
-  return [t, keychainUnescape(j), keychainUnescape(j, KEYCHAIN_SH_ESC_RE)].some((c) => KEYCHAIN_LIB_NAME_RE.test(c.replace(KEYCHAIN_DOT_RE, '')));
+  const sh = keychainUnescape(t, KEYCHAIN_SH_ESC_RE);
+  const joins = [];
+  for (const b of sh === t ? [t] : [t, sh]) {
+    const c = b.replace(KEYCHAIN_CONCAT_RE, '');
+    for (const x of [c.replace(KEYCHAIN_LIST_RE, '/'), c.replace(KEYCHAIN_LIST_RE, '')]) if (x !== t && !joins.includes(x)) joins.push(x);
+  }
+  const out = [t];
+  for (const u of [t, ...joins]) {
+    const j = u.replace(KEYCHAIN_SHELL_JOIN_RE, '');
+    out.push(keychainUnescape(j), keychainUnescape(j, KEYCHAIN_SH_ESC_RE));
+  }
+  out.push(...joins);
+  return out.some((x) => KEYCHAIN_LIB_NAME_RE.test(x.replace(KEYCHAIN_DOT_RE, '')));
 };
 const KEYCHAIN_LIB_USE_RE = /(?:loadStoredKey|resolveApiKey|\b_native\b|CLOUD_SLOT|loadIdentity|storeIdentity|\banalyze\b|\bisCloudEnabled\b)/;
 
@@ -1603,8 +2265,76 @@ function keychainQuery(cmd, env) {
   return false;
 }
 
+/**
+ * A deny message, or null. With `opts.instructionNotice` (an object the caller owns), a command that is allowed but writes
+ * an agent memory or instruction file leaves the notice from instructionWriteNotice in `opts.instructionNotice.hit`.
+ */
 function bashDenial(cmd, opts = {}) {
-  return shellPatchMessage(cmd, bashDenialOf(cmd, opts), opts);
+  const deny = shellPatchMessage(cmd, bashDenialOf(cmd, opts), opts);
+  const note = opts.instructionNotice;
+  if (!deny && note && !note.hit) note.hit = instructionWriteInPatch(cmd, opts);
+  return deny;
+}
+
+/* find ROOT ... -delete / -exec ...: a find that deletes, started at the home folder or above it, whose expression names
+   zn's vault or an agent's plugin folders or state. The deny message, or null. */
+const FIND_PROTECTED_NAME_RE = /^\.?(?:zn|gemini|zcode|claude|codex|cursor|agents)$|^(?:plugins|antigravity-cli|cli|config|installed_plugins\.json|known_marketplaces\.json|config\.json)$/i;
+function findDeleteDenial(words, opts) {
+  const ctx = opts.ctx || contextOf(opts);
+  const home = opts.home || os.homedir();
+  const env = opts.env || process.env;
+  const cwd = path.resolve(opts.cwd || process.cwd());
+  const homes = (ctx.agent && ctx.agent.homes) || [keyOf(slash(path.resolve(home)))];
+  const bySeq = new Map();
+  for (const w of words) {
+    if (!bySeq.has(w.seq)) bySeq.set(w.seq, []);
+    bySeq.get(w.seq).push(w);
+  }
+  for (const ws of bySeq.values()) {
+    const texts = ws.map((w) => w.text.replace(/^["']|["']$/g, ''));
+    const at = texts.findIndex((x) => /^find(?:\.exe)?$/i.test(path.basename(x)));
+    if (at < 0) continue;
+    const rest = texts.slice(at + 1);
+    if (!rest.some((x) => /^-(?:delete|exec|execdir|ok|okdir)$/.test(x))) continue;
+    const named = rest.some((x) => FIND_PROTECTED_NAME_RE.test(x.replace(/[*?[\]]/g, '').replace(/^\//, '')));
+    if (!named) continue;
+    for (const r of rest) {
+      if (r.startsWith('-') || r === '(' || r === '!') break;
+      const root = keyOf(slash(path.resolve(cwd, expandEnv(expandHome(r, home), env).text)));
+      const rootPrefix = root.endsWith('/') ? root : root + '/';
+      if (/[$`]/.test(r) || homes.some((h) => h === root || h.startsWith(rootPrefix))) {
+        return 'zn: this find deletes files under ' + r + ', which holds zn\'s vault (~/.zn) or an agent\'s plugins, and the ' +
+          'names it matches include them, so it was blocked: an agent may not change how zn and its hooks run. Ask the user to make this change.';
+      }
+    }
+  }
+  return null;
+}
+
+/* NAME=value words of the command (also after export, set or declare), with ~ and the variables already known
+   expanded, as an environment overlay: {NAME: value} or null. A name set twice keeps its first value; the cases a
+   later value would matter are covered by the targets check (protectedElsewhere). */
+const ASSIGN_WORD_RE = /(?:^|[\s;&|(){}])(?:(?:export|declare|typeset|local|readonly)\s+(?:-\w+\s+)*)?([A-Za-z_][A-Za-z0-9_]{0,63})=("[^"]*"|'[^']*'|(?:\$\([^)]*\)|`[^`]*`|[^\s;&|()<>`])*)/g;
+function shellAssignments(cmd, opts) {
+  const home = opts.home || os.homedir();
+  const env = opts.env || process.env;
+  const out = {};
+  const unknown = new Set();
+  let n = 0;
+  for (const m of String(cmd).matchAll(ASSIGN_WORD_RE)) {
+    if (++n > 64) break;
+    const name = m[1];
+    // A name set twice may hold either value when it is used: zn does not know which.
+    if (name in out || unknown.has(name)) { delete out[name]; unknown.add(name); continue; }
+    let v = m[2];
+    if (/^(["']).*\1$/s.test(v)) v = v.slice(1, -1);
+    // The output of a command, or a variable zn cannot resolve, may be the home folder.
+    if (/\$\(|`/.test(v)) { unknown.add(name); continue; }
+    v = expandEnv(expandHome(v, home), { ...env, ...out }).text;
+    if (/\$\{?[A-Za-z_]|%[A-Za-z_][A-Za-z0-9_]*%/.test(v)) { unknown.add(name); continue; }
+    out[name] = v;
+  }
+  return { env: Object.keys(out).length ? out : null, unknown };
 }
 
 function bashDenialOf(cmd, opts = {}) {
@@ -1612,6 +2342,13 @@ function bashDenialOf(cmd, opts = {}) {
   const admin = adminCommand(cmd);
   if (admin) return adminDenial(admin, opts, cmd);
   if (keychainQuery(cmd, opts.env || process.env)) return KEYCHAIN_MESSAGE;
+  // Variables the command sets itself (X=$HOME; rm -rf $X/.zn, export D=~/.zn) are expanded like the environment's.
+  const assigned = shellAssignments(cmd, opts);
+  if (assigned.env || assigned.unknown.size) {
+    const env = { ...(opts.env || process.env), ...(assigned.env || {}) };
+    for (const name of assigned.unknown) delete env[name];
+    opts = { ...opts, env, unknownVars: assigned.unknown };
+  }
   // The context (home, project, agent directories) is built once per command.
   opts = { ...opts, ctx: contextOf(opts) };
   // The code of a shell inside the command (sh -c "...") is checked as a command of its own, with the same budget.
@@ -1619,6 +2356,16 @@ function bashDenialOf(cmd, opts = {}) {
   if (!depth || !opts.budget) opts.budget = { until: Date.now() + CHECK_BUDGET_MS, disk: CHECK_BUDGET_DISK };
   // The bodies of the here-documents read as data are data, not command-line words, and are dropped first.
   const text = stripHeredocs(cmd, opts.budget);
+  // Destructive shell commands (see lib/destructive.js). The runner passes the rules from the user's settings; with no
+  // list, the two default rules apply. The bodies of data here-documents are not shell code and are not read.
+  {
+    const rules = Array.isArray(opts.destructiveRules) ? opts.destructiveRules : require('./../destructive').DEFAULT_RULES;
+    if (rules.length) {
+      // Loaded only now, so a hook with the check off does not pay for it.
+      const destructiveDeny = require('../destructive').denial(text, rules);
+      if (destructiveDeny) return destructiveDeny;
+    }
+  }
   // The command is read three times: a backslash before a letter is a Windows
   // path separator or a bash escape, and a PowerShell backtick is an escape too.
   // A word protected in any reading is refused.
@@ -1648,10 +2395,17 @@ function bashDenialOf(cmd, opts = {}) {
     words.push(...split);
     readings.push(split);
   }
+  {
+    const findDeny = findDeleteDenial(readings[0], opts);
+    if (findDeny) return findDeny;
+  }
   // Where a relative .env path may be read from once the command has changed directory (cd app && cat .env).
   // Each reading is followed on its own, so a cd counts once.
   opts.cdBases = cdBasesOf(readings, opts);
   opts.elsewhere = new Map();
+  markLinkWords(readings);
+  const mentionsAgents = /\.agents/i.test(text);
+  const makesLink = words.some((x) => x.link === true);
   if (overBudget(opts.budget, 0)) return TOO_SLOW_MESSAGE;
   opts.cmdText = text;
   // A word is classified once per command: each classification resolves the path on disk, and a long command
@@ -1659,6 +2413,8 @@ function bashDenialOf(cmd, opts = {}) {
   const classified = new Map();
   // And so is its verdict, which may read the file (a .env, a .pem).
   const denied = new Map();
+  // And whether a write target may still name ~/.zn or a plugin folder (protectedElsewhere).
+  const elsewhereProt = new Map();
   // A word with * ? or [ can match a secret file; the message names a literal file when the command has one too.
   // The command is refused either way, so after a glob only a few more words are resolved on disk to find that file.
   const GLOB_NAME_LOOKAHEAD = 32;
@@ -1684,12 +2440,24 @@ function bashDenialOf(cmd, opts = {}) {
     // A git pathspec with magic names the path after it.
     if (anyGit && text.charCodeAt(0) === 58) text = text.replace(PATHSPEC_MAGIC_RE, '') || text;
     const writing = !READ_ONLY_CMDS.has(w.head);
+    // After a cd that leads, through a link, into .agents, a writing command works inside the hook folder.
+    if (writing && opts.cdBases.agentsDir && !CD_CMDS.has(bareHead(w.head).toLowerCase())) return AGENTS_PROTECTED;
     if (!classified.has(text)) {
       if (globDeny && ++afterGlob > GLOB_NAME_LOOKAHEAD) return globDeny;
       if (overBudget(opts.budget, 1)) return TOO_SLOW_MESSAGE;
       classified.set(text, classifyWord(text, opts));
     }
-    const c = classified.get(text);
+    let c = classified.get(text);
+    // A cd's own target is not written to (where the cd leads is followed by cdBasesOf).
+    if ((writing || w.redirectTarget) && !CD_CMDS.has(bareHead(w.head).toLowerCase()) &&
+        (!c || (c.kind !== 'zn_state' && c.kind !== 'agent_config'))) {
+      if (!elsewhereProt.has(text)) {
+        if (overBudget(opts.budget, (opts.cdBases && opts.cdBases.dirs.length) || 1)) return TOO_SLOW_MESSAGE;
+        elsewhereProt.set(text, protectedElsewhere(text, opts));
+      }
+      const e = elsewhereProt.get(text);
+      if (e) c = e;
+    }
     if ((!c || c.kind === 'dotenv' || c.kind === 'keyfile') && (w.git || anyGit)) {
       // git show HEAD:.env, git cat-file -p :app/.env: a secret file read from the repository, not from disk.
       const deny = gitObjectDenial(text, opts) ||
@@ -1698,8 +2466,11 @@ function bashDenialOf(cmd, opts = {}) {
       if (deny) return deny;
     }
     if (!c) {
-      if (writing && AGENT_CONFIG_MENTION_RE.test(slash(text))) {
-        return 'zn: this command would change agent hook or plugin settings, which is protected. Ask the user to make this change.';
+      // Segments that are just "." name the same place (.agents/. is the folder itself).
+      const t = slash(text).replace(/(?:\/\.)+(?=\/|$)/g, '');
+      if ((writing && (AGENT_CONFIG_MENTION_RE.test(t) || agentsDirRisky(t, w))) ||
+          ((writing || w.redirectTarget) && (mentionsAgents || makesLink) && MID_DOTDOT_RE.test(t))) {
+        return AGENTS_PROTECTED;
       }
       continue;
     }
@@ -1716,6 +2487,7 @@ function bashDenialOf(cmd, opts = {}) {
     if (deny && /[*?[]/.test(text)) { globDeny = globDeny || deny; continue; }
     if (deny) return deny;
   }
+  if (!globDeny && opts.instructionNotice && !opts.instructionNotice.hit) opts.instructionNotice.hit = instructionWriteInWords(readings, opts);
   return globDeny;
 }
 
@@ -1889,18 +2661,27 @@ function cdBasesOf(readings, opts) {
   const all = new Set([cwd]);
   let unknown = false;
   let moved = false;
+  let agentsDir = false;
   for (const words of readings) {
     if (unknown) break;
     let bases = [cwd];
     for (let k = 0; k < words.length && !unknown; k++) {
       // Found by its text, not by the command's head, so { cd x; ... } and if cd x; then ... count too.
-      if (!CD_CMDS.has(words[k].text.replace(/^[({]+/, '').toLowerCase())) continue;
+      // env -C DIR, env --chdir=DIR and git -C DIR run the rest of the command in DIR, like a cd.
+      let chdir = null;
+      if (!CD_CMDS.has(words[k].text.replace(/^[({]+/, '').toLowerCase())) {
+        const opt = words[k].text;
+        if (!/^(?:env|git)$/i.test(bareHead(words[k].head)) || !/^(?:-C|--chdir(?:=.*)?)$/.test(opt)) continue;
+        if (opt.startsWith('--chdir=')) chdir = opt.slice(8);
+        else if (words[k + 1] && words[k + 1].seq === words[k].seq) chdir = words[k + 1].text;
+        if (chdir === null || chdir === '') continue;
+      }
       moved = true;
       // Each cd followed costs its new places; past the budget, the rest cannot be followed.
       if (overBudget(opts.budget, bases.length)) { unknown = true; break; }
       // The target: the next word of the same simple command that is not an option (cd -P dir, Set-Location -Path dir).
-      let t = '~';
-      for (let j = k + 1; j < words.length && words[j].seq === words[k].seq; j++) {
+      let t = chdir !== null ? chdir.replace(/^["']|["']$/g, '') : '~';
+      for (let j = k + 1; chdir === null && j < words.length && words[j].seq === words[k].seq; j++) {
         const x = words[j].text.replace(/^["']|["']$/g, '').replace(/[;)}]+$/, '');
         if (!x || (x.startsWith('-') && x !== '-')) continue;
         t = x;
@@ -1909,13 +2690,26 @@ function cdBasesOf(readings, opts) {
       const target = t === '-' ? '-' : expandEnv(expandHome(t, home), env).text;
       if (target === '-' || /[$`*?[{]/.test(target)) { unknown = true; continue; }
       const next = new Set(bases);
-      for (const b of bases) next.add(path.resolve(b, target));
+      for (const b of bases) {
+        const lex = path.resolve(b, target);
+        next.add(lex);
+        // cd ag, cd -P ag/..: with ag a link into .agents, the real place is the hook folder.
+        const pd = physicalDotDot(target, b);
+        const real = new Set();
+        if (pd) real.add(pd);
+        for (const x of pd ? [lex, pd] : [lex]) { try { real.add(fs.realpathSync(x)); } catch (_) { /* not there */ } }
+        for (const x of real) {
+          if (x === lex) continue;
+          next.add(x);
+          if (AGENTS_SEG_RE.test(slash(x)) && !AGENTS_SEG_RE.test(slash(lex))) agentsDir = true;
+        }
+      }
       if (next.size > CD_BASES_MAX) { unknown = true; continue; }
       bases = [...next];
       for (const d of bases) all.add(d);
     }
   }
-  return { dirs: [...all], unknown, moved };
+  return { dirs: [...all], unknown, moved, agentsDir };
 }
 
 /* A .env path the working directory alone does not settle: one built while the command runs ($DIR/.env, $(...)/.env),
@@ -1982,7 +2776,7 @@ function adminDenial(admin, opts = {}, cmd = '') {
   const next = words.find((w) => !w.startsWith('-')) || '';
   let arg = '';
   if (/^hooks/i.test(admin)) {
-    arg = /^(claude-code|codex|cursor|opencode)$/.test(next) ? next : '<agent>';
+    arg = require('../agents').listAdapters().includes(next) ? next : '<agent>';
     // The fixed options of zn hooks install, so the user installs in the same place the agent asked for.
     for (const o of ['--project', '--no-mcp']) if (words.includes(o)) arg += ' ' + o;
   } else if (/^secret (set|get|rm|remove|reveal|allow|approve|link)$/i.test(admin)) {
@@ -2001,6 +2795,12 @@ function adminDenial(admin, opts = {}, cmd = '') {
   }
   if (/^hooks/i.test(admin)) {
     return 'zn blocked this: `' + znCommand(admin, opts) + '` turns zn\'s protection on or off for a coding agent, which is the user\'s decision. ' + run(full);
+  }
+  if (/^vault reset$/i.test(admin)) {
+    return 'zn blocked this: `' + znCommand(admin, opts) + '` replaces the secret vault with an empty one, which is the user\'s decision. ' + run(admin);
+  }
+  if (/^vault purge$/i.test(admin)) {
+    return 'zn blocked this: `' + znCommand(admin, opts) + '` deletes the secret vault and its backups for good, which is the user\'s decision. ' + run(admin);
   }
   if (/^(un)?lock$/i.test(admin)) {
     return 'zn blocked this: locking or unlocking the secret vault is the user\'s decision, so an agent may not run `' + znCommand(admin, opts) + '`. ' + run(admin);
@@ -2022,6 +2822,343 @@ function denialOf(c, text, opts) {
   return credentialDenial(text, c);
 }
 
+/* ------------------------------ egress ------------------------------ */
+
+/*
+ * Network requests written in a command (curl, wget, Invoke-WebRequest and its aliases, inline python or node code that
+ * opens a URL), in a WebFetch URL or in the arguments of an MCP call. egressParts() returns the places where data leaves
+ * the computer (headers, credentials, query string, body, inline code) as plain text; the hook runner scans that text with
+ * the scrubber engine for personal data and literal secrets. Values read from the environment ($TOKEN, ${API_KEY},
+ * $env:TOKEN, %TOKEN%) and command substitutions are removed first: that is the safe way to pass a secret, and only
+ * literal values are reported. A request whose hosts are all local (localhost, 127.0.0.1, ::1) or on the user's
+ * allow-list (hooks.egressAllowHosts) is not checked.
+ */
+const EGRESS_URL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+const EGRESS_URL_LIKE_RE = /^(?:localhost|\$|\[|[\w${}-]+(?:\.[\w${}-]+)+|[\w.${}-]+:\d+)(?:[:/?#]|$)/i;
+const EGRESS_URLS_IN_TEXT_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s'"`)}\]>]+/gi;
+const EGRESS_PROGRAMS = new Set(['curl', 'wget']);
+const EGRESS_WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'exec', 'nohup', 'time', 'nice', 'timeout', 'stdbuf', 'xargs', 'builtin',
+  'ionice', 'setsid', 'then', 'do', 'else', '!', '{']);
+const EGRESS_INTERPRETER_RE = /^(?:python[0-9.]*|py|node|nodejs|deno|bun)$/;
+const EGRESS_CODE_NET_RE = /\b(?:requests|httpx|urllib[0-9]?|urlopen|aiohttp|pycurl|http\.client|https?\.(?:get|request)|axios|undici|node-fetch|XMLHttpRequest|WebClient|socket)\b|\bfetch\s*\(|\bhttps?:\/\//i;
+// Options that take a value, by tool. The kind says where the value goes; skip lists the others, so their value is not read as a URL.
+const CURL_OPTIONS = {
+  long: { header: 'header', user: 'credentials', cookie: 'header', 'proxy-header': 'header', 'proxy-user': 'credentials', 'oauth2-bearer': 'credentials', 'user-agent': 'header',
+    referer: 'header', pass: 'credentials', data: 'body', 'data-raw': 'body', 'data-binary': 'body', 'data-ascii': 'body', 'data-urlencode': 'body', json: 'body',
+    form: 'body', 'form-string': 'body', 'url-query': 'query', url: 'host', proxy: 'url', preproxy: 'url' },
+  short: { H: 'header', u: 'credentials', b: 'header', A: 'header', e: 'header', d: 'body', F: 'body', x: 'url' },
+  skip: new Set(['output', 'request', 'max-time', 'connect-timeout', 'retry', 'retry-delay', 'retry-max-time', 'write-out', 'cacert', 'cert', 'key', 'resolve', 'limit-rate',
+    'max-redirs', 'range', 'time-cond', 'upload-file', 'config', 'dump-header', 'trace', 'trace-ascii', 'output-dir', 'connect-to', 'interface', 'local-port',
+    'dns-servers', 'pinnedpubkey', 'capath', 'cert-type', 'key-type', 'unix-socket', 'cookie-jar', 'continue-at', 'max-filesize', 'speed-limit', 'speed-time',
+    'stderr', 'variable', 'ciphers', 'curves', 'doh-url', 'hsts', 'alt-svc', 'noproxy', 'proxy-cacert', 'proxy-cert', 'proxy-key']),
+  shortSkip: new Set('cCDEKmoPQrTwXyYzt'.split('')),
+};
+const WGET_OPTIONS = {
+  long: { header: 'header', user: 'credentials', password: 'credentials', 'http-user': 'credentials', 'http-password': 'credentials', 'ftp-user': 'credentials', 'ftp-password': 'credentials',
+    'proxy-user': 'credentials', 'proxy-password': 'credentials', 'user-agent': 'header', referer: 'header', 'post-data': 'body', 'body-data': 'body' },
+  short: { U: 'header' },
+  skip: new Set(['output-document', 'output-file', 'append-output', 'directory-prefix', 'tries', 'timeout', 'wait', 'waitretry', 'read-timeout', 'dns-timeout',
+    'connect-timeout', 'limit-rate', 'quota', 'post-file', 'body-file', 'load-cookies', 'save-cookies', 'input-file', 'base', 'execute', 'bind-address',
+    'ca-certificate', 'certificate', 'private-key', 'level', 'accept', 'reject', 'domains', 'exclude-domains', 'include-directories', 'exclude-directories',
+    'default-page', 'method', 'config']),
+  shortSkip: new Set('OPoaiBtTwQlARDIXe'.split('')),
+};
+
+/** Text with the values read from the environment, and command substitutions, removed. */
+function egressStripEnv(text) {
+  return String(text).replace(ENV_REF_RE, '').replace(/\$\([^()]*\)/g, '');
+}
+
+/** Lower-case host of a URL (scheme, user information, port and path removed); '' when there is none. */
+function egressHostOf(raw) {
+  let s = String(raw).trim().replace(EGRESS_URL_SCHEME_RE, '');
+  s = s.split(/[/?#\\]/, 1)[0];
+  s = s.slice(s.lastIndexOf('@') + 1);
+  if (s[0] === '[') {
+    const end = s.indexOf(']');
+    return (end > 0 ? s.slice(1, end) : s).toLowerCase();
+  }
+  if (s.split(':').length === 2) s = s.slice(0, s.indexOf(':'));
+  return s.toLowerCase();
+}
+
+/** True for a host that stays on this computer, or one the user listed ("example.com" or "*.example.com"). */
+function egressHostAllowed(host, allow) {
+  if (!host) return false;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.localhost')) return true;
+  for (const a of Array.isArray(allow) ? allow : []) {
+    const h = String(a).toLowerCase();
+    if (h === host || (h.startsWith('*.') && host.endsWith(h.slice(1)))) return true;
+  }
+  return false;
+}
+
+/** Splits the options of curl or wget. Returns {parts, urls}: the places data goes, and the URLs named. */
+function egressOptions(words, spec) {
+  const parts = [];
+  const urls = [];
+  const put = (kind, value) => {
+    if (typeof value !== 'string' || value === '') return;
+    if (kind === 'host') { urls.push(value); parts.push({ where: 'url', text: value }); }
+    else if (kind === 'url') parts.push({ where: 'url', text: value });
+    else if (value.startsWith('@')) return; // @file is a file read, not a literal value
+    else {
+      parts.push({ where: kind, text: value });
+      // user:password is read like the credentials of a URL, so the detector of passwords in URLs applies to it.
+      if (kind === 'credentials' && value.includes(':')) parts.push({ where: 'url', text: 'https://' + value + '@host.invalid/' });
+    }
+  };
+  let restUrls = false;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (restUrls || w === '-' || w[0] !== '-') {
+      if (restUrls || EGRESS_URL_SCHEME_RE.test(w) || EGRESS_URL_LIKE_RE.test(w)) put('host', w);
+      continue;
+    }
+    if (w === '--') { restUrls = true; continue; }
+    if (w.startsWith('--')) {
+      const eq = w.indexOf('=');
+      const name = (eq > 0 ? w.slice(2, eq) : w.slice(2)).toLowerCase();
+      const known = Object.prototype.hasOwnProperty.call(spec.long, name);
+      if (!known && !spec.skip.has(name)) continue;
+      const value = eq > 0 ? w.slice(eq + 1) : words[++i];
+      if (known) put(spec.long[name], value);
+      continue;
+    }
+    for (let j = 1; j < w.length; j++) {
+      const c = w[j];
+      const known = Object.prototype.hasOwnProperty.call(spec.short, c);
+      if (!known && !spec.shortSkip.has(c)) continue;
+      let value = w.slice(j + 1);
+      if (!value) value = words[++i];
+      if (known) put(spec.short[c], value);
+      break;
+    }
+  }
+  return { parts, urls };
+}
+
+// PowerShell: the cmdlet's arguments are read as one text, up to the end of its line or pipeline.
+function egressPowerShell(text, powershell, found) {
+  const re = powershell
+    ? /(?:^|[\s;|&(])(invoke-webrequest|invoke-restmethod|iwr|irm|curl|wget)(?=\s)/gi
+    : /(?:^|[\s;|&(])(invoke-webrequest|invoke-restmethod|iwr|irm)(?=\s)/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    // A backtick at the end of a line continues the command on the next one: join those lines before the cut.
+    let rest = text.slice(m.index + m[0].length).replace(/`[ \t]*\r?\n/g, ' ');
+    const cut = rest.search(/\r?\n|\s\|\s|&&/);
+    if (cut >= 0) rest = rest.slice(0, cut);
+    found.push({ urls: rest.match(EGRESS_URLS_IN_TEXT_RE) || [], parts: [{ where: 'ps', text: rest }] });
+  }
+}
+
+// python -c, node -e, deno eval and python - <<EOF: the code is read as one text when it opens a URL.
+function egressInterpreter(words, k, text, found) {
+  const rest = words.slice(k + 1);
+  let code = null;
+  for (let i = 0; i < rest.length; i++) {
+    const t = rest[i].text;
+    if (/^-[A-Za-z]*[cep]$/.test(t) || t === '--eval' || t === '--print' || (i === 0 && t === 'eval')) { code = rest[i + 1] ? rest[i + 1].text : null; break; }
+  }
+  if (code === null) {
+    const h = /<<-?\s*['"]?[A-Za-z_]\w*/.exec(text);
+    if (h && !rest.some((r) => /\.(?:py|js|mjs|cjs|ts)$/i.test(r.text))) code = text.slice(h.index);
+  }
+  if (!code || !EGRESS_CODE_NET_RE.test(code)) return;
+  found.push({ urls: code.match(EGRESS_URLS_IN_TEXT_RE) || [], parts: [{ where: 'code', text: code }] });
+}
+
+function egressCollect(raw, opts, depth) {
+  const found = [];
+  const text = stripHeredocs(raw, { until: Date.now() + CHECK_BUDGET_MS, disk: 0 });
+  egressPowerShell(text, opts.powershell === true, found);
+  let rest = text;
+  let guard = 0;
+  while (rest.length && guard++ < SIMPLE_COMMANDS_MAX) {
+    const scan = scanFirstCommand(rest, false);
+    const words = scan.words;
+    let k = -1;
+    for (let i = 0; i < words.length; i++) {
+      const t = words[i].text;
+      const name = programName(t);
+      if (EGRESS_PROGRAMS.has(name) || EGRESS_INTERPRETER_RE.test(name)) { k = i; break; }
+      if (ASSIGNMENT_RE.test(t) || EGRESS_WRAPPERS.has(name) || t.startsWith('-') || /^\d+[smhd]?$/.test(t)) continue;
+      break;
+    }
+    if (k >= 0) {
+      const name = programName(words[k].text);
+      if (EGRESS_INTERPRETER_RE.test(name)) egressInterpreter(words, k, raw, found);
+      // In the PowerShell tool, curl and wget are Invoke-WebRequest, read above; curl.exe is the real program.
+      else if (!(opts.powershell === true && !/\.exe$/i.test(words[k].text))) {
+        const r = egressOptions(words.slice(k + 1).map((w) => w.text), name === 'curl' ? CURL_OPTIONS : WGET_OPTIONS);
+        if (r.parts.length) found.push(r);
+      }
+    }
+    rest = rest.slice(scan.end + 1);
+  }
+  // sh -c "curl ...": the code of a shell inside the command is a command of its own.
+  if (depth < SHELL_CODE_DEPTH && /\b(?:sh|bash|zsh|dash|ksh|ash|eval|su|pwsh|powershell|cmd|watch|flock|xargs|busybox)\b/.test(text)) {
+    for (const code of shellCodesOf(allWords(text, false))) found.push(...egressCollect(code, opts, depth + 1));
+  }
+  return found;
+}
+
+function egressResult(found, allowOrFn) {
+  const out = [];
+  if (!found.length) return out;
+  // The allow-list may be a function, read from the settings only when a request was found.
+  const allow = typeof allowOrFn === 'function' ? allowOrFn() : allowOrFn;
+  for (const r of found) {
+    const hosts = r.urls.map(egressHostOf);
+    if (hosts.length && hosts.every((h) => egressHostAllowed(h, allow))) continue;
+    out.push({ hosts: [...new Set(hosts.filter(Boolean))], parts: r.parts.map((p) => ({ where: p.where, text: egressStripEnv(p.text) })) });
+  }
+  return out;
+}
+
+/*
+ * The places in a shell command where data leaves the computer through a network request that is not local or
+ * allow-listed. Returns [{hosts: [string], parts: [{where, text}]}], one entry per request. where: 'header',
+ * 'body', 'query', 'url' (a URL as written), 'ps' (PowerShell arguments) or 'code' (inline code);
+ * egressLabel() turns a detection inside a part into what a person reads.
+ * opts: powershell (the PowerShell tool), allow (host allow-list, or a function that returns it).
+ */
+function egressParts(cmd, opts = {}) {
+  const raw = String(cmd || '');
+  if (!raw || raw.length > SHELL_SCAN_CAP) return [];
+  if (!/curl|wget|invoke-|iwr|irm|python|py\b|node|deno|bun|https?:\/\//i.test(raw)) return [];
+  return egressResult(egressCollect(raw, opts, 0), opts.allow);
+}
+
+/*
+ * Percent-decoded copies of a text, for the scan: "%40" is how an email address is written in a URL or a form body, and
+ * "+" is a space in a query or form. Returns [] when the text has no "%", else up to three distinct copies (decoded,
+ * decoded with "+" as a space, and the first decoded once more for double encoding). Invalid sequences are left as
+ * they are, nothing throws, and the work is linear in the text.
+ */
+function egressDecode(text) {
+  return text.replace(/(?:%[0-9a-f]{2})+/gi, (seq) => {
+    try { return decodeURIComponent(seq); } catch (e) { return seq; }
+  });
+}
+function egressDecodedCopies(text) {
+  if (typeof text !== 'string' || text.indexOf('%') < 0) return [];
+  const out = new Set();
+  const once = egressDecode(text);
+  out.add(once);
+  if (text.indexOf('+') >= 0) out.add(egressDecode(text.replace(/\+/g, ' ')));
+  if (once.indexOf('%') >= 0) out.add(egressDecode(once));
+  out.delete(text);
+  return [...out];
+}
+
+/** The URL of a WebFetch call, in the shape egressParts returns ([] when its host is local or allow-listed). */
+function egressUrlParts(url, opts = {}) {
+  const u = String(url || '');
+  if (!u) return [];
+  return egressResult([{ urls: [u], parts: [{ where: 'url', text: u }] }], opts.allow);
+}
+
+const EGRESS_HEADER_KEY_RE = /(?:^|[_.-])(?:headers?|cookies?|authorization|auth|credentials?|bearer|token)(?:$|[_.-])/i;
+const EGRESS_BODY_KEY_RE = /^(?:body|data|json|payload|form|params|query|variables)$/i;
+const EGRESS_URL_KEY_RE = /^(?:url|uri|endpoint|href|webhook(?:_?url)?|base_?url)$/i;
+
+/** The same for the arguments of an MCP call: only a call that has a URL or headers is a request. */
+function egressMcpCollect(args) {
+  const urls = [];
+  const parts = [];
+  let request = false;
+  let leaves = 0;
+  // complete: the walk reached every text in the arguments (depth and leaf limits not hit), so the parts cover all of it.
+  let complete = true;
+  const walk = (value, key, where, depth) => {
+    if (depth > 6 || leaves > 2000) { complete = false; return; }
+    if (typeof value === 'string') {
+      leaves++;
+      if (/^https?:\/\//i.test(value.trim()) || EGRESS_URL_KEY_RE.test(key)) { request = true; urls.push(value); parts.push({ where: 'url', text: value }); }
+      else parts.push({ where: where || 'arguments', text: value });
+      return;
+    }
+    if (Array.isArray(value)) { for (const v of value) walk(v, key, where, depth + 1); return; }
+    if (value && typeof value === 'object') {
+      for (const [k, v] of Object.entries(value)) {
+        leaves++;
+        parts.push({ where: 'arguments', text: k });
+        let w = where;
+        if (!w && EGRESS_HEADER_KEY_RE.test(k)) w = 'header';
+        else if (!w && EGRESS_BODY_KEY_RE.test(k)) w = 'body';
+        if (/^headers?$/i.test(k)) request = true;
+        walk(v, k, w, depth + 1);
+      }
+    }
+  };
+  walk(args, '', null, 0);
+  return { request, urls, parts, complete };
+}
+
+/*
+ * True when the egress check of an MCP call covers every text in its arguments: the call is a network request (a URL or
+ * headers) and the walk was not cut short by the depth or leaf limits. Only then may the egress check answer the
+ * personal-data question of the MCP check on its own; otherwise that question stays.
+ */
+function egressMcpCovers(args) {
+  if (!args || typeof args !== 'object') return false;
+  const c = egressMcpCollect(args);
+  return c.request && c.complete;
+}
+
+/*
+ * The places of an MCP call that the egress check scans. Only a call with a URL or headers is a request.
+ * Host rule: the host allow-list (and the local hosts) governs only what goes to the network host, that is the URL,
+ * headers and body parts. The MCP server receives all the arguments, whatever the host, so personal data in the other
+ * texts of the call (where 'arguments') is still scanned for a local or allow-listed host: it is the question the MCP
+ * check asks for a call that is not a request.
+ */
+function egressMcpParts(args, opts = {}) {
+  if (!args || typeof args !== 'object') return [];
+  const { request, urls, parts } = egressMcpCollect(args);
+  if (!request) return [];
+  const out = egressResult([{ urls, parts }], opts.allow);
+  if (out.length) return out;
+  const rest = parts.filter((p) => p.where === 'arguments');
+  return rest.length ? [{ hosts: [], parts: rest.map((p) => ({ where: p.where, text: egressStripEnv(p.text) })) }] : [];
+}
+
+const EGRESS_PS_PARAMS = { headers: 'header', body: 'body', uri: 'URL', credential: 'credentials', authentication: 'credentials', token: 'credentials', useragent: 'header' };
+const EGRESS_CODE_KEYS = { header: 'header', headers: 'header', cookie: 'header', cookies: 'header', auth: 'credentials', params: 'query string', data: 'body',
+  json: 'body', body: 'body', payload: 'body', url: 'URL' };
+
+/** What a person reads for a detection at index `start` of a part: 'header', 'body', 'query string', 'URL', 'credentials', 'code' or 'arguments'. */
+function egressLabel(part, start) {
+  const text = part.text;
+  const before = text.slice(Math.max(0, start - 300), start);
+  if (part.where === 'ps' || part.where === 'code') {
+    // A detection inside a URL written in the text is named by its place in that URL.
+    for (const m of text.matchAll(EGRESS_URLS_IN_TEXT_RE)) {
+      if (start >= m.index && start < m.index + m[0].length) return egressLabel({ where: 'url', text: m[0] }, start - m.index);
+    }
+  }
+  if (part.where === 'url') {
+    const schemeEnd = (EGRESS_URL_SCHEME_RE.exec(text) || [''])[0].length;
+    const slash = text.indexOf('/', schemeEnd);
+    const q = text.indexOf('?');
+    if (q >= 0 && start > q) return 'query string';
+    return start >= schemeEnd && (slash < 0 || start < slash) && text.slice(0, start).length >= schemeEnd && /@/.test(text.slice(schemeEnd, slash < 0 ? undefined : slash)) ? 'credentials' : 'URL';
+  }
+  if (part.where === 'ps') {
+    let last = null;
+    for (const m of before.matchAll(/(?:^|\s)-(headers|body|uri|credential|authentication|token|useragent)\b/gi)) last = m[1].toLowerCase();
+    return last ? EGRESS_PS_PARAMS[last] : 'arguments';
+  }
+  if (part.where === 'code') {
+    let last = null;
+    for (const m of before.matchAll(/\b(headers?|cookies?|auth|params|data|json|body|payload|url)\b['"]?\s*(?:=|:|\()/gi)) last = m[1].toLowerCase();
+    return (last && EGRESS_CODE_KEYS[last]) || 'code';
+  }
+  return part.where === 'query' ? 'query string' : part.where;
+}
+
 module.exports = {
   POLICY_RULES_VERSION,
   classifyPath,
@@ -2034,6 +3171,8 @@ module.exports = {
   expandBraces,
   readDenial,
   writeDenial,
+  instructionWriteNotice,
+  INSTRUCTION_FILE_NAMES,
   scanFirstCommand,
   wrapWithZnRun,
   scanPowerShell,
@@ -2042,4 +3181,10 @@ module.exports = {
   adminCommand,
   bashDenial,
   SHELL_SCAN_CAP,
+  egressParts,
+  egressUrlParts,
+  egressMcpParts,
+  egressMcpCovers,
+  egressDecodedCopies,
+  egressLabel,
 };

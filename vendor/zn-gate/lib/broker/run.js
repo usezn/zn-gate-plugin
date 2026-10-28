@@ -4,9 +4,16 @@
  * zn run [--secrets A,B] -- <command> [args...]
  *
  * Env mode of the secrets broker (the MVP has no egress proxy):
- *   - Named markers (__ZN_<NAME>__) in the child's arguments and environment
- *     are replaced by the real values, and --secrets NAME sets env NAME=value.
- *     Nothing else is changed: values only ever exist inside the child.
+ *   - --secrets NAME sets env NAME=value in the child, and named markers
+ *     (__ZN_<NAME>__) in the environment zn run inherits are replaced by the
+ *     real values. Nothing else is changed: values only ever exist inside the
+ *     child's environment.
+ *   - A marker in the command's arguments is refused, never filled in: an
+ *     argument is visible to every process of the same user (ps,
+ *     /proc/<pid>/cmdline) and to command-line loggers. The environment is the
+ *     only channel zn run uses. Processes of the same user can read it too
+ *     (/proc/<pid>/environ), but it is not listed by ps or logged with the
+ *     command line.
  *   - Only for secrets in mode "env" whose allowCommands matches the command.
  *   - The first use of each (secret, command) pair needs your confirmation
  *     on the vault's own channel (dialog or `zn unlock --foreground`).
@@ -84,11 +91,32 @@ function parseRunArgs(args) {
   return out;
 }
 
-/** Named secrets the command needs: markers in argv plus --secrets. */
+/** Named secrets the command needs: the ones named with --secrets. */
 function requiredSecrets(parsed) {
-  const names = new Set(parsed.secrets);
+  return [...new Set(parsed.secrets)];
+}
+
+/** Names of the secret markers written in the command's arguments (never allowed). */
+function argvMarkers(parsed) {
+  const names = new Set();
   for (const a of parsed.command) for (const m of markers.findNamedMarkers(a)) names.add(m.name);
   return [...names];
+}
+
+/**
+ * Refuses a command that carries a secret marker in its arguments. The value
+ * would end up in the process list and in command-line logs, so zn run does
+ * not fill it in; the secret goes in the environment instead.
+ */
+function assertNoArgvMarkers(parsed) {
+  const found = argvMarkers(parsed);
+  if (found.length === 0) return;
+  const first = found[0];
+  throw znError('ZN_POLICY_DENIED', 'a secret marker in the command arguments (' + found.map((n) => markers.markerFor(n)).join(', ') + ') is not filled in: ' +
+    'an argument is visible to other processes (ps) and to command-line logs, so zn run never puts a value there. ' +
+    'Next step: give the program the secret as an environment variable instead: ' + znCommand('run --secrets ' + first + ' -- <command>') +
+    ', and have the program read $' + first + ' (many tools read a fixed variable, such as PGPASSWORD for psql: store the secret under that name). ' +
+    'For HTTP APIs use the secrets_http_request tool of the zn "secrets" MCP server.');
 }
 
 /**
@@ -170,6 +198,7 @@ async function prepare(parsed, opts) {
   const agent = opts.agent || parsed.agent || env.ZN_AGENT || null;
   const argv0 = parsed.command[0];
   const exeName = markers.normalizeExe(argv0);
+  assertNoArgvMarkers(parsed);
   const names = requiredSecrets(parsed);
   const optional = optionalSecrets(parsed, env);
   if (names.length === 0 && optional.length === 0) {
@@ -198,6 +227,7 @@ async function prepare(parsed, opts) {
   if (found && !planted) {
     try { opened = exe.openExecutable(found.real); } catch (_) { opened = null; }
   }
+  const risk = opened && found ? exe.scriptRisk(opened, found.real) : null;
   const ctx = { project, executable: opened ? { real: found.real, fp: opened.fp } : null };
   const close = () => { if (opened) { try { fs.closeSync(opened.fd); } catch (_) { /* closed */ } opened = null; } };
   try {
@@ -231,13 +261,14 @@ async function prepare(parsed, opts) {
     }
     if (planted) await deny(name, m.mode, '`' + argv0 + '` ' + planted + '; zn run will not give it ' + name);
     if (!opened) await deny(name, m.mode, '`' + argv0 + '` could not be opened for checking; zn run will not give it ' + name);
+    if (risk && risk.deny) await deny(name, m.mode, scriptDenial(risk.deny, argv0, name));
     chosen.push({ name, mode: m.mode, command: entry });
   }
 
   const skipped = [];
   for (const name of optional) {
     const m = meta.get(name);
-    const entry = m && !m.deny && m.mode === 'env' && !planted && opened ? markers.matchAllowCommands(m.allowCommands, parsed.command) : null;
+    const entry = m && !m.deny && m.mode === 'env' && !planted && opened && !(risk && risk.deny) ? markers.matchAllowCommands(m.allowCommands, parsed.command) : null;
     if (entry && await approvals.isApproved(name, entry, ctx)) chosen.push({ name, mode: m.mode, command: entry });
     else skipped.push(name);
   }
@@ -263,7 +294,7 @@ async function prepare(parsed, opts) {
 
   const values = new Map();
   for (const c of chosen) {
-    const v = await vault.resolve(project, markers.markerFor(c.name));
+    const v = await vault.resolve(project, markers.markerFor(c.name), { purpose: 'run', agent, tool: 'zn run', argv: parsed.command, exe: ctx.executable });
     if (v == null) await deny(c.name, c.mode, 'secret ' + c.name + ' has no value in the vault. Next step: save its value with zn secret set ' + c.name + ' in your own terminal, or, if you are an agent, ask the user to do it.', 'ZN_NOT_FOUND');
     values.set(c.name, String(v));
   }
@@ -288,8 +319,14 @@ async function prepare(parsed, opts) {
       childEnv.NoDefaultCurrentDirectoryInExePath = '1';
     }
   }
-  const argv = parsed.command.map((a) => markers.substitute(a, values));
+  // Arguments go through exactly as written: assertNoArgvMarkers refused any marker in them.
+  const argv = parsed.command.slice();
 
+  const ownScript = risk && !risk.deny && risk.warn ? risk.warn : null;
+  if (ownScript && chosen.length && opts.stderr !== false) {
+    (opts.stderr || process.stderr).write('zn run: warning: `' + exeName + '` is a script you can rewrite (' + ownScript + '); another program running as you could swap it while it starts and read the secret. ' +
+      'Keep it where only you can write, or run it through its interpreter.\n');
+  }
   for (const c of chosen) {
     // A `warn` rule of the organization policy: allowed, recorded as "warn", and said.
     const m = meta.get(c.name);
@@ -297,11 +334,24 @@ async function prepare(parsed, opts) {
       await audit({ secret: c.name, mode: c.mode, agent, tool: 'zn run', argv0: exeName, host: null, decision: 'warn', reason: WARN_REASON });
       if (opts.stderr !== false) (opts.stderr || process.stderr).write(warnNotice(c.name, m.warnReason) + '\n');
     } else {
-      await audit({ secret: c.name, mode: c.mode, agent, tool: 'zn run', argv0: exeName, host: null, decision: 'allow', reason: 'allowCommands: ' + c.command });
+      await audit({ secret: c.name, mode: c.mode, agent, tool: 'zn run', argv0: exeName, host: null, decision: 'allow', reason: 'allowCommands: ' + c.command + (ownScript ? '; script writable by the current user: ' + ownScript : '') });
     }
   }
   return { argv, env: childEnv, secrets: chosen.map((c) => ({ ...c, value: values.get(c.name) })), project, resolved: found ? found.real : null };
   }
+}
+
+/*
+ * A `#!` script (on Windows, a .cmd or .bat file) is opened again by its
+ * interpreter after the last check. When group or others (on Windows, another
+ * principal) can rewrite it or a folder above it, or another account owns it,
+ * it could be swapped in that window and would receive the secret: refuse.
+ * A script only the current user can write is allowed with a warning.
+ */
+function scriptDenial(loose, argv0, name) {
+  return '`' + argv0 + '` is a script that others can rewrite (' + loose + '), and its interpreter opens it again after zn has checked it, ' +
+    'so zn run will not give it ' + name + '. Next step: move the script where only you can write (not group or others) and that you own, ' +
+    'or run it through its interpreter, for example: zn run -- bash ./script.sh, after allowing that command.';
 }
 
 function closeExe(prep) {
@@ -337,6 +387,11 @@ function spawnChecked(prep, opts) {
     if (why) {
       return Promise.reject(znError('ZN_POLICY_DENIED', '`' + prep.argv[0] + '`: ' + why + ' (' + prep.exe.real + '); it was not started. ' +
         'Run the command again; if this keeps happening, something is replacing the program.'));
+    }
+    const again = exe.scriptRisk(prep.exe.opened, prep.exe.real);
+    if (again && again.deny) {
+      return Promise.reject(znError('ZN_POLICY_DENIED', '`' + prep.argv[0] + '` is a script that others can rewrite (' + again.deny + '); it was not started. ' +
+        'Put the script where only you can write, or run it through its interpreter.'));
     }
     file = exe.execPath(prep.exe.opened, prep.exe.real);
     // The program still sees the name it was called by (multi-call binaries need it).
@@ -398,6 +453,7 @@ async function runBroker(args, opts = {}) {
   const stderr = opts.stderr || process.stderr;
   try {
     const parsed = parseRunArgs(args);
+    assertNoArgvMarkers(parsed);
     const env = opts.env || process.env;
     let vault = opts.vault;
     let prep;
@@ -430,7 +486,7 @@ async function main(args) {
   process.exitCode = await runBroker(args);
 }
 
-module.exports = { systemCmdExe, batchInvocation, parseRunArgs, requiredSecrets, optionalSecrets, referencedSecrets, prepare, runBroker, main, USAGE };
+module.exports = { systemCmdExe, batchInvocation, parseRunArgs, requiredSecrets, argvMarkers, optionalSecrets, referencedSecrets, prepare, runBroker, main, USAGE };
 
 // Direct entry (`node lib/broker/run.js -- <command>`), used by hook rewrites.
 if (require.main === module) main(process.argv.slice(2));

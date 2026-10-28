@@ -41,6 +41,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { whichSync } = require('../broker/markers');
+const { askAsDeny, isPlainAsk } = require('./ask-deny');
 const { writeFileAtomic } = require('../broker/files');
 const cfg = require('./config-file');
 const { patchScan, PATCH_SCAN_CAP } = require('./codex');
@@ -61,6 +62,27 @@ function textsOf(tool, args) {
   return texts;
 }
 
+// The plugin sends the base name of $SHELL (never a path; empty when unset) and process.platform.
+// powershell.exe, pwsh and pwsh-preview all count as PowerShell.
+function shellBase(name) {
+  if (typeof name !== 'string') return '';
+  return name.replace(/\\/g, '/').split('/').pop().toLowerCase().replace(/\.exe$/, '');
+}
+function isPowerShellName(name) {
+  const base = shellBase(name);
+  return base === 'powershell' || /^pwsh(-preview)?$/.test(base);
+}
+const BASH_LIKE = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh']);
+// Mirrors OpenCode's own choice (packages/core/src/shell/select.ts): on Windows it uses $SHELL
+// when that names a usable shell and otherwise picks pwsh, then powershell, then Git Bash, then
+// cmd.exe. So on Windows an unset or non-bash $SHELL means PowerShell; elsewhere only an
+// explicit PowerShell name does. Measured with OpenCode 1.19.3 on Windows Server 2022.
+function usesPowerShell(shell, platform) {
+  if (isPowerShellName(shell)) return true;
+  if (platform !== 'win32') return false;
+  return !BASH_LIKE.has(shellBase(shell));
+}
+
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const args = raw.args && typeof raw.args === 'object' ? raw.args : {};
@@ -77,6 +99,9 @@ function normalize(raw) {
   else if (TOKENIZED_OUTPUT.has(t)) tool = 'mcp';
   else if (BUILTIN.has(t)) tool = t;
   else tool = 'mcp';
+  // OpenCode's bash tool runs in the user's shell. When the plugin saw that it is PowerShell,
+  // the command is checked and wrapped as PowerShell, not as POSIX sh.
+  if (tool === 'bash' && usesPowerShell(raw.shell, raw.platform)) tool = 'powershell';
   const input = {
     command: typeof args.command === 'string' ? args.command : undefined,
     path: args.filePath || args.path || undefined,
@@ -111,6 +136,8 @@ function respond(d) {
   const ev = d && d.event;
   if (!ev || !ev.event) return { action: 'none' };
   if (d.decision === 'deny' && ev.event !== 'post_tool') return { action: 'deny', message: d.message || 'Blocked by zn' };
+  // OpenCode's plugin API has no question: one that zn wanted to ask is a deny.
+  if (ev.event === 'pre_tool' && isPlainAsk(d)) return { action: 'deny', message: askAsDeny('OpenCode', d) };
   // Only rewrites that add no secret value (wrapping in `zn run`) are
   // applied. Restoring detected values into the arguments is not: OpenCode
   // keeps the mutated arguments in the session, where the model could read
@@ -129,6 +156,9 @@ function respond(d) {
 
 /* ------------------------------ plugin ------------------------------ */
 
+// Seconds the plugin waits for the runner before it gives up (and the post-tool check stops before that).
+const HOOK_TIMEOUT_S = 20;
+
 function pluginSource(opts = {}) {
   // A project plugin is shared through the repository: it calls `zn` on PATH
   // instead of naming this user's node and runner.
@@ -139,10 +169,29 @@ function pluginSource(opts = {}) {
   const argv = project ? '["hook", "opencode"]' : '[RUNNER, "opencode"]';
   // On Windows `zn` is zn.cmd, which spawn runs only through a shell. The
   // arguments are fixed strings, so the shell adds no input of its own; and
-  // cmd.exe must not look for `zn` in the current directory first (the
-  // project, where an agent can write a zn.cmd of its own).
+  // neither `zn` nor the `node` it starts may come from the folder OpenCode
+  // runs in (the project, where an agent can write a zn or node of its own):
+  // the PATH keeps only its absolute entries, and cmd.exe does not look in the
+  // current directory first.
   const shell = project ? 'process.platform === "win32"' : 'false';
-  const env = project ? '{ ...process.env, NoDefaultCurrentDirectoryInExePath: "1" }' : 'process.env';
+  const env = project ? 'projectEnv()' : 'process.env';
+  const projectEnvSource = project ? `
+// The environment of \`zn\`: the PATH without its relative or empty entries, and
+// on Windows no search of the current directory by cmd.exe.
+function projectEnv() {
+  const win = process.platform === "win32";
+  const env = {};
+  let pathValue = "";
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.toUpperCase() === "PATH") pathValue = String(v || "");
+    else env[k] = v;
+  }
+  const keep = (d) => (win ? /^(?:[A-Za-z]:[\\\\/]|\\\\\\\\)/.test(d) : d.startsWith("/"));
+  env.PATH = pathValue.split(win ? ";" : ":").filter(keep).join(win ? ";" : ":");
+  if (win) env.NoDefaultCurrentDirectoryInExePath = "1";
+  return env;
+}
+` : '';
   return `${PLUGIN_MARK} (written by \`zn hooks install opencode\`; remove with \`zn hooks uninstall opencode\`).
 // Sends tool calls, tool results and chat messages to the local zn hook runner,
 // which blocks reads of secret files, puts commands that use stored secrets
@@ -150,10 +199,13 @@ function pluginSource(opts = {}) {
 import { spawn } from "node:child_process";
 
 ${launch}
-const TIMEOUT_MS = 20000;
+${projectEnvSource}const TIMEOUT_MS = ${HOOK_TIMEOUT_S * 1000};
 // The only answers the plugin acts on. Any other answer is an error, which
 // blocks the call (before), withholds the output (after) or stops the message.
 const ACTIONS = ["none", "deny", "error", "args", "output"];
+// OpenCode runs its bash tool in $SHELL, or in PowerShell on Windows when it is unset. The
+// runner needs only the program's name (not its path) and the platform to tell them apart.
+const SHELL = String(process.env.SHELL || "").replace(/\\\\/g, "/").split("/").pop();
 
 // Copy scrubbed string leaves from src into target, in place.
 function applyStrings(target, src) {
@@ -189,13 +241,15 @@ function runHook(event) {
         finish(answer);
       }
     });
+    // A hook that ends without reading its input (EPIPE) is answered by close above; it must not crash OpenCode.
+    child.stdin.on("error", () => {});
     child.stdin.end(JSON.stringify(event));
   });
 }
 
 export const ZnGate = async ({ directory }) => ({
   "tool.execute.before": async (input, output) => {
-    const r = await runHook({ hook: "tool.execute.before", tool: input.tool, sessionID: input.sessionID, cwd: directory, args: output.args });
+    const r = await runHook({ hook: "tool.execute.before", tool: input.tool, sessionID: input.sessionID, cwd: directory, args: output.args, shell: SHELL, platform: process.platform });
     if (r.action === "deny") throw new Error(r.message);
     if (r.action === "error") throw new Error("zn: the secret scrubber is not working (" + r.message + "); call blocked");
     if (r.action === "args" && r.args) for (const [k, v] of Object.entries(r.args)) output.args[k] = v;
@@ -203,7 +257,7 @@ export const ZnGate = async ({ directory }) => ({
   "tool.execute.after": async (input, output) => {
     const content = Array.isArray(output.content) ? output.content : null;
     const r = await runHook({
-      hook: "tool.execute.after", tool: input.tool, sessionID: input.sessionID, cwd: directory, args: input.args,
+      hook: "tool.execute.after", tool: input.tool, sessionID: input.sessionID, cwd: directory, args: input.args, shell: SHELL, platform: process.platform,
       output: typeof output.output === "string" ? output.output : undefined,
       metadata: output.metadata && typeof output.metadata === "object" ? output.metadata : undefined,
       content: content ? content.map((c) => (c && typeof c.text === "string" ? { type: c.type, text: c.text } : { type: c && c.type })) : undefined,
@@ -252,9 +306,15 @@ function install(opts = {}) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   writeFileAtomic(file, pluginSource(opts), 0o644);
   if (opts.mcp !== false) {
+    // A project's opencode.json is shared: the hint names zn on the PATH, never the paths of this machine.
+    const project = (opts.scope || 'user') === 'project';
     const cli = path.resolve(__dirname, '..', '..', 'bin', 'cli.js').replace(/\\/g, '/');
-    report.warnings.push('optional: to let OpenCode use the secrets kept in zn\'s vault, add the "secrets" MCP server to opencode.json under "mcp": "secrets": ' +
-      JSON.stringify({ type: 'local', command: [(opts.nodePath || process.execPath).replace(/\\/g, '/'), cli, 'secrets-mcp', '--agent', 'opencode'] }));
+    const command = project
+      ? ['zn', 'secrets-mcp', '--agent', 'opencode']
+      : [(opts.nodePath || process.execPath).replace(/\\/g, '/'), cli, 'secrets-mcp', '--agent', 'opencode'];
+    report.warnings.push('optional: to let OpenCode use the secrets kept in zn\'s vault, add the "secrets" MCP server to ' +
+      (project ? 'opencode.json in this project' : 'opencode.json') + ' under "mcp": "secrets": ' + JSON.stringify({ type: 'local', command }) +
+      (project ? ' (everyone who uses the project needs zn on their PATH)' : ''));
   }
   return report;
 }
@@ -276,10 +336,13 @@ function detect(opts = {}) {
 
 module.exports = {
   id,
+  HOOK_TIMEOUT_S,
   detect,
   install,
   uninstall,
   normalize,
+  isPowerShellName,
+  usesPowerShell,
   respond,
   capabilities: { ask: false, rewriteInput: true, rewriteOutput: 'all' },
   pluginSource,
