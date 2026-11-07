@@ -1642,6 +1642,8 @@ const OVERSIZE_POST = {
     shape: (t) => t,
   },
   opencode: { isPost: (k) => k.hook === 'tool.execute.after', tool: 'bash', shape: (t) => ({ output: t }) },
+  // ZCode: the tool already ran, so a post-tool event gets the withheld notice (exit 0), never a block (exit 2).
+  zcode: { isPost: (k) => k.hook_event_name === 'PostToolUse' || (k.hook_event_name === undefined && (k.tool_response !== undefined || k.toolResponse !== undefined)), tool: 'bash', shape: (t) => t },
   cursor: { isPost: (k) => k.hook_event_name === 'postToolUse' || (k.hook_event_name === undefined && k.tool_output !== undefined), tool: 'mcp', shape: (t) => t },
 };
 
@@ -1657,7 +1659,11 @@ function oversizeEvent(agentId, adapter, text, why = 'the event on stdin is too 
   }
   if (!spec || !keys || !spec.isPost(keys)) return refuseInput(agentId, why);
   const event = { event: 'post_tool', hookEvent: 'postToolUse', tool: spec.tool, input: { texts: [] } };
-  const output = adapter.respond({ decision: 'allow', updatedOutput: spec.shape(POST_WITHHELD), message: POST_CAP_NOTE, event });
+  // ZCode cannot hide tool output: after a timeout it gets the timeout notice, and for an output too large to read its
+  // adapter's own notice (stats.withheld), never the withheld one.
+  const note = why === SUPERVISOR_REASON && agentId === 'zcode' ? POST_TIMEOUT_NOTE : POST_CAP_NOTE;
+  const stats = agentId === 'zcode' && why !== SUPERVISOR_REASON ? { withheld: true } : undefined;
+  const output = adapter.respond({ decision: 'allow', updatedOutput: spec.shape(POST_WITHHELD), message: note, event, stats });
   if (output !== null && output !== undefined) process.stdout.write(JSON.stringify(output));
 }
 
@@ -1680,7 +1686,8 @@ function refuseInput(agentId, why) {
   }
   // Claude Code and Codex show this stderr to the model, so it never says how to
   // let actions pass unchecked (docs/compat.md documents that for the user).
-  const msg = 'zn: could not read this action (' + why + '), so it was blocked. ' + fixHint(agentId);
+  // A check that ran out of time gets the same step as every other timeout; an event zn cannot read, the reinstall step.
+  const msg = 'zn: could not read this action (' + why + '), so it was blocked. ' + (why === SUPERVISOR_REASON ? TIMEOUT_STEP : fixHint(agentId));
   process.stderr.write('zn hook: ' + msg + '\n');
   if (agentId === 'cursor') process.stdout.write(JSON.stringify({ permission: 'deny', continue: false, user_message: msg, agent_message: msg }));
   // Antigravity does not document its exit codes, so its deny answer is printed as well.
@@ -1701,8 +1708,13 @@ function refuseInput(agentId, why) {
  * (JSON only on stdout) and exit 2, Codex's documented block code. Other agents and events are untouched.
  */
 const CODEX_WATCHDOG_MARGIN_S = 5;
-const CODEX_FAIL_REASON = 'zn-gate could not finish checking this in time, so it was blocked. ' +
-  'Try again; if it keeps happening, run zn-gate doctor.';
+// The step every agent gets when a check did not finish in time or failed: the same words whatever the agent.
+const TIMEOUT_STEP = 'Try again; if it keeps happening, ask the user to run `zn-gate check` in their terminal.';
+const CODEX_FAIL_REASON = 'zn: the check could not finish in time or failed, so this was blocked. ' + TIMEOUT_STEP;
+// A ZCode post-tool event whose check timed out: the tool had already run and ZCode cannot hide its output.
+const POST_TIMEOUT_NOTE = 'zn: the check timed out, so this output was not checked for secrets. It was NOT withheld: ' +
+  'ZCode cannot hide tool output, so anything secret in it is already in this conversation. ' +
+  'Do not repeat it; if it holds a real secret, tell the user to rotate it. ' + TIMEOUT_STEP;
 
 function codexDenyFor(eventName, reason, agentId = 'codex') {
   // ZCode reads a prompt block as {continue: false, reason}; Codex as {decision: "block", reason}.
@@ -1752,8 +1764,7 @@ function armCodexFailClosed(agentId, eventName) {
  * Both print the deny decision (JSON only on stdout) and exit 2, like every other refusal of this runner.
  */
 const ANTIGRAVITY_WATCHDOG_MARGIN_S = 5;
-const ANTIGRAVITY_FAIL_REASON = 'zn: the check could not finish in time or failed, so this call was blocked. ' +
-  'Try again; if it keeps happening, ask the user to run zn-gate check in their terminal.';
+const ANTIGRAVITY_FAIL_REASON = 'zn: the check could not finish in time or failed, so this call was blocked. ' + TIMEOUT_STEP;
 
 function antigravityDeadlineMs() {
   let ms = (require('../agents/antigravity').HOOK_TIMEOUT_S - ANTIGRAVITY_WATCHDOG_MARGIN_S) * 1000;

@@ -253,7 +253,9 @@ function parseCommand(command, agentId) {
     const n = new RegExp("^ZN_NODE='(" + audit.SAFE_ABS + ")'$", 'm').exec(text);
     const r = new RegExp("^ZN_RUNNER='(" + audit.SAFE_ABS + ")'$", 'm').exec(text);
     if (!n || !r) return { launcher: lm[1], event: lm[2], unreadable: true, ...extra };
-    return { launcher: lm[1], event: lm[2], node: n[1], runner: r[1], ...extra };
+    // The SHA-256 of the runner recorded at install time (absent in a launcher written by an older zn-gate).
+    const h = /^ZN_SHA='([0-9a-f]*)'$/m.exec(text);
+    return { launcher: lm[1], event: lm[2], node: n[1], runner: r[1], sha: h ? h[1] : null, ...extra };
   }
   // On Windows, Cursor and Gemini CLI run the same three steps as an encoded PowerShell script (launcher.windowsScript).
   const ws = require('./shell-quote').windowsCommandScript(c);
@@ -329,8 +331,8 @@ function spawnHook(file, args, input, env, cwd, timeout = HOOK_TIMEOUT_MS) {
     input: JSON.stringify(input), encoding: 'utf8', timeout, cwd,
     env: { ...process.env, ZN_STATS: 'off', ...env }, windowsHide: true,
   });
-  // A hook that answers and exits before reading all its input makes the write fail with EPIPE although it ran: its status and output are the answer.
-  const ranAndExited = r.error && r.error.code === 'EPIPE' && typeof r.status === 'number';
+  // A hook that answers and exits before reading all its input makes the write fail with EPIPE (EOF on Windows) although it ran: its status and output are the answer.
+  const ranAndExited = r.error && (r.error.code === 'EPIPE' || r.error.code === 'EOF') && typeof r.status === 'number';
   if (r.error && !ranAndExited) return { ran: false, why: r.error.code || r.error.message };
   return { ran: true, decision: decisionOf(r.stdout, r.status), stdout: r.stdout, status: r.status };
 }
@@ -378,18 +380,42 @@ function pluginManifest(root, rootVar, platform = process.platform) {
           words = shellWords(h.command);
         }
         if (!words.length) continue;
-        if (!byName) byName = unsafeStart(words, rootVar, h.type !== 'process');
-        if (!byName) byName = scriptOutside(root, fill(words[1]));
+        // ZCode's plugin ships a second entry for Windows: the system PowerShell by its full path with the exact inline
+        // command of lib/agents/zcode.js (pluginWindowsArgs), which runs scripts/zn-hook.ps1 of the plugin folder.
+        const zc = rootVar === 'ZCODE_PLUGIN_ROOT' ? require('./agents/zcode') : null;
+        const winCmd = Boolean(zc) && h.type === 'process' && String(h.command).toLowerCase() === zc.PLUGIN_WIN_CMD.toLowerCase();
+        const win = winCmd || (Boolean(zc) && h.type === 'process' && String(h.command).toLowerCase() === zc.PLUGIN_WIN_POWERSHELL.toLowerCase());
+        if (win) {
+          const want = winCmd ? zc.pluginWindowsCmdArgs(event) : zc.pluginWindowsArgs(event);
+          byName = h.command === (winCmd ? zc.PLUGIN_WIN_CMD : zc.PLUGIN_WIN_POWERSHELL) && words.length === want.length + 1 && want.every((a, i) => a === words[i + 1])
+            ? scriptOutside(root, path.join(root, 'scripts', winCmd ? 'zn-hook.cmd' : 'zn-hook.ps1'))
+            : '`' + words.slice(0, 2).join(' ') + '`, which is not the Windows hook the plugin ships';
+        } else {
+          if (!byName) byName = unsafeStart(words, rootVar, h.type !== 'process');
+          if (!byName) byName = scriptOutside(root, fill(words[1]));
+        }
         if (!byName && h.type !== 'process' && platform === 'win32' && h.shell !== 'bash') {
           byName = 'the default Windows shell of Claude Code (no "shell": "bash"), where /bin/sh is not a full path';
         }
         // What decides whether the host runs the hook at all, and waits for its answer, for the PreToolUse check below.
         const off = h.enabled === false || h.disabled === true || g.enabled === false || g.disabled === true;
-        hooks.push({ event, file: fill(words[0]), args: words.slice(1).map(fill), byName, type: h.type, matcher: g.matcher, async: h.async === true || h.async === 'true' || Boolean(h.asyncRewake), off,
+        hooks.push({ event, file: fill(words[0]), args: words.slice(1).map(fill), byName, type: h.type, win, matcher: g.matcher, async: h.async === true || h.async === 'true' || Boolean(h.asyncRewake), off,
           command: h.command, words, shell: h.shell, onFailure: h.onFailure, timeout: h.timeout });
       }
     }
   }
+  return { hooks, bare: hooks.find((h) => h.byName) || null };
+}
+
+/* The hooks of a ZCode plugin manifest that can run on this system, and the first of them that starts a program by name or
+   in a form zn does not ship (bare). Every event lists a /bin/sh hook (macOS, Linux) and a PowerShell hook (Windows); the one
+   of the other system cannot start here and is not judged (on Windows, only the /bin/sh entry is skipped),
+   so a manifest is read only where it runs. A program by name is refused on every system. */
+function zcodeRelevant(manifest, win) {
+  // Only the entry the plugin ships for the other system is left out. On Windows that is the /bin/sh entry (whatever
+  // script it runs); any other entry that starts with "/" (a program by name, `env`, another shell or path) is judged here
+  // too, so it cannot hide behind the Windows entry. A PowerShell entry is left out on the other systems.
+  const hooks = manifest ? manifest.hooks.filter((h) => (win ? !(String(h.file).startsWith('/') && h.file === '/bin/sh') : !WIN_ABS.test(String(h.file)))) : [];
   return { hooks, bare: hooks.find((h) => h.byName) || null };
 }
 
@@ -521,6 +547,9 @@ function cursorZnPlugin(home) {
 }
 
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
+// A Windows absolute path: a drive letter and a slash or backslash. The only one a plugin hook may start is the system PowerShell of the
+// ZCode plugin (checked against PLUGIN_WIN_CMD and PLUGIN_WIN_POWERSHELL in pluginManifest); any other one is "not a system shell running a script".
+const WIN_ABS = /^[A-Za-z]:[\\/]/;
 // The only programs a plugin hook may start: the system shells by their usual full paths (not any file of that name).
 const SYSTEM_SHELLS = new Set(['/bin/sh', '/usr/bin/sh', '/bin/bash', '/usr/bin/bash', '/bin/dash', '/usr/bin/dash']);
 
@@ -542,7 +571,7 @@ function scriptOutside(root, script) {
 function unsafeStart(words, rootVar, shell) {
   const [prog, first] = words;
   if (shell && ASSIGN.test(prog)) return 'a NAME=value in front of the program (' + prog.split('=')[0] + '), which can make the shell read other code';
-  if (!prog.startsWith('/') || /[$`~]/.test(prog)) return '`' + prog + '` by name';
+  if (!(prog.startsWith('/') || WIN_ABS.test(prog)) || /[$`~]/.test(prog)) return '`' + prog + '` by name';
   const glob = words.find((w) => /[*?[]/.test(w));
   if (glob !== undefined) return 'a pattern the shell or the host expands (`' + glob + '`), so what runs is not what the manifest names';
   const name = prog.slice(prog.lastIndexOf('/') + 1);
@@ -750,13 +779,19 @@ function cliHooks(spec, ctx, userFile, given) {
     // The launcher runs the Node.js it was installed with, else `zn` from the PATH, else it blocks (see launcher.js).
     const isFile = (f) => { try { return fs.statSync(f).isFile(); } catch (err) { return false; } };
     const recorded = !cmd.unreadable && isFile(cmd.node) && isFile(cmd.runner);
-    const viaPath = !recorded && !cmd.unreadable && Boolean(znOnPath(ctx.env) && onAbsPath('node', ctx.env));
+    // Only the PowerShell script of Windows still falls back to `zn` on the PATH; the sh launcher runs nothing it has not verified.
+    const viaPath = Boolean(cmd.winScript) && !recorded && !cmd.unreadable && Boolean(znOnPath(ctx.env) && onAbsPath('node', ctx.env));
+    // The sh launcher runs the runner only if it still has the SHA-256 recorded at install time.
+    const runnerChanged = recorded && !cmd.winScript && typeof cmd.sha === 'string' && require('./agents/launcher').runnerSha(cmd.runner) !== cmd.sha;
     if (spec.id === 'antigravity' && cmd.quoted && !cmd.winScript) {
       // Antigravity splits the command on spaces and runs it with no shell: the quotes stay in the file name (ENOENT).
       out.problem = 'its hook cannot start: Antigravity runs the command without a shell, so the quotes around the launcher path (' + cmd.launcher + ') become part of the file name and the hook never runs';
       out.fix = REINSTALL(spec.id);
     } else if (cmd.unreadable) {
       out.problem = 'its hook cannot start: its launcher script (' + cmd.launcher + ') is missing or was changed';
+      out.fix = REINSTALL(spec.id);
+    } else if (runnerChanged) {
+      out.problem = 'its hook is blocking tool calls and prompts: zn-gate changed since the hooks were installed (' + cmd.runner + ' no longer matches the launcher), so zn will not run it';
       out.fix = REINSTALL(spec.id);
     } else if (!recorded && !viaPath) {
       out.problem = 'its hook cannot start: its ' + (isFile(cmd.node) ? 'zn-gate files (' + cmd.runner + ')' : 'Node.js (' + cmd.node + ')') + ' is no longer there, so zn now blocks the tool calls and prompts instead of checking them';
@@ -972,25 +1007,29 @@ async function checkAgent(spec, ctx) {
         // Only the PreToolUse hook the plugin ships counts: a "process" hook that runs exactly /bin/sh with
         // ${ZCODE_PLUGIN_ROOT}/scripts/zn-hook.sh PreToolUse, turned on, for every tool it is asked about.
         const manifest = pluginManifest(plugin.root, 'ZCODE_PLUGIN_ROOT');
-        const pres = manifest ? manifest.hooks.filter((h) => h.event === 'PreToolUse') : [];
+        const onWin = process.platform === 'win32';
+        const rel = zcodeRelevant(manifest, onWin);
+        const pres = rel.hooks.filter((h) => h.event === 'PreToolUse');
+        // Only the entry of this system counts: the PowerShell one on Windows, the /bin/sh one elsewhere (the other cannot start here).
         const pre = pres.find((h) => !h.byName && h.type === 'process' && !h.off && !h.async && matcherCovers(h.matcher, spec.tool) &&
-          h.words.length === ZCODE_PRE_WORDS.length && h.words.every((w, i) => w === ZCODE_PRE_WORDS[i]));
+          (onWin ? h.win : !h.win && h.words.length === ZCODE_PRE_WORDS.length && h.words.every((w, i) => w === ZCODE_PRE_WORDS[i])));
         const REINSTALL = 'install the zn-gate plugin again in ZCode (Settings, Plugins), then run `zn-gate check` again';
         const zfile = path.join(plugin.root, 'hooks', 'hooks.json');
         if (!pres.length) {
           res.problem = 'the zn-gate plugin has no PreToolUse hook in ' + zfile + ', so ZCode runs no zn check before tool calls';
           res.fix = REINSTALL;
-        } else if (manifest.bare) {
-          res.problem = bareProgramProblem(manifest.bare);
+        } else if (rel.bare) {
+          res.problem = bareProgramProblem(rel.bare);
           res.fix = 'update the plugin: ' + REINSTALL;
         } else if (!pre) {
-          res.problem = 'the PreToolUse hook of the zn-gate plugin in ' + zfile + ' is not the hook the plugin ships (`' + ZCODE_PRE_WORDS.join(' ') + '`, turned on, for every tool), so ZCode runs no zn check before tool calls';
+          res.problem = 'the PreToolUse hook of the zn-gate plugin in ' + zfile + ' is not the hook the plugin ships (`' + (onWin ? 'cmd.exe ... scripts/zn-hook.cmd PreToolUse' : ZCODE_PRE_WORDS.join(' ')) + '`, turned on, for every tool), so ZCode runs no zn check before tool calls';
           res.fix = REINSTALL;
         } else if (!fs.existsSync(pre.file)) {
           res.problem = 'the zn-gate plugin starts its hook with ' + pre.file + ', which is not on this computer, so the hook cannot start';
-          res.fix = 'the ZCode plugin needs a system with ' + pre.file + ' (Linux); elsewhere use `zn hooks install zcode` in your own terminal, then run `zn-gate check` again';
+          res.fix = 'the ZCode plugin needs a system with ' + pre.file + '; elsewhere use `zn hooks install zcode` in your own terminal, then run `zn-gate check` again';
         } else {
-          live = { file: pre.file, args: pre.args, env: ctx.env && ctx.env.PATH ? { PATH: ctx.env.PATH } : {}, plugin: true };
+          // ZCode gives a plugin's hooks the plugin folder in ZCODE_PLUGIN_ROOT (the Windows entry reads its script there).
+          live = { file: pre.file, args: pre.args, env: { ...(ctx.env && ctx.env.PATH ? { PATH: ctx.env.PATH } : {}), ZCODE_PLUGIN_ROOT: plugin.root }, plugin: true };
         }
       } else if (!userHooksOn) {
         // Turned off, and nothing else of zn's runs: ZCode is not protected.
@@ -1371,4 +1410,4 @@ function report({ results, removed, warnings }, write) {
   return setUp && !bad ? 0 : 1;
 }
 
-module.exports = { check, report, FAKE_LINE, AGENTS, _internal: { pluginManifest, spawnHook, gitBash, PLUGIN_NODE_MIN, pluginNodeOk, pluginNodeMessage, pluginNodeStatus, pluginNodeProblem, resolveHookNode, hookEntries, matcherCovers, parseCommand, decisionOf, claudePlugin, claudePluginRootProblem, claudePreToolProblem, claudePreHook, claudePluginRun, cursorZnPlugin, CLAUDE_PRE_COMMAND, CLAUDE_CHECK_COMMAND, ZCODE_PRE_WORDS } };
+module.exports = { check, report, FAKE_LINE, AGENTS, _internal: { pluginManifest, zcodeRelevant, spawnHook, gitBash, PLUGIN_NODE_MIN, pluginNodeOk, pluginNodeMessage, pluginNodeStatus, pluginNodeProblem, resolveHookNode, hookEntries, matcherCovers, parseCommand, decisionOf, claudePlugin, claudePluginRootProblem, claudePreToolProblem, claudePreHook, claudePluginRun, cursorZnPlugin, CLAUDE_PRE_COMMAND, CLAUDE_CHECK_COMMAND, ZCODE_PRE_WORDS } };

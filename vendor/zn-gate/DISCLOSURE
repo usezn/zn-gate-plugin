@@ -40,8 +40,14 @@ The same setup can also, after asking:
     then checks what passes between the agent and that server; it starts only
     the server the person had configured.
 This happens only when the person runs `zn hooks install` or `zn-gate init` in
-their own terminal (`init` asks before each change). Nothing is written when
-the package is installed or imported. zn-gate reads, but never writes, the
+their own terminal (`init` asks before each change). When the package is
+installed or updated, a short install step (postinstall) rewrites only the
+launcher scripts that zn-gate itself wrote in its own hooks folder and that
+point at this copy of zn-gate (or, for a global install, at a copy that no
+longer exists), so that they record the new hook runner. It changes nothing
+else, never fails the install, and does not run with --ignore-scripts.
+Nothing is written when the package is imported. zn-gate reads, but never
+writes, the
 system-wide managed settings of Claude Code, Codex and Cursor, to report
 whether they switch its hooks off; `zn team managed-config` only prints a file
 for an administrator to put in place. `zn-gate uninstall` lists what zn-gate
@@ -127,9 +133,11 @@ secrets: after the same kind of checks, it moves the old vault into a backup
 folder with the date in its name, so that the next `zn unlock` starts an empty
 vault.
 
-5. No install scripts, no downloaded code, no telemetry by default
+5. One install step, no downloaded code, no telemetry by default
 
-The package has no preinstall, install or postinstall script. zn-gate does not
+The package has no preinstall or install script. Its postinstall script only
+refreshes zn-gate's own hook launchers, as described in section 2; it reads no
+network and runs no other program. zn-gate does not
 download or run code from the network itself; everything it runs is in the
 package or is a program already on the computer (section 3). The only downloads
 it starts are steps the person accepts in `zn-gate init`: installing this same

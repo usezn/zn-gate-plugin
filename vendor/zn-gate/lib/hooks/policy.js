@@ -28,7 +28,7 @@ const { znCommand } = require('../zn-command');
 
 // Version of the policy rules (credential paths, zn home, secret commands,
 // command wrapping). Bump it when a rule changes; see CONTRIBUTING.md.
-const POLICY_RULES_VERSION = '2026-10-26.7';
+const POLICY_RULES_VERSION = '2026-11-02.42';
 
 /* ------------------------------ paths ------------------------------ */
 
