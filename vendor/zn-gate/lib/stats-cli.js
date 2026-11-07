@@ -116,9 +116,9 @@ async function run(args, out = (s) => process.stdout.write(s), { confirm = confi
     return 2;
   }
   const s = stats.summary({ days: o.days });
-  let res = { sent: 0, failed: 0 };
-  const sentDays = [];
-  if (share.status().share) res = await share.sendPending({ print: (r) => sentDays.push(r.day) });
+  let res = { sent: 0, failed: 0, sentDays: [], failedDays: [] };
+  if (share.status().share) res = await share.sendPending();
+  const sentDays = res.sentDays;
   if (o.json) {
     out(JSON.stringify({ ...s, sharing: share.status().share, sent_days: sentDays, send_failed: res.failed }, null, 2) + '\n');
   } else {

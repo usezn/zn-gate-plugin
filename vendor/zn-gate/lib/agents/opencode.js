@@ -167,6 +167,8 @@ function pluginSource(opts = {}) {
   const runner = JSON.stringify((opts.runnerPath || cfg.runnerPath()).replace(/\\/g, '/'));
   const launch = project ? 'const NODE = "zn";\nconst RUNNER = null;' : `const NODE = ${node};\nconst RUNNER = ${runner};`;
   const argv = project ? '["hook", "opencode"]' : '[RUNNER, "opencode"]';
+  // The repair step a blocked call names: check what is wrong, then install the hook again (the same scope).
+  const repair = JSON.stringify('Run zn-gate check in a terminal, then zn hooks install opencode' + (project ? ' --project' : '') + '.');
   // On Windows `zn` is zn.cmd, which spawn runs only through a shell. The
   // arguments are fixed strings, so the shell adds no input of its own; and
   // neither `zn` nor the `node` it starts may come from the folder OpenCode
@@ -206,6 +208,14 @@ const ACTIONS = ["none", "deny", "error", "args", "output"];
 // OpenCode runs its bash tool in $SHELL, or in PowerShell on Windows when it is unset. The
 // runner needs only the program's name (not its path) and the platform to tell them apart.
 const SHELL = String(process.env.SHELL || "").replace(/\\\\/g, "/").split("/").pop();
+
+// Why the hook could not answer, in plain words: a spawn error names the missing program, not a raw ENOENT.
+const REPAIR = ${repair};
+function why(m) {
+  if (/ENOENT/.test(m)) return NODE === "zn" ? "zn was not found on the PATH" : "the Node.js it was installed with was not found";
+  if (/EACCES|EPERM/.test(m)) return "the hook could not be started (permission denied)";
+  return m;
+}
 
 // Copy scrubbed string leaves from src into target, in place.
 function applyStrings(target, src) {
@@ -251,7 +261,7 @@ export const ZnGate = async ({ directory }) => ({
   "tool.execute.before": async (input, output) => {
     const r = await runHook({ hook: "tool.execute.before", tool: input.tool, sessionID: input.sessionID, cwd: directory, args: output.args, shell: SHELL, platform: process.platform });
     if (r.action === "deny") throw new Error(r.message);
-    if (r.action === "error") throw new Error("zn: the secret scrubber is not working (" + r.message + "); call blocked");
+    if (r.action === "error") throw new Error("zn: the secret scrubber is not working (" + why(r.message) + "), so this call was blocked. " + REPAIR);
     if (r.action === "args" && r.args) for (const [k, v] of Object.entries(r.args)) output.args[k] = v;
   },
   "tool.execute.after": async (input, output) => {
@@ -279,7 +289,7 @@ export const ZnGate = async ({ directory }) => ({
     if (!prompt) return;
     const r = await runHook({ hook: "chat.message", sessionID: input.sessionID, cwd: directory, prompt });
     if (r.action === "deny") throw new Error(r.message);
-    if (r.action === "error") throw new Error("zn: the secret scrubber is not working (" + r.message + "); message not sent");
+    if (r.action === "error") throw new Error("zn: the secret scrubber is not working (" + why(r.message) + "), so this message was not sent. " + REPAIR);
   },
 });
 `;

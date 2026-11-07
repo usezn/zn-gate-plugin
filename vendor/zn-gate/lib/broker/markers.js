@@ -116,6 +116,28 @@ function whichSync(cmd, envPath) {
   return exe.whichSync(cmd, envPath);
 }
 
+/*
+ * The temp folders a binary must not come from. os.tmpdir() follows TMPDIR, TEMP and TMP, which the agent sets for
+ * the commands it runs, so the fixed system temp folders and the temp folder of the user profile (read from the
+ * system, not from the environment) are always included as well. Every one in its native real form.
+ */
+function tempRoots() {
+  const roots = [os.tmpdir()];
+  if (process.platform === 'win32') {
+    try { roots.push(path.join(os.userInfo().homedir, 'AppData', 'Local', 'Temp')); } catch (_) { /* no profile */ }
+    try { roots.push(fs.realpathSync.native('\\\\?\\GLOBALROOT\\SystemRoot\\Temp')); } catch (_) { /* not there */ }
+  } else {
+    roots.push('/tmp', '/var/tmp', '/private/tmp', '/private/var/tmp', '/dev/shm', '/var/folders', '/private/var/folders');
+  }
+  const out = [];
+  for (const r of roots) {
+    if (!r || !path.isAbsolute(r)) continue;
+    const real = realOf(r);
+    if (!out.includes(real)) out.push(real);
+  }
+  return out;
+}
+
 function isInside(child, parent) {
   const rel = path.relative(parent, child);
   return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
@@ -130,24 +152,37 @@ function isInside(child, parent) {
  */
 function checkResolvedExecutable(resolved, projectRoot, resolvedReal) {
   if (!resolved) return 'command not found on PATH';
-  // The caller passes the real path it already resolved, so it is not resolved twice.
-  const real = resolvedReal || realOf(resolved);
-  const tmp = realOf(os.tmpdir());
-  if (isInside(real, tmp)) return 'resolves to a file in the temp directory';
+  // Both sides in the native real form: a Windows 8.3 short name, a subst drive and a \\?\ prefix all
+  // name the same folder in more than one way, and a PATH entry may use any of them.
+  const real = realOf(resolvedReal || resolved);
+  if (tempRoots().some((tmp) => isInside(real, tmp))) return 'resolves to a file in the temp directory';
   // Both the name as found on PATH and the real file are compared with the
   // project's real path: a project reached through a symlink (macOS /var is
   // /private/var) must still count as the project.
   if (projectRoot) {
     const root = realOf(projectRoot);
-    if ([resolved, real].some((p) => isInside(p, root) || isInside(p, projectRoot))) {
+    if ([resolved, realOf(resolved), real].some((p) => isInside(p, root) || isInside(p, projectRoot))) {
       return 'resolves to a file inside the project, which the agent can edit';
     }
   }
   return null;
 }
 
+// The native form also expands a Windows 8.3 short name: os.tmpdir() can be C:\Users\LONGNA~1\..., and a file
+// planted in the long form of that folder must still count as inside it.
 function realOf(p) {
-  try { return fs.realpathSync(p); } catch (_) { return path.resolve(p); }
+  try { return fs.realpathSync.native(p); } catch (_) { /* not there: resolve the part that is */ }
+  // A path that does not exist (yet) still names its folders in a short, linked or other form: take the native real
+  // form of the deepest folder that exists and add the rest, so it compares like the temp and project folders.
+  let head = path.resolve(p);
+  const rest = [];
+  for (;;) {
+    const parent = path.dirname(head);
+    if (parent === head) return path.resolve(p);
+    rest.unshift(path.basename(head));
+    head = parent;
+    try { return path.join(fs.realpathSync.native(head), ...rest); } catch (_) { /* go one folder up */ }
+  }
 }
 
 /* ------------------------------ hosts ------------------------------ */
@@ -175,6 +210,7 @@ function isLoopbackHost(host) {
 }
 
 module.exports = {
+  tempRoots,
   MARKER_SOURCE,
   markerRegex,
   markerFor,

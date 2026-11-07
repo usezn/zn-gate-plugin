@@ -160,7 +160,13 @@ function acquireLock(lockPath, waitMs = LOCK_WAIT_MS) {
   for (;;) {
     try {
       const fd = fs.openSync(lockPath, 'wx', LEDGER_FILE_MODE);
-      try { fs.writeSync(fd, token); } finally { fs.closeSync(fd); }
+      // If the token cannot be written (a full disk), remove the empty lock again: left behind, it would
+      // make every later writer wait for it and report that another process is writing.
+      let wrote = false;
+      try { fs.writeSync(fd, token); wrote = true; } finally {
+        fs.closeSync(fd);
+        if (!wrote) { try { fs.unlinkSync(lockPath); } catch { /* best effort */ } }
+      }
       return token;
     } catch (e) {
       // On Windows a lock that is being deleted answers EPERM/EACCES instead of EEXIST. If the

@@ -65,16 +65,65 @@ const id = 'zcode';
  * the agent from the environment: it comes from the launcher the hook runs, `runner.js zcode`). zn only ever answers deny on
  * PermissionRequest. Not tested: Windows with ZCode itself, macOS, the desktop app.
  * ---------------------------------------------------------------------------------------------------------------- */
-// ZCode's documented default is 60000. zn sets 30000 on its entries; zn's runner answers by itself 5 seconds before this (lib/hooks/runner.js).
+// zn's own time budget for one hook: the launcher blocks by itself 2 seconds before it and zn's runner answers a post-tool
+// check 5 seconds before it (lib/hooks/runner.js).
 const HOOK_TIMEOUT_S = 30;
 const HOOK_TIMEOUT_MS = HOOK_TIMEOUT_S * 1000;
+// The timeoutMs written on zn's entries (ZCode's documented default is 60000). ZCode lets a call run when its hook times out,
+// and on a Windows machine with every CPU busy ZCode timed an ordinary check at up to 131 seconds and a stuck hook that zn
+// then blocked at up to 154 seconds (the plugin) and 181 seconds (hooks installed this way) in our tests, so ZCode's
+// timeout is set far above zn's own budget: the hook still answers (or blocks) by itself within HOOK_TIMEOUT_S once it runs.
+// ZCode reads it with no upper limit. Same value as the plugin's hooks.json.
+const ENTRY_TIMEOUT_MS = 300000;
 const HOOK_STATUS = 'zn: checking for secrets';
-// The launcher's own deadline: assumed (not documented): the call runs when a hook times out, and the runner arms its watchdog only after it has
-// started, so a hook stuck on start-up is answered (blocked) by the launcher 2 seconds before ZCode gives up.
-const LAUNCHER_DEADLINE_S = HOOK_TIMEOUT_S - 2;
+// The launcher's own deadline: the call runs when a hook times out, and the runner arms its watchdog only after it has
+// started, so a hook stuck on start-up is answered (blocked) by the launcher. 2 minutes, like the plugin: with every CPU
+// busy ZCode timed an ordinary check at up to 131 seconds and a stuck hook at up to 181 seconds until it was blocked in our
+// tests, still under ENTRY_TIMEOUT_MS.
+const LAUNCHER_DEADLINE_S = 120;
 // Matchers: "*" (or none) matches every tool; a name list is only letters, digits, underscores and "|"; anything else is a regex.
 const PRE_MATCHER = '*';
 const PERMISSION_MATCHER = '*';
+
+/* The plugin's hooks.json (plugins/zcode/hooks/hooks.json) has no field for a platform: ZCode starts what an entry names and
+ * a hook that cannot start lets the call run. So every event has two "process" entries: /bin/sh on a script, which only
+ * macOS and Linux have, and, for Windows, the system PowerShell by its full path with a small inline command that reads
+ * scripts/zn-hook.ps1 from the plugin folder (ZCODE_PLUGIN_ROOT) and runs it as a script block (no execution policy applies
+ * to it). On each system the entry of the other one cannot start and is skipped. The inline command is built here, so
+ * the manifest, `zn-gate check` and the tests all read the same text. It has no double quote and no apostrophe in its
+ * messages: ZCode starts the process with no shell and Windows puts the arguments on one command line. */
+const PLUGIN_WIN_POWERSHELL = 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe';
+function pluginWindowsArgs(event) {
+  const blocks = event !== 'PostToolUse';
+  const msg = blocks
+    ? 'zn: the plugin launcher (scripts/zn-hook.ps1) could not run. This call was blocked because zn could not check it. Ask the user to fix it, or to turn off the zn-gate plugin in ZCode (Settings, Plugins).'
+    : 'zn is NOT protecting this session: the plugin launcher (scripts/zn-hook.ps1) could not run.';
+  const script = "try { & ([scriptblock]::Create([IO.File]::ReadAllText($env:ZCODE_PLUGIN_ROOT + '/scripts/zn-hook.ps1'))) '" + event + "' } catch { [Console]::Error.WriteLine('" + msg + "'); exit " + (blocks ? 2 : 0) + ' }; exit ' + (blocks ? 2 : 0);
+  return ['-NoProfile', '-NonInteractive', '-Command', script];
+}
+/* The entry hooks.json ships for Windows is the system cmd.exe on scripts/zn-hook.cmd, which starts Node.js directly (Windows PowerShell
+ * alone takes 0.5 to 3 seconds to start) and, when Node.js is not where the installer puts it, runs the PowerShell command above, so
+ * the answer is the same. Measured on Windows Server 2022 with Node.js spawning cmd.exe the way ZCode starts a hook (no shell, an
+ * arguments list): the program must be written with backslashes (with a slash cmd.exe reads "/Windows" as a switch and refuses), a
+ * double quote in an argument reaches cmd.exe as \" and breaks it, and a path with a space needs quotes, which Node.js adds
+ * around an argument that holds a space. So the script path is an argument of its own with a trailing space: the quotes Node.js
+ * adds keep the whole path one word for cmd.exe, also with a space, &, parentheses or ^ in a folder name, and Windows ignores the
+ * space at the end of a file name.
+ * - The path is ${ZCODE_PLUGIN_ROOT}, which ZCode replaces with the plugin folder before it starts the process (as in the /bin/sh
+ *   entry), never %ZCODE_PLUGIN_ROOT%: when that variable is not set cmd.exe leaves the text as it is, and the relative path it
+ *   gives would be looked up in the project folder, where a repository could have placed a file of that name.
+ * - It is grouped in ( ) instead of started with `call`: with `call` cmd.exe reads the line a second time, doubles every ^ and
+ *   expands % again, so a folder name with ^ or % would point somewhere else. The ( ) also keeps the first character of the line
+ *   from being a quote, which cmd.exe /c would remove together with the last one. cmd.exe still replaces %NAME% in the line when
+ *   a variable NAME is set: a folder name holding such a pair (not a single %) gives a path that does not exist, and the call is
+ *   blocked.
+ * - `||` blocks, or lets a PostToolUse call run, when the file cannot be run at all.
+ * zn-gate check fills in ${ZCODE_PLUGIN_ROOT} the same way and starts exactly this program with these arguments. Older plugin
+ * versions ship the PowerShell entry; zn-gate check accepts both. */
+const PLUGIN_WIN_CMD = 'C:\\Windows\\System32\\cmd.exe';
+function pluginWindowsCmdArgs(event) {
+  return ['/d', '/c', '(', '${ZCODE_PLUGIN_ROOT}\\scripts\\zn-hook.cmd ', event, ')', '||', 'exit', '/b', event !== 'PostToolUse' ? '2' : '0'];
+}
 // Tools whose output can hold a secret: the built-in ones that print file or command text, and every MCP tool.
 const POST_MATCHER = '^(Bash|Read|Grep|WebFetch)$|^mcp__.*';
 const EVENTS = ['PreToolUse', 'PermissionRequest', 'UserPromptSubmit', 'PostToolUse'];
@@ -301,7 +350,7 @@ function stripOurs(groups) {
  * same three steps are an inline PowerShell script. A command given by the caller keeps the plain command.
  */
 function handlerFor(opts = {}) {
-  const base = { timeoutMs: HOOK_TIMEOUT_MS, statusMessage: HOOK_STATUS };
+  const base = { timeoutMs: ENTRY_TIMEOUT_MS, statusMessage: HOOK_STATUS };
   if (opts.command) return () => ({ type: 'command', command: opts.command, ...base });
   const platform = opts.platform || process.platform;
   const node = opts.nodePath || process.execPath;
@@ -623,7 +672,12 @@ module.exports = {
   capabilities: { ask: 'pre_tool', rewriteInput: false, rewriteOutput: false },
   HOOK_TIMEOUT_S,
   HOOK_TIMEOUT_MS,
+  ENTRY_TIMEOUT_MS,
   LAUNCHER_DEADLINE_S,
+  PLUGIN_WIN_POWERSHELL,
+  PLUGIN_WIN_CMD,
+  pluginWindowsCmdArgs,
+  pluginWindowsArgs,
   HOOK_STATUS,
   PRE_MATCHER,
   POST_MATCHER,

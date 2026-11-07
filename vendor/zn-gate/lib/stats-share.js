@@ -124,23 +124,35 @@ function post(report) {
   });
 }
 
-/** Send the pending reports; sent_until moves past each day sent. Returns { sent, failed }. */
+/**
+ * Send the pending reports. sent_until moves past the leading run of days that were sent: from the first failure it
+ * stays put, so that day (and any later one) is tried again next time. Later days are still sent in the same run: the
+ * server stores one report per (install_id, day), so sending a day again replaces it and counts nothing twice.
+ * Returns { sent, failed, sentDays, failedDays }. */
 async function sendPending({ now = new Date(), print = () => {} } = {}) {
   const reports = pendingReports(now);
   let sent = 0;
   let failed = 0;
+  const sentDays = [];
+  const failedDays = [];
+  let advance = true;
   for (const r of reports) {
     print(r);
     if (await post(r)) {
       sent++;
-      const cfg = readConfig();
-      cfg.stats = { ...(cfg.stats || {}), sent_until: stats.today(new Date(Date.parse(r.day + 'T00:00:00Z') + 86400000)) };
-      writeConfig(cfg);
+      sentDays.push(r.day);
+      if (advance) {
+        const cfg = readConfig();
+        cfg.stats = { ...(cfg.stats || {}), sent_until: stats.today(new Date(Date.parse(r.day + 'T00:00:00Z') + 86400000)) };
+        writeConfig(cfg);
+      }
     } else {
+      advance = false;
       failed++;
+      failedDays.push(r.day);
     }
   }
-  return { sent, failed };
+  return { sent, failed, sentDays, failedDays };
 }
 
 module.exports = { status, setShare, pendingReports, sendPending, ENDPOINT };

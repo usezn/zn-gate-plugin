@@ -65,4 +65,4 @@ them.
 ## What zn does not cover
 
 zn reduces what reaches the model; it is not a sandbox. Per-agent limits are
-documented in https://github.com/usezn/zn/blob/v1.14.1/docs/compat.md.
+documented in https://github.com/usezn/zn/blob/v1.15.0/docs/compat.md.

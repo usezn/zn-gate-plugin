@@ -401,8 +401,8 @@ function selfCheck(command, opts = {}) {
   const first = parts ? require('../exe').findProgram(parts[0], env) : null;
   if (parts && !first) return { ok: false, detail: 'it could not be started (' + parts[0] + ' was not found on the PATH)' };
   const r = parts ? spawnSync(first, parts.slice(1), spawnOpts) : spawnSync(command, { shell: true, ...spawnOpts });
-  // A hook that answers and exits before reading all its input makes the write fail with EPIPE although it ran: its status and output are the answer.
-  const ranAndExited = r.error && r.error.code === 'EPIPE' && typeof r.status === 'number';
+  // A hook that answers and exits before reading all its input makes the write fail with EPIPE (EOF on Windows) although it ran: its status and output are the answer.
+  const ranAndExited = r.error && (r.error.code === 'EPIPE' || r.error.code === 'EOF') && typeof r.status === 'number';
   if (r.error && !ranAndExited) return { ok: false, detail: r.error.code === 'ETIMEDOUT' ? 'it did not answer within 20 seconds' : 'it could not be started (' + (r.error.code || 'error') + ')' };
   const text = String(r.stdout || '').trim();
   let parsed;
