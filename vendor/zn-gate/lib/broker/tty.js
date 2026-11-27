@@ -6,6 +6,7 @@
  */
 
 const { spawnSync } = require('child_process');
+const path = require('path');
 const messages = require('../messages');
 
 /**
@@ -103,8 +104,15 @@ function confirm(question, io = {}) {
   });
 }
 
-/** Read the clipboard with the platform tool. Returns a string or throws. */
-function readClipboard() {
+/** Longest a clipboard tool may run before it is killed; the user can still type the value at the hidden prompt. */
+const CLIPBOARD_TIMEOUT_MS = 5000;
+
+/**
+ * Read the clipboard with the platform tool. Returns a string or throws.
+ * opts.timeoutMs (tests) replaces the 5 s limit per tool.
+ */
+function readClipboard(opts = {}) {
+  const timeoutMs = opts.timeoutMs || CLIPBOARD_TIMEOUT_MS;
   // Absolute paths only: a clipboard tool planted on PATH would receive the value. On Windows, the system
   // PowerShell from the kernel's \\SystemRoot link, never from SystemRoot (see exe.js).
   const ps = process.platform === 'win32' ? require('../exe').systemPowerShell() : null;
@@ -113,9 +121,17 @@ function readClipboard() {
     : process.platform === 'win32'
       ? (ps ? [[ps, ['-NoProfile', '-Command', 'Get-Clipboard -Raw']]] : [])
       : [['/usr/bin/wl-paste', ['--no-newline']], ['/usr/bin/xclip', ['-selection', 'clipboard', '-o']], ['/usr/bin/xsel', ['--clipboard', '--output']]];
+  const timedOut = [];
   for (const [cmd, args] of candidates) {
-    const r = spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true, ...(cmd === ps ? { env: require('../exe').psEnv(ps) } : {}) });
+    const r = spawnSync(cmd, args, { encoding: 'utf8', windowsHide: true, timeout: timeoutMs, killSignal: 'SIGKILL', ...(cmd === ps ? { env: require('../exe').psEnv(ps) } : {}) });
+    // A tool that does not answer is killed and the next one is tried; the error names the ones that hung.
+    if (r.error && r.error.code === 'ETIMEDOUT') { timedOut.push(path.basename(cmd)); continue; }
     if (!r.error && r.status === 0) return String(r.stdout || '').replace(/\r?\n$/, '');
+  }
+  if (timedOut.length) {
+    const timeoutErr = new Error(messages.clipboardTimedOut(timedOut, timeoutMs));
+    timeoutErr.code = 'ZN_UNAVAILABLE';
+    throw timeoutErr;
   }
   const err = new Error(candidates.length ? messages.clipboardUnreadable(candidates.map((c) => c[0])) : messages.CLIPBOARD_NO_POWERSHELL);
   err.code = 'ZN_UNAVAILABLE';

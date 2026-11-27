@@ -60,6 +60,60 @@ function macOf(key, record) {
   return crypto.createHmac('sha256', key).update(JSON.stringify(record)).digest('hex');
 }
 
+/*
+ * forEachLine(file, fn, {chunkSize, maxLine}) -> boolean (false when the file does not exist)
+ * Reads the file in chunks and calls fn(line, lineNo) for every non-empty line,
+ * so a log of any size is never held in one string (a single string over
+ * ~512 MiB throws ERR_STRING_TOO_LONG). A line longer than maxLine bytes
+ * (default 4 MiB; the daemon never writes one) is handed over as null.
+ * fn returns true to stop early. Read errors other than ENOENT are thrown.
+ * opts.onChunk(buffer, length), when given, sees every raw chunk as it is read
+ * (used to hash the exact bytes that were read).
+ */
+function forEachLine(file, fn, opts) {
+  const o = opts || {};
+  const chunkSize = Number.isInteger(o.chunkSize) && o.chunkSize > 0 ? o.chunkSize : 1024 * 1024;
+  const maxLine = Number.isInteger(o.maxLine) && o.maxLine > 0 ? o.maxLine : 4 * 1024 * 1024;
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch (err) { if (err.code === 'ENOENT') return false; throw err; }
+  try {
+    const buf = Buffer.allocUnsafe(chunkSize);
+    let parts = [];
+    let partLen = 0;
+    let tooLong = false;
+    let lineNo = 0;
+    const emit = (bytes) => {
+      if (!tooLong && bytes.length === 0) return false;
+      lineNo += 1;
+      return fn(tooLong ? null : bytes.toString('utf8'), lineNo) === true;
+    };
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, chunkSize, null);
+      if (n === 0) break;
+      if (typeof o.onChunk === 'function') o.onChunk(buf, n);
+      let start = 0;
+      for (;;) {
+        const nl = buf.indexOf(0x0a, start);
+        if (nl < 0 || nl >= n) break;
+        let bytes = buf.subarray(start, nl);
+        if (partLen > 0) { parts.push(Buffer.from(bytes)); bytes = Buffer.concat(parts); }
+        const stop = emit(bytes);
+        parts = []; partLen = 0; tooLong = false;
+        if (stop) return true;
+        start = nl + 1;
+      }
+      if (start < n && !tooLong) {
+        partLen += n - start;
+        if (partLen > maxLine) { tooLong = true; parts = []; partLen = 1; } else parts.push(Buffer.from(buf.subarray(start, n)));
+      }
+    }
+    if (partLen > 0 || tooLong) emit(tooLong ? Buffer.alloc(0) : Buffer.concat(parts));
+    return true;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /* Last record of the log (reads only the tail of the file). */
 function lastRecord(file) {
   let fd;
@@ -145,6 +199,8 @@ function checkHead(file, head) {
 
 /**
  * verify({file, key, checkpoint}) -> {ok, records, error?, line?}
+ * The log is read in chunks, never as one string. A file that cannot be read
+ * throws (an IO error is not a finding: callers must not call it tampering).
  * Checks every MAC, the prev links and the sequence numbers.
  * checkpoint: {seq, mac}, the last record the vault remembers. The log must
  * reach that sequence number and the record there must carry that MAC, so a
@@ -155,38 +211,43 @@ function verify(opts) {
   const o = opts || {};
   const key = Buffer.isBuffer(o.key) ? o.key : Buffer.from(String(o.key || ''), 'hex');
   const cp = o.checkpoint && Number.isInteger(o.checkpoint.seq) && o.checkpoint.seq > 0 ? o.checkpoint : null;
-  let text;
-  try { text = fs.readFileSync(o.file, 'utf8'); } catch (err) {
-    if (err.code === 'ENOENT') {
-      return cp ? { ok: false, records: 0, error: 'log truncated (vault expects ' + cp.seq + ' records)' } : { ok: true, records: 0 };
-    }
-    throw err;
-  }
-  const lines = text.split('\n').filter((l) => l.length > 0);
   let prev = GENESIS;
   let seq = 0;
-  for (let i = 0; i < lines.length; i++) {
+  let count = 0;
+  let failure = null;
+  const fileHash = crypto.createHash('sha256');
+  let fileBytes = 0;
+  const fail = (line, error) => { failure = { ok: false, records: line - 1, line, error }; return true; };
+  const exists = forEachLine(o.file, (text, line) => {
     let rec;
-    try { rec = JSON.parse(lines[i]); } catch (err) { return { ok: false, records: i, line: i + 1, error: 'unparseable record' }; }
+    try { rec = JSON.parse(text); } catch (err) { rec = undefined; }
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return fail(line, 'unparseable record');
     const mac = rec.mac;
     delete rec.mac;
     const expected = macOf(key, rec);
     if (typeof mac !== 'string' || mac.length !== expected.length ||
-        !crypto.timingSafeEqual(Buffer.from(mac, 'hex'), Buffer.from(expected, 'hex'))) {
-      return { ok: false, records: i, line: i + 1, error: 'bad mac' };
-    }
-    if (rec.prev !== prev) return { ok: false, records: i, line: i + 1, error: 'broken chain' };
-    if (rec.seq !== seq + 1) return { ok: false, records: i, line: i + 1, error: 'bad sequence' };
+        !crypto.timingSafeEqual(Buffer.from(mac, 'hex'), Buffer.from(expected, 'hex'))) return fail(line, 'bad mac');
+    if (rec.prev !== prev) return fail(line, 'broken chain');
+    if (rec.seq !== seq + 1) return fail(line, 'bad sequence');
     prev = mac;
     seq = rec.seq;
+    count = line;
     if (cp && seq === cp.seq && mac !== cp.mac) {
-      return { ok: false, records: i, line: i + 1, error: 'log differs from the vault checkpoint (record ' + seq + ' has a different MAC)' };
+      return fail(line, 'log differs from the vault checkpoint (record ' + seq + ' has a different MAC)');
     }
+    return false;
+  }, { chunkSize: o.chunkSize, maxLine: o.maxLine, onChunk: (b, n) => { fileHash.update(b.subarray(0, n)); fileBytes += n; } });
+  if (!exists) {
+    if (cp) return { ok: false, records: 0, error: 'log truncated (vault expects ' + cp.seq + ' records)' };
+    // No log yet (a vault that has not written a record): with opts.hash the checked bytes are the empty input.
+    return o.hash === true ? { ok: true, records: 0, sha256: fileHash.digest('hex'), bytes: 0 } : { ok: true, records: 0 };
   }
+  if (failure) return failure;
   if (cp && seq < cp.seq) {
-    return { ok: false, records: lines.length, error: 'log truncated (vault expects ' + cp.seq + ' records)' };
+    return { ok: false, records: count, error: 'log truncated (vault expects ' + cp.seq + ' records)' };
   }
-  return { ok: true, records: lines.length };
+  // With opts.hash: also the sha256 and size of the exact bytes that were checked (a caller that reads the file later can tell whether it changed).
+  return o.hash === true ? { ok: true, records: count, sha256: fileHash.digest('hex'), bytes: fileBytes } : { ok: true, records: count };
 }
 
 function parseSince(since) {
@@ -209,24 +270,23 @@ function parseSince(since) {
 function read(opts) {
   const o = opts || {};
   const file = o.file || require('./store').paths(o).auditFile;
-  let text;
-  try { text = fs.readFileSync(file, 'utf8'); } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    throw err;
-  }
   const from = parseSince(o.since);
-  const out = [];
-  for (const line of text.split('\n')) {
-    if (!line) continue;
+  const limit = Number(o.limit) > 0 ? Number(o.limit) : 0;
+  let out = [];
+  forEachLine(file, (line) => {
+    if (line === null) return false;
     let rec;
-    try { rec = JSON.parse(line); } catch (err) { continue; }
-    if (from !== null && Date.parse(rec.ts) < from) continue;
+    try { rec = JSON.parse(line); } catch (err) { return false; }
+    if (!rec || typeof rec !== 'object') return false;
+    if (from !== null && Date.parse(rec.ts) < from) return false;
     const ev = { seq: rec.seq, ts: rec.ts };
     for (const f of FIELDS) if (rec[f] !== undefined) ev[f] = rec[f];
     out.push(ev);
-  }
-  const limit = Number(o.limit) > 0 ? Number(o.limit) : 0;
+    // Keep only about the newest `limit` events while reading.
+    if (limit && out.length >= limit * 2) out = out.slice(-limit);
+    return false;
+  });
   return limit ? out.slice(-limit) : out;
 }
 
-module.exports = { append, verify, checkHead, read, sanitize, lastRecord, FIELDS, GENESIS };
+module.exports = { append, verify, checkHead, read, sanitize, lastRecord, forEachLine, FIELDS, GENESIS };

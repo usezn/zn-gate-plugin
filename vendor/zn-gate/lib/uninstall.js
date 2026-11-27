@@ -32,7 +32,7 @@ function projectHooks(spec, cwd, userFile) {
   if (path.resolve(file) === path.resolve(userFile)) return null;
   let text = '';
   try { if (fs.lstatSync(file).isFile()) text = fs.readFileSync(file, 'utf8'); } catch (_) { return null; }
-  if (spec.id === 'opencode') return /\/zn-gate\/lib\/hooks\/runner\.js"|"hook", "opencode"/.test(text) ? file : null;
+  if (spec.id === 'opencode') return require('./agents/opencode').isOurs(file) ? file : null;
   let tree = null;
   try { tree = JSON.parse(text.replace(/^\uFEFF/, '')); } catch (_) { return null; }
   return chk.hookEntries(tree, spec.id).some((e) => chk.parseCommand(e.command, spec.id)) ? file : null;
@@ -90,12 +90,28 @@ async function plan(opts = {}) {
     const userFile = spec.file(getAdapter(r.id), { home, env });
     const a = { id: r.id, name: r.name, userHooks: null, projectHooks: null, plugin: null };
     if (r.via === 'hooks' || r.via === 'both') a.userHooks = userFile;
+    // The OpenCode plugin is removed only when it is zn's own (the file starts with zn's mark).
+    if (r.id === 'opencode' && a.userHooks && !getAdapter('opencode').isOurs(userFile)) a.userHooks = null;
     if (r.id === 'claude-code') {
       const p = zc._internal.claudePlugin(home, env);
       if (p.root) a.plugin = p.root;
     }
     a.projectHooks = projectHooks(spec, cwd, userFile);
     if (a.userHooks || a.projectHooks || a.plugin) agents.push(a);
+  }
+  // Launcher scripts that zn wrote for hooks: listed for every agent, also when its hooks are already gone.
+  const launcher = require('./agents/launcher');
+  const launchers = [];
+  for (const id of launcher.LAUNCHER_AGENTS) {
+    const file = launcher.launcherFile(id, { home, env });
+    if (!launcher.isOurLauncher(file)) continue;
+    // A launcher that some hooks file of the user still names stays unless those hooks are removed in this run.
+    const listed = agents.some((x) => x.id === id && x.userHooks);
+    const spec = zc.AGENTS.find((x) => x.id === id);
+    let named = false;
+    try { named = fs.readFileSync(spec.file(getAdapter(id), { home, env }), 'utf8').includes(path.basename(file)); } catch (_) { /* no file */ }
+    if (named && !listed) continue;
+    launchers.push({ id, file });
   }
   const vaultOpts = env.ZN_HOME ? { home: env.ZN_HOME } : (opts.home ? { home: path.join(home, '.zn') } : {});
   const store = require('./vault/store');
@@ -107,11 +123,12 @@ async function plan(opts = {}) {
     shadowed: shadowedFiles(cwd),
     vault: { exists: found.files.length > 0, home: store.paths(vaultOpts).home, lines: purge.describe(found, vaultOpts) },
     vaultOpts,
+    launchers,
   };
 }
 
 function isEmpty(p) {
-  return !p.agents.length && !p.wrapped.length && !p.vault.exists && !p.shadowed.length;
+  return !p.agents.length && !p.wrapped.length && !p.launchers.length && !p.vault.exists && !p.shadowed.length;
 }
 
 function printPlan(p, io) {
@@ -122,12 +139,21 @@ function printPlan(p, io) {
     out(io, 'Nothing from zn-gate was found for your user or this folder.');
     return;
   }
-  if (p.agents.length || p.wrapped.length) out(io, 'Will be removed:');
+  if (p.agents.length || p.wrapped.length || p.launchers.length) out(io, 'Will be removed:');
   for (const a of p.agents) {
     out(io, '  ' + a.name);
     if (a.plugin) out(io, '    - the zn-gate plugin (' + a.plugin + ')');
+    if (a.id === 'opencode') {
+      if (a.userHooks) out(io, '    - zn\'s plugin for your user: ' + a.userHooks);
+      if (a.projectHooks) out(io, '    - zn\'s plugin for this project: ' + a.projectHooks);
+      continue;
+    }
     if (a.userHooks) out(io, '    - zn\'s hooks for your user (and its "secrets" MCP server, if listed): ' + a.userHooks);
     if (a.projectHooks) out(io, '    - zn\'s hooks for this project: ' + a.projectHooks);
+  }
+  if (p.launchers.length) {
+    out(io, '  zn\'s hook launcher scripts (and their folder, if it ends up empty)');
+    for (const l of p.launchers) out(io, '    - ' + l.file);
   }
   if (p.wrapped.length) {
     out(io, '  MCP servers wrapped by zn-gate init --wrap-mcp');
@@ -161,8 +187,7 @@ async function removeVault(p, io) {
   const daemon = require('./vault/daemon');
   const policy = require('./team/policy');
   const o = p.vaultOpts;
-  const f = policy.paths(o);
-  if ([f.teamFile, f.policyFile].some((x) => fs.existsSync(x))) {
+  if (policy.onTeamMachine(o)) {
     out(io, 'The vault was kept: this computer belongs to a zn Team organization and its controls are kept inside the vault. Ask your administrator.');
     return 'failed';
   }
@@ -213,7 +238,7 @@ async function run(args, io) {
   if (!io.human) tty.requireHuman('zn-gate uninstall', io);
   let failed = 0;
   const ask = io.confirm || ((q) => tty.confirm(q, { stdin: io.stdin, stderr: io.stderr }));
-  if (p.agents.length || p.wrapped.length) {
+  if (p.agents.length || p.wrapped.length || p.launchers.length) {
     if (!(await ask('Remove what is listed above?'))) { out(io, 'Nothing was changed.'); return 1; }
     // Wrapped MCP first: putting a saved copy back must not undo the hook removal that follows.
     const withBackup = p.wrapped.filter((w) => w.backup);
@@ -225,16 +250,19 @@ async function run(args, io) {
       }
     }
     const { getAdapter } = require('./agents');
+    // Agents whose hooks (user or project) could not be removed: their launcher stays, a hook may still call it.
+    const failedHooks = new Set();
     for (const a of p.agents) {
       const adapter = getAdapter(a.id);
       for (const scope of ['user', 'project']) {
         if (!(scope === 'user' ? a.userHooks : a.projectHooks)) continue;
         try {
-          const rep = adapter.uninstall({ scope, projectDir: io.cwd, home: io.home, env: io.env, mcp: true, removeLauncher: true });
+          const rep = adapter.uninstall({ scope, projectDir: io.cwd, home: io.home, env: io.env, mcp: true, removeLauncher: false });
           out(io, '  ' + a.name + ': removed zn\'s hooks (' + scope + ') in ' + rep.settings + (rep.backup ? ' (copy saved: ' + rep.backup + ')' : ''));
         } catch (err) {
           out(io, '  ' + a.name + ': could not remove the ' + scope + ' hooks: ' + (err && err.message ? err.message : err));
           failed++;
+          failedHooks.add(a.id);
         }
       }
       if (a.plugin) {
@@ -243,6 +271,64 @@ async function run(args, io) {
         else if ((io.run || s.exec)(s, io.env)) out(io, '  ' + a.name + ': plugin removed');
         else { out(io, '  ' + a.name + ': the plugin was not removed. Run it yourself: ' + s.manual); failed++; }
       }
+    }
+    // Launcher scripts last, once the hooks that call them are gone. One whose hooks could not be removed stays, and so
+    // does one that a hooks file (the user's, or this folder's) still names. zn keeps no list of the other projects of
+    // this machine; the hooks zn writes into a project call `zn` from the PATH, not this script.
+    const launcher = require('./agents/launcher');
+    const { AGENTS } = require('./check');
+    for (const l of p.launchers) {
+      const spec = AGENTS.find((x) => x.id === l.id);
+      const base = path.basename(l.file);
+      // Three answers: true (names the launcher), false (does not: the file is absent or has no mention) and null (cannot
+      // tell: any other read error). Only a clear false lets the launcher go; null keeps it (fail closed).
+      // ENOTDIR (a folder on the path is really a file) means "does not exist" only when the parent is confirmed not to be
+      // a folder; if that cannot be confirmed either, it stays "cannot tell".
+      const notAFolder = (f) => {
+        try { return !fs.statSync(path.dirname(f)).isDirectory(); } catch (_) { return false; }
+      };
+      const names = (f) => {
+        try { return fs.readFileSync(f, 'utf8').includes(base); } catch (e) {
+          if (e && e.code === 'ENOENT') return false;
+          if (e && e.code === 'ENOTDIR' && notAFolder(f)) return false;
+          return null;
+        }
+      };
+      let keep = failedHooks.has(l.id);
+      let why = 'a hooks file may still use it';
+      if (!keep && spec) {
+        // Every AGENTS entry has file() and project(); a missing or failing one keeps the launcher (fail safe).
+        let files;
+        try {
+          files = [spec.file(getAdapter(l.id), { home: io.home, env: io.env }), spec.project(io.cwd)];
+        } catch (_) {
+          files = null;
+        }
+        if (!files) { keep = true; files = []; }
+        if (l.id === 'claude-code') {
+          const profiles = claudeProfileSettings(io.home);
+          files.push(...profiles.files);
+          if (profiles.unknown) { keep = true; why = 'a Claude Code profile could not be checked'; }
+        }
+        if (!keep) {
+          const answers = files.map(names);
+          if (answers.includes(null)) { keep = true; why = 'a hooks file could not be read'; }
+          else keep = answers.includes(true);
+        }
+      }
+      // The Claude Code launcher is shared by every profile (every CLAUDE_CONFIG_DIR). With a profile folder set, zn
+      // cannot see the other profiles, so it keeps the launcher rather than break their hooks.
+      if (!keep && l.id === 'claude-code' && io.env && io.env.CLAUDE_CONFIG_DIR) {
+        keep = true;
+        why = 'other Claude Code profiles may still use it';
+      }
+      if (keep) {
+        out(io, '  launcher script kept (' + why + '): ' + l.file + '. Once nothing uses it, delete that file yourself.');
+        continue;
+      }
+      launcher.removeLauncher(l.id, { home: io.home, env: io.env });
+      if (fs.existsSync(l.file)) { out(io, '  launcher script not removed: ' + l.file); failed++; }
+      else out(io, '  launcher script removed: ' + l.file);
     }
     // Look again: a config wrapped twice, or one with no saved copy, is still wrapped.
     const still = wrappedConfigs(io.envList);
@@ -268,6 +354,30 @@ async function run(args, io) {
   if (failed) out(io, 'Not everything was removed: ' + failed + (failed === 1 ? ' step' : ' steps') + ' did not finish (see above). Exit code 1.');
   out(io, 'Last step, to remove the program itself: npm uninstall -g zn-gate');
   return failed ? 1 : 0;
+}
+
+
+/* The settings files of the Claude Code profiles in the home folder: ~/.claude and every ~/.claude* folder (for
+   example one per CLAUDE_CONFIG_DIR). Only folders are profiles: ~/.claude.json and its backups are plain files that
+   Claude Code keeps next to them. A link to a folder is a profile; a link that cannot be followed is not known to be
+   anything, so (like a home folder that cannot be listed) it makes `unknown` true: the caller must not assume there are
+   no other profiles. */
+function claudeProfileSettings(home) {
+  const files = [];
+  let entries;
+  try { entries = fs.readdirSync(home, { withFileTypes: true }); } catch (_) { return { files, unknown: true }; }
+  let unknown = false;
+  for (const e of entries) {
+    const n = e.name;
+    if (!/^\.claude/.test(n)) continue;
+    let isDir = e.isDirectory();
+    if (!isDir && !e.isFile()) {
+      // A link (or an entry whose type the listing did not give): follow it to see what it is.
+      try { isDir = fs.statSync(path.join(home, n)).isDirectory(); } catch (_) { unknown = true; continue; }
+    }
+    if (isDir) files.push(path.join(home, n, 'settings.json'));
+  }
+  return { files, unknown };
 }
 
 module.exports = { run, plan, printPlan, USAGE };

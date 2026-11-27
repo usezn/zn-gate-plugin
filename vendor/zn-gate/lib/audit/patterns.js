@@ -6,6 +6,7 @@
  */
 
 const path = require('path');
+const { isHookStopVar } = require('../loader-env');
 
 const MAX_LINE = 4000;
 
@@ -290,21 +291,50 @@ function hostOf(url) {
 }
 
 function isLoopback(host) {
-  return host === 'localhost' || host === '::1' || host === '0.0.0.0' || /^127\./.test(host || '') || /\.localhost$/.test(host || '');
+  return host === 'localhost' || host === '::1' || host === '0.0.0.0' || /^127(?:\.\d{1,3}){3}$/.test(host || '') || /\.localhost$/.test(host || '');
 }
 
-/** URL without user, password, query or fragment, for printing. */
+/** Scheme and host of a URL, for printing: no path, user, password, query or fragment. */
 function safeUrl(url) {
   try {
     const u = new URL(String(url));
-    return u.protocol + '//' + u.host + (u.pathname === '/' ? '' : u.pathname);
+    // No host (for example "user:pass@host" read as a scheme): nothing safe to show.
+    if (!u.host || !/^[a-z][a-z0-9+.-]*:$/i.test(u.protocol) || !/^[a-z][a-z0-9+.-]*:(?:\\?\/){2}/i.test(String(url).trim())) return '(unparsable URL)';
+    return u.protocol + '//' + u.host;
   } catch (_) {
-    return String(url).replace(/\/\/[^/@\s]*@/, '//').replace(/[?#].*$/, '');
+    return '(unparsable URL)';
   }
+}
+
+/**
+ * Replace every URL in a text with scheme://host (never the path, query, userinfo or fragment).
+ * A URL that cannot be read safely becomes "(unparsable URL)".
+ */
+function maskUrls(text, keep) {
+  const kept = keep ? String(keep).replace(/\\/g, '') : null;
+  let out = String(text == null ? '' : text).replace(/\b[a-z][a-z0-9+.-]{1,15}:(?:\\?\/){2}[^\s"'<>`]*/gi, (m) => {
+    // A "]" that closes a redaction marker is part of the URL, not punctuation.
+    const tail = (m.includes('[') ? /[)}.,;]+$/ : /[)\]}.,;]+$/).exec(m);
+    const core = tail ? m.slice(0, tail.index) : m;
+    const clean = core.replace(/\\/g, '');
+    // The one URL a finding is about (the download URL of ZNA002) is kept, without its user and password.
+    if (kept && clean === kept) return clean.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/i, '$1') + (tail ? tail[0] : '');
+    return safeUrl(clean) + (tail ? tail[0] : '');
+  });
+  // user:password@host[:port] without a scheme (a proxy): never print the user or the password.
+  // The user may be empty, the password may hold "/", a backslash or "@" (it ends at the last "@" of the token), and the host may be IPv6.
+  out = out.replace(/(^|["'\s=(,;\[])[^\s"'@:]*:[^\s"']*@(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:\d+)?/g, '$1[REDACTED]@$2$3');
+  // Protocol-relative URLs ("//host/path"): host only.
+  out = out.replace(/(["'=(])\/\/([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?)[^\s"'<>`]*/g, '$1//$2');
+  return out;
 }
 
 /** Classify an agent-level environment variable. */
 function classifyEnv(key, value) {
+  // glibc's dynamic loader ends every dynamically linked program before its first line when LD_TRACE_LOADED_OBJECTS is set (to any
+  // value, even empty or a placeholder: it prints the library list instead) or when LD_DEBUG names "help" (it prints the debug options).
+  // The shell that runs a hook is such a program, so every hook the agent starts exits 0 having checked nothing.
+  if (isHookStopVar(key, value)) return { kind: 'hookstop' };
   if (isPlaceholder(value)) return null;
   const k = String(key);
   const v = String(value);
@@ -546,6 +576,7 @@ module.exports = {
   hostOf,
   isLoopback,
   safeUrl,
+  maskUrls,
   claudePermission,
   exfiltration,
   weakening,

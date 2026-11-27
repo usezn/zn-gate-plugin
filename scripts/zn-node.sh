@@ -21,6 +21,12 @@
 # Functions exported in the environment (bash running as sh) could replace the commands below.
 unset -f [ test wait kill command printf cd pwd ls sort sleep 2>/dev/null
 
+# Variables that make Node.js or the dynamic loader load code of the caller's choosing (NODE_OPTIONS=--require, LD_PRELOAD and the
+# like) are removed before anything is started: a project can set the environment of the agent. NODE_EXTRA_CA_CERTS and the proxy settings stay.
+unset GCONV_PATH GLIBC_TUNABLES LOCPATH NLSPATH HOSTALIASES RES_OPTIONS OPENSSL_CONF NODE_OPTIONS NODE_PATH NODE_REPL_EXTERNAL_MODULE NODE_V8_COVERAGE PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT PYTHONUSERBASE PERL5OPT PERL5LIB PERLLIB RUBYOPT RUBYLIB JAVA_TOOL_OPTIONS _JAVA_OPTIONS JDK_JAVA_OPTIONS BASH_ENV ENV
+set -f; IFS='
+'; for ZN_V in $(export -p); do ZN_V=${ZN_V#export }; ZN_V=${ZN_V#declare -x }; ZN_V=${ZN_V%%=*}; case $ZN_V in ""|*[!A-Za-z0-9_]*) ;; [Ll][Dd]_*|[Dd][Yy][Ll][Dd]_*|[Gg][Cc][Oo][Nn][Vv]_[Pp][Aa][Tt][Hh]|[Gg][Ll][Ii][Bb][Cc]_[Tt][Uu][Nn][Aa][Bb][Ll][Ee][Ss]|[Ll][Oo][Cc][Pp][Aa][Tt][Hh]|[Nn][Ll][Ss][Pp][Aa][Tt][Hh]|[Hh][Oo][Ss][Tt][Aa][Ll][Ii][Aa][Ss][Ee][Ss]|[Rr][Ee][Ss]_[Oo][Pp][Tt][Ii][Oo][Nn][Ss]|[Oo][Pp][Ee][Nn][Ss][Ss][Ll]_[Cc][Oo][Nn][Ff]|[Nn][Oo][Dd][Ee]_[Oo][Pp][Tt][Ii][Oo][Nn][Ss]|[Nn][Oo][Dd][Ee]_[Pp][Aa][Tt][Hh]|[Nn][Oo][Dd][Ee]_[Rr][Ee][Pp][Ll]_[Ee][Xx][Tt][Ee][Rr][Nn][Aa][Ll]_[Mm][Oo][Dd][Uu][Ll][Ee]|[Nn][Oo][Dd][Ee]_[Vv]8_[Cc][Oo][Vv][Ee][Rr][Aa][Gg][Ee]|[Pp][Yy][Tt][Hh][Oo][Nn][Pp][Aa][Tt][Hh]|[Pp][Yy][Tt][Hh][Oo][Nn][Hh][Oo][Mm][Ee]|[Pp][Yy][Tt][Hh][Oo][Nn][Ss][Tt][Aa][Rr][Tt][Uu][Pp]|[Pp][Yy][Tt][Hh][Oo][Nn][Ii][Nn][Ss][Pp][Ee][Cc][Tt]|[Pp][Yy][Tt][Hh][Oo][Nn][Uu][Ss][Ee][Rr][Bb][Aa][Ss][Ee]|[Pp][Ee][Rr][Ll]5[Oo][Pp][Tt]|[Pp][Ee][Rr][Ll]5[Ll][Ii][Bb]|[Pp][Ee][Rr][Ll][Ll][Ii][Bb]|[Rr][Uu][Bb][Yy][Oo][Pp][Tt]|[Rr][Uu][Bb][Yy][Ll][Ii][Bb]|[Jj][Aa][Vv][Aa]_[Tt][Oo][Oo][Ll]_[Oo][Pp][Tt][Ii][Oo][Nn][Ss]|_[Jj][Aa][Vv][Aa]_[Oo][Pp][Tt][Ii][Oo][Nn][Ss]|[Jj][Dd][Kk]_[Jj][Aa][Vv][Aa]_[Oo][Pp][Tt][Ii][Oo][Nn][Ss]|[Bb][Aa][Ss][Hh]_[Ee][Nn][Vv]|[Ee][Nn][Vv]) unset "$ZN_V" ;; esac; done; unset IFS ZN_V; set +f
+
 EVENT="${1:-}"
 [ "$#" -gt 0 ] && shift
 AGENT=

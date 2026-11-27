@@ -175,6 +175,9 @@ function findPromptAssignments(text) {
   AUTH_RE.lastIndex = 0;
   while ((m = AUTH_RE.exec(t)) !== null) {
     const start = m.index + m[0].length - m[1].length;
+    // Elided ("Bearer abc123..." or "Bearer abc123…"): check before trimTrailing drops the dots. The
+    // ellipsis character is not in the token class, so it shows up right after the match.
+    if (/\.\.\.$/.test(m[1]) || t[m.index + m[0].length] === '…') continue;
     const tok = trimTrailing(m[1]);
     if (authToken(tok)) out.push(result(start, start + tok.length, 'AUTHORIZATION'));
   }

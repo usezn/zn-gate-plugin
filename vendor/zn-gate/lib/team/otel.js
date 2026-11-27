@@ -25,8 +25,8 @@
  * the same bytes and the same SHA-256.
  */
 
-const fs = require('fs');
 const crypto = require('crypto');
+const { forEachLine } = require('../vault/audit');
 
 const SCOPE_NAME = 'usezn.evidence';
 const SCOPE_VERSION = '1';
@@ -181,33 +181,76 @@ function parseSince(since) {
 }
 
 /**
+ * exportAuditStream({auditFile, since, installId, orgId, chunk}, write) -> {records, sha256, fileSha256, fileBytes}
+ * fileSha256 and fileBytes describe the raw log bytes read for the output (not the output).
+ * Same output as exportAuditFile, but the log is read in chunks and the output
+ * is handed to write(text) piece by piece (one OTLP line at a time), so a log
+ * of any size is never held in one string. A log that is already in seq order
+ * (the daemon's own is) is streamed as it is read; an out-of-order one is read
+ * into memory and sorted first, as before. A read error other than a missing
+ * file is thrown to the caller; it says nothing about the log being changed.
+ */
+function exportAuditStream(opts, write) {
+  const o = opts || {};
+  const file = o.auditFile || require('../vault/store').paths(o).auditFile;
+  const from = parseSince(o.since);
+  const seqOf = (r) => (Number.isSafeInteger(r.seq) ? r.seq : 0);
+  const fileHash = crypto.createHash('sha256');
+  let fileBytes = 0;
+  const each = (fn, hashing) => forEachLine(file, (line) => {
+    if (line === null || !line.trim()) return false;
+    let rec;
+    try { rec = JSON.parse(line); } catch (err) { return false; }
+    if (!rec || typeof rec !== 'object') return false;
+    const t = Date.parse(rec.ts);
+    if (!Number.isFinite(t)) return false;
+    if (from !== null && t < from) return false;
+    fn(rec);
+    return false;
+  }, Object.assign({}, o.chunk, hashing ? { onChunk: (b, n) => { fileHash.update(b.subarray(0, n)); fileBytes += n; } } : {}));
+
+  let sorted = true;
+  let prev = -Infinity;
+  each((rec) => { const s = seqOf(rec); if (s < prev) sorted = false; prev = s; });
+
+  const resource = gateResource({ installId: o.installId, orgId: o.orgId });
+  const hash = crypto.createHash('sha256');
+  let batch = [];
+  let records = 0;
+  let any = false;
+  const flush = () => {
+    if (!batch.length) return;
+    const req = { resourceLogs: [{ resource, scopeLogs: [{ scope: { name: SCOPE_NAME, version: SCOPE_VERSION }, logRecords: batch }] }] };
+    const text = JSON.stringify(req) + '\n';
+    hash.update(text, 'utf8');
+    write(text);
+    batch = [];
+    any = true;
+  };
+  const add = (rec) => { batch.push(gateRecordToLog(rec)); records += 1; if (batch.length === RECORDS_PER_LINE) flush(); };
+  if (sorted) {
+    each(add, true);
+  } else {
+    const all = [];
+    each((rec) => all.push(rec), true);
+    all.sort((a, b) => seqOf(a) - seqOf(b));
+    for (const rec of all) add(rec);
+  }
+  flush();
+  return { records, sha256: any ? hash.digest('hex') : crypto.createHash('sha256').update('', 'utf8').digest('hex'), fileSha256: fileHash.digest('hex'), fileBytes };
+}
+
+/**
  * exportAuditFile({auditFile, since, installId, orgId}) -> {content, records, sha256}
  * Reads the local log (missing file = no records). Lines that do not parse, or
  * have no valid timestamp, are skipped. `records` is the number of records
  * exported. `since` is an ISO date or a duration such as '7d' or '12h'.
+ * Builds the whole output as one string: for a large log use exportAuditStream.
  */
 function exportAuditFile(opts) {
-  const o = opts || {};
-  const file = o.auditFile || require('../vault/store').paths(o).auditFile;
-  let text;
-  try { text = fs.readFileSync(file, 'utf8'); } catch (err) {
-    if (err.code === 'ENOENT') text = ''; else throw err;
-  }
-  const from = parseSince(o.since);
-  const records = [];
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    let rec;
-    try { rec = JSON.parse(line); } catch (err) { continue; }
-    if (!rec || typeof rec !== 'object') continue;
-    const t = Date.parse(rec.ts);
-    if (!Number.isFinite(t)) continue;
-    if (from !== null && t < from) continue;
-    records.push(rec);
-  }
-  const content = auditToOtlpJsonLines(records, { installId: o.installId, orgId: o.orgId });
-  const sha256 = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
-  return { content, records: records.length, sha256 };
+  const parts = [];
+  const r = exportAuditStream(opts, (s) => parts.push(s));
+  return { content: parts.join(''), records: r.records, sha256: r.sha256 };
 }
 
-module.exports = { auditToOtlpJsonLines, exportAuditFile };
+module.exports = { auditToOtlpJsonLines, exportAuditFile, exportAuditStream };

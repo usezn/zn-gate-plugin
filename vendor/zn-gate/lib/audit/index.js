@@ -272,6 +272,9 @@ class FileCtx {
       severity = LOWER[severity] || severity;
       detail = String(detail) + IGNORED_ENV_NOTE;
     }
+    // The URL path, query, userinfo and fragment never reach a report (detail or evidence), except the download URL of ZNA002.
+    const keepUrl = (extra && extra.keepUrl) || null;
+    const evidenceText = (extra && extra.evidence != null) ? redact(extra.evidence) : this.redactedLine(ln);
     this.out.push({
       id,
       severity,
@@ -279,8 +282,8 @@ class FileCtx {
       file: this.rec.display,
       line: ln,
       title: (extra && extra.title) || rule.title,
-      detail: clip(redact(redactSpan(detail)), 600),
-      evidence: clip((extra && extra.evidence != null) ? redact(extra.evidence) : this.redactedLine(ln), EVIDENCE_MAX),
+      detail: clip(redact(P.maskUrls(redactSpan(detail), keepUrl)), 600),
+      evidence: clip(P.maskUrls(evidenceText, keepUrl), EVIDENCE_MAX),
       fix: (extra && extra.fix) || rule.fix,
       references: (extra && extra.references) || rule.references.slice(),
       _readers: (extra && extra.readers) || this.rec.readers,
@@ -395,10 +398,66 @@ function hookCommands(tree) {
   return out;
 }
 
+/** Every hook that posts tool events to a URL under a hooks tree: [{url, type, event, envVars}]. */
+function hookUrls(tree) {
+  const out = [];
+  function walk(node, event, depth) {
+    if (depth > 8 || node == null) return;
+    if (Array.isArray(node)) { for (const n of node) walk(n, event, depth + 1); return; }
+    if (typeof node !== 'object') return;
+    const type = typeof node.type === 'string' ? node.type.toLowerCase() : '';
+    const url = typeof node.url === 'string' ? node.url.trim() : '';
+    if (url && (type === 'http' || type === 'agent' || type === 'webhook')) {
+      const names = new Set(Array.isArray(node.allowedEnvVars) ? node.allowedEnvVars.filter((x) => typeof x === 'string' && x) : []);
+      if (node.headers && typeof node.headers === 'object' && !Array.isArray(node.headers)) {
+        for (const v of Object.values(node.headers)) {
+          if (typeof v !== 'string') continue;
+          for (const m of v.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) names.add(m[1]);
+        }
+      }
+      out.push({ url, type, event, envVars: [...names] });
+    }
+    for (const [k, v] of Object.entries(node)) {
+      if (v && typeof v === 'object') walk(v, event || k, depth + 1);
+    }
+  }
+  walk(tree, null, 0);
+  return out;
+}
+
+function checkHookUrls(ctx, tree, keyPath) {
+  for (const h of hookUrls(tree)) {
+    if (P.isPlaceholder(h.url)) continue;
+    const host = P.hostOf(h.url);
+    const loop = Boolean(host) && P.isLoopback(host);
+    const line = ctx.locate(keyPath.concat(h.event ? [h.event] : []), h.url);
+    const what = (h.event ? '"' + h.event + '" ' : '') + h.type + ' hook';
+    const where = host ? P.safeUrl(h.url) : 'a URL that could not be read';
+    const env = h.envVars.length ? ' It forwards ' + (h.envVars.length === 1 ? 'the environment variable ' : 'the environment variables ') + h.envVars.slice(0, 5).join(', ') + (h.envVars.length > 5 ? ' and ' + (h.envVars.length - 5) + ' more' : '') + ' in its headers.' : '';
+    // Your own user file is low whatever the address; a project file is medium for a local address, high otherwise.
+    const sev = ctx.home ? 'low' : (loop ? 'medium' : 'high');
+    ctx.add('ZNA022', sev, line, what + ' sends every matching tool event to ' + where + (loop ? ' (a local address).' : '.') + env, { evidence: urlEvidence(ctx, line, String(h.url)) });
+  }
+}
+
+/**
+ * Evidence for a URL value: its line with the value replaced by scheme and host (never the path or query).
+ * When the line does not hold the value as written, a fixed `"key": "scheme://host"` pair is shown instead.
+ */
+function urlEvidence(ctx, ln, url, key, proxy) {
+  // A proxy may be written without a scheme (user:pass@host:port): read it as classifyEnv does.
+  const shown = P.safeUrl(proxy && !/^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? 'http://' + url : url);
+  const raw = ctx.redactedLine(ln);
+  // The line may hold other URLs: every one of them is reduced too (Ctx.add does it for each finding).
+  return url && raw.includes(url) ? P.maskUrls(raw.split(url).join(shown)) : JSON.stringify(key || 'url') + ': ' + JSON.stringify(shown);
+}
+
 function checkDownloadRun(ctx, command, line, what) {
   const hit = P.downloadAndRun(command);
   if (!hit) return false;
-  ctx.add('ZNA002', 'critical', line, what + ' downloads code and runs it: ' + short(command, 200));
+  // The download URL is what the finding is about and is shown without user and password; any other URL on the line is reduced.
+  const dl = /[a-z][a-z0-9+.-]{1,15}:\/\/[^\s"'<>`|;&)]*/i.exec(hit.match);
+  ctx.add('ZNA002', 'critical', line, what + ' downloads code and runs it: ' + short(command, 200), { keepUrl: dl ? dl[0] : null });
   return true;
 }
 
@@ -412,6 +471,7 @@ function checkAutoRun(ctx, command, line, what) {
 }
 
 function checkHooks(ctx, tree, keyPath) {
+  checkHookUrls(ctx, tree, keyPath);
   for (const h of hookCommands(tree)) {
     const line = ctx.locate(keyPath.concat(h.event ? [h.event] : []), h.command);
     if (isOurHook(h.command, ctx)) {
@@ -434,19 +494,22 @@ function checkEnv(ctx, env, keyPath, opts) {
       // Environment of one MCP server: code loading is as bad as anywhere;
       // an endpoint or proxy redirects that server's own credentials.
       const who = 'MCP server "' + opts.server + '": ';
-      if (c.kind === 'endpoint') ctx.add('ZNA007', capHome(ctx, c.loopback ? 'low' : 'medium'), line, who + k + ' points to ' + P.safeUrl(v) + '; the server sends its requests and credentials there.', { title: 'MCP server endpoint overridden by the project' });
-      else if (c.kind === 'proxy') ctx.add('ZNA007', capHome(ctx, c.loopback ? 'low' : 'medium'), line, who + k + ' routes the server\'s traffic through ' + (c.host || 'a proxy') + '.', { title: 'MCP server traffic routed through a proxy set by the project' });
+      if (c.kind === 'endpoint') ctx.add('ZNA007', capHome(ctx, c.loopback ? 'low' : 'medium'), line, who + k + ' points to ' + P.safeUrl(v) + '; the server sends its requests and credentials there.', { title: 'MCP server endpoint overridden by the project', evidence: urlEvidence(ctx, line, String(v), k) });
+      else if (c.kind === 'proxy') ctx.add('ZNA007', capHome(ctx, c.loopback ? 'low' : 'medium'), line, who + k + ' routes the server\'s traffic through ' + (c.host || 'a proxy') + '.', { title: 'MCP server traffic routed through a proxy set by the project', evidence: urlEvidence(ctx, line, String(v), k, true) });
+      else if (c.kind === 'hookstop') ctx.add('ZNA008', capHome(ctx, 'medium'), line, who + k + ' is set for the server process: on Linux the dynamic loader then stops the server before it runs, so it fails to start. Only this server is affected; the agent and its hooks are not.', { title: 'MCP server environment stops the server from starting' });
       else ctx.add('ZNA008', capHome(ctx, 'high'), line, who + k + ' is set for the server process' + (c.kind === 'confdir' ? ' and moves where it reads its configuration.' : ' and loads code or certificates into it.'));
       continue;
     }
     if (c.kind === 'endpoint') {
       const sev = capHome(ctx, c.loopback ? 'medium' : 'critical');
-      ctx.add('ZNA007', sev, line, k + ' points to ' + P.safeUrl(v) + (c.loopback ? ' (a local address)' : '') + '; the agent sends its API key and prompts there.');
+      ctx.add('ZNA007', sev, line, k + ' points to ' + P.safeUrl(v) + (c.loopback ? ' (a local address)' : '') + '; the agent sends its API key and prompts there.', { evidence: urlEvidence(ctx, line, String(v), k) });
     } else if (c.kind === 'proxy') {
       const sev = capHome(ctx, c.loopback ? 'medium' : 'high');
-      ctx.add('ZNA007', sev, line, k + ' routes the agent\'s traffic through ' + (c.host || 'a proxy') + '.', { title: 'Agent traffic routed through a proxy set by the project' });
+      ctx.add('ZNA007', sev, line, k + ' routes the agent\'s traffic through ' + (c.host || 'a proxy') + '.', { title: 'Agent traffic routed through a proxy set by the project', evidence: urlEvidence(ctx, line, String(v), k, true) });
     } else if (c.kind === 'confdir') {
       ctx.add('ZNA008', capHome(ctx, 'high'), line, k + ' moves where the agent reads its own configuration (to ' + v + '), so a config shipped in the repository is loaded instead of yours.', { title: 'Environment variable redirects the agent configuration' });
+    } else if (c.kind === 'hookstop') {
+      ctx.add('ZNA008', capHome(ctx, 'critical'), line, k + ' is set for every process the agent starts: on Linux the dynamic loader then stops each program before it runs, the shell of every hook included, so the hooks check nothing and tool calls go ahead.', { title: 'Environment variable that stops the agent\'s hooks before they run' });
     } else {
       ctx.add('ZNA008', capHome(ctx, 'high'), line, k + ' is set for every process the agent starts.');
     }
@@ -458,7 +521,7 @@ function endpointValue(ctx, key, value, line) {
   const host = P.hostOf(value);
   if (!host) return;
   const loop = P.isLoopback(host);
-  ctx.add('ZNA007', capHome(ctx, loop ? 'medium' : 'critical'), line, key + ' points to ' + P.safeUrl(value) + (loop ? ' (a local address)' : '') + '; the agent sends its API key and prompts there.');
+  ctx.add('ZNA007', capHome(ctx, loop ? 'medium' : 'critical'), line, key + ' points to ' + P.safeUrl(value) + (loop ? ' (a local address)' : '') + '; the agent sends its API key and prompts there.', { evidence: urlEvidence(ctx, line, value, key) });
 }
 
 // The exact "secrets" MCP server `zn hooks install` writes: `zn secrets-mcp`
@@ -522,8 +585,8 @@ function checkMcpServers(ctx, servers, keyPath, opts) {
       const host = P.hostOf(url);
       if (host && !P.isLoopback(host)) {
         const plain = /^http:/i.test(url) || /^ws:/i.test(url);
-        if (plain) ctx.add('ZNA006', 'medium', line, 'MCP server "' + name + '" uses unencrypted ' + P.safeUrl(url) + '.');
-        else if (!ctx.home) ctx.add('ZNA006', 'low', line, 'MCP server "' + name + '" is remote: ' + P.safeUrl(url) + '.');
+        if (plain) ctx.add('ZNA006', 'medium', line, 'MCP server "' + name + '" uses unencrypted ' + P.safeUrl(url) + '.', { evidence: urlEvidence(ctx, line, url, 'url') });
+        else if (!ctx.home) ctx.add('ZNA006', 'low', line, 'MCP server "' + name + '" is remote: ' + P.safeUrl(url) + '.', { evidence: urlEvidence(ctx, line, url, 'url') });
       }
     }
   }
@@ -707,7 +770,10 @@ function checkOpencodeJson(ctx, data) {
     for (const ins of data.instructions) {
       if (typeof ins !== 'string' || !/^https?:\/\//i.test(ins)) continue;
       const plain = /^http:/i.test(ins);
-      if (plain || !ctx.home) ctx.add('ZNA006', plain ? 'medium' : 'low', ctx.locate(['instructions'], ins), 'Instructions are loaded from ' + P.safeUrl(ins) + ' and can change after review.', { title: 'Agent instructions loaded from a URL' });
+      if (plain || !ctx.home) {
+        const insLine = ctx.locate(['instructions'], ins);
+        ctx.add('ZNA006', plain ? 'medium' : 'low', insLine, 'Instructions are loaded from ' + P.safeUrl(ins) + ' and can change after review.', { title: 'Agent instructions loaded from a URL', evidence: urlEvidence(ctx, insLine, ins, 'instructions') });
+      }
     }
   }
   if (data.provider && typeof data.provider === 'object') {
@@ -1089,6 +1155,19 @@ const CI_AGENT_RUN = [
 ];
 const UNTRUSTED_TRIGGERS = ['issue_comment', 'issues', 'pull_request_target', 'pull_request_review_comment', 'pull_request_review', 'discussion', 'discussion_comment'];
 
+/** The `on:` block of a workflow (the key and everything indented under it, or a one-line `on: [a, b]`), or all of `head` when there is none. */
+function onBlock(head) {
+  const lines = head.split('\n');
+  const at = lines.findIndex((l) => /^(?:on|"on"|'on'|true)\s*:/.test(l));
+  if (at < 0) return head;
+  const out = [lines[at]];
+  for (let i = at + 1; i < lines.length; i++) {
+    if (/^\S/.test(lines[i]) && !/^-/.test(lines[i])) break;
+    out.push(lines[i]);
+  }
+  return out.join('\n');
+}
+
 function checkWorkflow(ctx) {
   let agentLine = 0;
   let agent = null;
@@ -1102,7 +1181,8 @@ function checkWorkflow(ctx) {
   if (!agent) return;
   const jobsAt = ctx.lines.findIndex((l) => /^jobs\s*:/.test(l));
   const head = (jobsAt < 0 ? ctx.lines : ctx.lines.slice(0, jobsAt)).filter((l) => !/^\s*#/.test(l)).join('\n');
-  const triggers = UNTRUSTED_TRIGGERS.filter((t) => new RegExp('(?:^|[\\s\\[,])' + t + '(?:\\s*:|\\s*[,\\]]|\\s*$)', 'm').test(head));
+  // The triggers are read from the `on:` block alone: `issues: write` under `permissions:` is not the `issues` trigger.
+  const triggers = UNTRUSTED_TRIGGERS.filter((t) => new RegExp('(?:^|[\\s\\[,])' + t + '(?:\\s*:|\\s*[,\\]]|\\s*$)', 'm').test(onBlock(head)));
   if (!triggers.length) return;
   const text = ctx.lines.filter((l) => !/^\s*#/.test(l)).join('\n');
   const prt = triggers.includes('pull_request_target');
@@ -1200,6 +1280,15 @@ const EXTENSION_DIRS = [
   [/(^|\/)\.amazonq\/(?:cli-)?agents$/, 'amazonq', 'agents'],
 ];
 
+// Directories an agent reads files from, so a symbolic link at one of these
+// paths is followed (inside the repository) or reported (outside it).
+const SYMLINK_DIRS = EXTENSION_DIRS.map(([re]) => re).concat([
+  /(^|\/)\.cursor\/(?:rules|agents)$/,
+  /(^|\/)\.github\/instructions$/,
+  /(^|\/)\.amazonq\/rules$/,
+  /(^|\/)\.claude\/output-styles$/,
+]);
+
 // Directories agents read from. They are visited first, and inside them the
 // SKIP_DIRS list does not apply (a skill may be called "build" or "dist").
 const AGENT_DIRS = new Set(['.claude', '.codex', '.cursor', '.amazonq', '.vscode', '.opencode', '.gemini', '.github', '.claude-plugin', '.clinerules', 'skills']);
@@ -1250,7 +1339,7 @@ function readBounded(abs, max, follow) {
 
 /* ------------------------------ walk -------------------------------- */
 
-function walk(root, deadline, maxEntries) {
+function walk(root, deadline, maxEntries, noPrune) {
   const files = [];
   const extDirs = [];
   const unchecked = [];
@@ -1282,17 +1371,22 @@ function walk(root, deadline, maxEntries) {
       const agentHere = inAgent || isAgentDirName(d.name);
       if (d.isSymbolicLink()) {
         const asFile = classify(r, !rel);
-        if (!asFile && !isAgentDirName(d.name)) continue;
+        const dirLike = isAgentDirName(d.name) || SYMLINK_DIRS.some((re) => re.test(r.toLowerCase()));
+        if (!asFile && !dirLike && !inAgent) continue;
         let real = null;
         try { real = fs.realpathSync(abs); } catch (_) { real = null; }
         let st = null;
         try { st = real && fs.statSync(real); } catch (_) { st = null; }
+        // Inside an agent directory, only a linked directory is of interest.
+        if (!asFile && !dirLike && !(st && st.isDirectory())) continue;
         if (!real || !st) {
           unchecked.push({ file: r, agent: asFile ? asFile.agent : 'any', readers: asFile ? asFile.readers : AGENTS, severity: 'medium', detail: r + ' is a broken symbolic link.' });
         } else if (!insideRoot(real)) {
           unchecked.push({ file: r, agent: asFile ? asFile.agent : 'any', readers: asFile ? asFile.readers : AGENTS, severity: 'high', detail: r + ' is a symbolic link to a location outside the audited directory. Agents follow it; zn audit does not read it.' });
-        } else if (st.isDirectory() && isAgentDirName(d.name)) {
-          if (!visitedReal.has(real)) { visitedReal.add(real); visit(real, r, depth + 1, true); }
+        } else if (st.isDirectory()) {
+          const ext = EXTENSION_DIRS.find(([re]) => re.test(r.toLowerCase()));
+          if (ext) extDirs.push({ rel: r, abs, agent: ext[1], what: ext[2] });
+          if (depth < MAX_DEPTH && !visitedReal.has(real)) { visitedReal.add(real); visit(real, r, depth + 1, true); }
         } else if (st.isFile() && asFile) {
           files.push(Object.assign({ abs: real, rel: r, display: r, scope: 'project' }, asFile));
         }
@@ -1300,7 +1394,7 @@ function walk(root, deadline, maxEntries) {
       }
       if (d.isDirectory()) {
         if (d.name === '.git') continue;
-        if (!agentHere && SKIP_DIRS.has(d.name)) {
+        if (!noPrune && !agentHere && SKIP_DIRS.has(d.name)) {
           const pruned = pruneInfo(d.name, dir);
           if (pruned) {
             if (!pruned.silent) skippedDirs.push({ dir: r, reason: pruned.reason });
@@ -1891,6 +1985,25 @@ function inventory(extDirs, out) {
   }
 }
 
+function baselineFindings(root, home, out) {
+  const bl = require('./baseline');
+  const base = bl.loadBaseline(home, root);
+  if (!base) return;
+  const d = bl.diffSurface(base, bl.extractSurface(root));
+  const add = (key, severity, verb) => {
+    const file = key.slice(0, key.indexOf('#'));
+    out.push({
+      id: 'ZNA023', severity, agent: 'any', file, line: 1, title: BY_ID.ZNA023.title,
+      detail: redact('The entry ' + key.slice(key.indexOf('#') + 1) + ' in ' + file + ' was ' + verb + ' since you approved this project.'),
+      evidence: redact(key), fix: BY_ID.ZNA023.fix, references: [], _readers: AGENTS,
+    });
+  };
+  for (const k of d.changed) add(k, 'high', 'changed');
+  for (const k of d.added) add(k, 'high', 'added');
+  // A removed hook, permission or setting weakens the project; a removed server, script or task only takes something away.
+  for (const k of d.removed) add(k, /#(?:hook:|permissions|setting:)/.test(k) ? 'medium' : 'low', 'removed');
+}
+
 function normalizeAgents(list) {
   if (!list || list.length === 0 || list.includes('all')) return new Set(AGENTS);
   return new Set(list);
@@ -1904,7 +2017,7 @@ function audit(opts) {
   const deadline = Date.now() + (o.timeBudgetMs || TIME_BUDGET_MS);
   const out = [];
   const maxEntries = o.maxEntries || MAX_ENTRIES;
-  const { files, extDirs, unchecked, truncated, entries, skippedDirs } = walk(root, deadline, maxEntries);
+  const { files, extDirs, unchecked, truncated, entries, skippedDirs } = walk(root, deadline, maxEntries, o.noPrune);
   const known = new Set(files.map((f) => f.rel));
   for (const rec of redirectedConfigs(root, unchecked)) if (!known.has(rec.rel)) files.push(rec);
   for (const rec of importedInstructions(root, files, deadline, unchecked)) files.push(rec);
@@ -1935,6 +2048,7 @@ function audit(opts) {
   }
   checkShadowing(root, out);
   inventory(extDirs, out);
+  if (o.baselineHome) { try { baselineFindings(root, o.baselineHome, out); } catch (_) { /* a damaged baseline never stops the audit */ } }
   try {
     const cfg = rules().loadCustomConfig();
     if (cfg.errors.length > 0) {
@@ -1966,4 +2080,45 @@ function audit(opts) {
   return { root, files: scanned, findings, truncated: Boolean(truncated) || timedOut, entries, skippedDirs, agents: Array.from(selected), agentFiles, explicitAgents: !(!o.agents || o.agents.length === 0 || o.agents.includes('all')) };
 }
 
-module.exports = { audit, classify, redact, AGENTS, AGENT_PLACES, _internal: { globMatcher, hookCommands, isOurHook, isOurMcp, gitIgnored, readBounded, grantsWrite, withoutTrailingEquals, OUR_HOOKS, SAFE_ABS, znGateFile } };
+/**
+ * The audit of one project file, without walking the folder: the rules `audit` applies to that file and nothing else, so what a hook needs
+ * to know about `.claude/settings.json` does not depend on what else is in the project (a walk that stops after N entries can stop before
+ * the file). A file that is not there gives no findings; a link that leaves the project, a file that cannot be read or one that is too large
+ * gives the same "not checked" finding the whole audit gives.
+ */
+function auditFileAt(opts) {
+  const root = path.resolve(opts.root);
+  const rel = String(opts.rel);
+  const c = classify(rel, false);
+  const result = { root, findings: [] };
+  if (!c) return result;
+  const abs = path.join(root, ...rel.split('/'));
+  let st;
+  try { st = fs.lstatSync(abs); } catch (_) { return result; }
+  const out = [];
+  let target = abs;
+  if (st.isSymbolicLink()) {
+    let real = null;
+    try { real = fs.realpathSync(abs); } catch (_) { real = null; }
+    let realRoot = root;
+    try { realRoot = fs.realpathSync(root); } catch (_) { /* keep */ }
+    const inside = real && (path.relative(realRoot, real) === '' || (!path.relative(realRoot, real).startsWith('..') && !path.isAbsolute(path.relative(realRoot, real))));
+    if (!inside) {
+      out.push(uncheckedFinding({ file: rel, agent: c.agent, readers: c.readers, severity: 'high', detail: rel + (real ? ' is a symbolic link to a location outside the audited directory. Agents follow it; zn audit does not read it.' : ' is a broken symbolic link.') }));
+    } else {
+      target = real;
+    }
+  }
+  if (!out.length) auditFile(Object.assign({ abs: target, rel, display: rel, scope: 'project', root }, c), out);
+  const seen = new Set();
+  for (const f of out) {
+    const key = [f.id, f.file, f.line, f.severity, f.detail].join('\u0000');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    delete f._readers;
+    result.findings.push(f);
+  }
+  return result;
+}
+
+module.exports = { audit, auditFileAt, classify, redact, AGENTS, AGENT_PLACES, _internal: { globMatcher, hookCommands, isOurHook, isOurMcp, gitIgnored, readBounded, grantsWrite, withoutTrailingEquals, OUR_HOOKS, SAFE_ABS, znGateFile } };

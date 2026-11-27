@@ -4,13 +4,14 @@ const fs = require('fs');
 const linearRegex = require('./linear-regex');
 const { ZERO_WIDTH_RE, INVISIBLE_ASTRAL_RE, spaceInvisible, spaceInvisibleForMatch } = require('./invisible');
 const path = require('path');
+const { envFlag } = require('./env-flag');
 
 /**
  * zn deterministic rules engine - SINGLE SOURCE OF TRUTH.
- * RULES_VERSION: 2026-10-27.2
+ * RULES_VERSION: 2026-11-16.34
  */
 
-const RULES_VERSION = '2026-10-28.1';
+const RULES_VERSION = '2026-11-16.34';
 
 // Word boundaries are written as explicit ASCII lookarounds, not \b: JavaScript's
 // \b is ASCII-only without the u flag, while Python's is Unicode. A letter such
@@ -91,10 +92,26 @@ function testMultiZh(text) {
   return ZH_PHRASE_RE.test(text) || nearMatch(text, ZH_IGNORE_RE, ZH_IGNORE_OBJECT_RE) || nearMatch(text, ZH_FORGET_RE, ZH_FORGET_OBJECT_RE);
 }
 
+// Spanish, Portuguese, French and German override rules. Same design as the
+// English ones: an override verb (ignore, forget, disregard, discard) AND a
+// named target (instructions, rules, system prompt...) with a quantifier
+// (all, your...), a qualifier (previous, above, system...) or a plural noun
+// that can only mean the instructions. "ignora el error de compilación" and
+// "olvidé la contraseña" name no target and stay allowed. Whitespace runs
+// are bounded and every group is a fixed word list. The Python rules carry
+// the same sources (test_rules_parity.py compares them).
+// Every override match starts with an ASCII letter (or a Latin letter that case-folds to one).
+// This cheap lookahead lets the scan skip other scripts at once; it does not change any match.
+const OVERRIDE_PREFILTER = String.raw`(?=[A-Za-z\u00c0-\u024f\u212a])`;
+const OVERRIDE_ES_SOURCE = String.raw`(?<![A-Za-z0-9_])(?:ignor(?:a|e|ad)|olvid(?:a|e|ad)|descart(?:a|e|ad)|omit(?:e|a)|desestim(?:a|e|ad)|haz\s{1,32}caso\s{1,32}omiso\s{1,32}de|no\s{1,32}tengas\s{1,32}en\s{1,32}cuenta)\s{1,32}(?:todas|todos|toda|todo|cualquier|cualesquiera|tus|tu|mis|sus|estas|estos|esas|esos)\s{1,32}(?:(?:el|la|los|las|de|del)\s{1,32}){0,2}(?:instrucci[oó]n|instrucciones|reglas|normas|directrices|directivas|pautas|indicaciones|[oó]rdenes|restricciones|limitaciones|prompts?|mensajes?\s{1,32}del\s{1,32}sistema)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:ignor(?:a|e|ad)|olvid(?:a|e|ad)|descart(?:a|e|ad)|omit(?:e|a)|desestim(?:a|e|ad)|haz\s{1,32}caso\s{1,32}omiso\s{1,32}de|no\s{1,32}tengas\s{1,32}en\s{1,32}cuenta)\s{1,32}(?:(?:el|la|los|las|de|del)\s{1,32}){0,2}(?:instrucci[oó]n|instrucciones|reglas|normas|directrices|directivas|pautas|indicaciones|[oó]rdenes|restricciones|limitaciones|prompts?|mensajes?\s{1,32}del\s{1,32}sistema)\s{1,32}(?:anteriores|previas|previos|anterior|previa|previo|originales|iniciales|de\s{1,32}arriba|de\s{1,32}antes|del\s{1,32}sistema|de\s{1,32}sistema|de\s{1,32}seguridad|de\s{1,32}desarrolladores?)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:ignor(?:a|e|ad)|olvid(?:a|e|ad)|descart(?:a|e|ad)|omit(?:e|a)|desestim(?:a|e|ad)|haz\s{1,32}caso\s{1,32}omiso\s{1,32}de|no\s{1,32}tengas\s{1,32}en\s{1,32}cuenta)\s{1,32}(?:(?:el|la|los|las|de|del)\s{1,32}){0,2}(?:instrucciones|directrices|directivas|prompts?\s{1,32}del\s{1,32}sistema)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:ignor(?:a|e|ad)|olvid(?:a|e|ad)|descart(?:a|e|ad)|omit(?:e|a)|desestim(?:a|e|ad)|haz\s{1,32}caso\s{1,32}omiso\s{1,32}de|no\s{1,32}tengas\s{1,32}en\s{1,32}cuenta)\s{1,32}(?:todo|todas)\s{1,32}(?:lo\s{1,32}(?:anterior|de\s{1,32}arriba|dicho\s{1,32}antes)|las\s{1,32}(?:anteriores|previas))(?![A-Za-z0-9_])`;
+const OVERRIDE_PT_SOURCE = String.raw`(?<![A-Za-z0-9_])(?:esque[cç](?:a|e|am|er)|desconsider(?:e|a|em|ar)|descart(?:e|a|em|ar))\s{1,32}(?:todas|todos|toda|todo|qualquer|quaisquer|suas|seus|sua|seu|minhas|meus|estas|estes|essas|esses|tuas|teus)\s{1,32}(?:(?:as|os|a|o|de|das|dos)\s{1,32}){0,2}(?:instru[cç][aã]o|instru[cç][oõ]es|regras|normas|diretrizes|diretivas|orienta[cç][oõ]es|ordens|restri[cç][oõ]es|limita[cç][oõ]es|prompts?|mensagens?\s{1,32}do\s{1,32}sistema)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:esque[cç](?:a|e|am|er)|desconsider(?:e|a|em|ar)|descart(?:e|a|em|ar))\s{1,32}(?:(?:as|os|a|o|de|das|dos)\s{1,32}){0,2}(?:instru[cç][aã]o|instru[cç][oõ]es|regras|normas|diretrizes|diretivas|orienta[cç][oõ]es|ordens|restri[cç][oõ]es|limita[cç][oõ]es|prompts?|mensagens?\s{1,32}do\s{1,32}sistema)\s{1,32}(?:anteriores|pr[eé]vias|anterior|pr[eé]via|acima|originais|iniciais|do\s{1,32}sistema|de\s{1,32}sistema|de\s{1,32}seguran[cç]a|j[aá]\s{1,32}dadas)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:esque[cç](?:a|e|am|er)|desconsider(?:e|a|em|ar)|descart(?:e|a|em|ar))\s{1,32}(?:(?:as|os|a|o|de|das|dos)\s{1,32}){0,2}(?:instru[cç][oõ]es|diretrizes|diretivas|prompts?\s{1,32}do\s{1,32}sistema)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:esque[cç](?:a|e|am|er)|desconsider(?:e|a|em|ar)|descart(?:e|a|em|ar))\s{1,32}tudo\s{1,32}(?:o\s{1,32})?(?:acima|anterior|que\s{1,32}(?:foi\s{1,32}dito|te\s{1,32}disseram|eu\s{1,32}disse)\s{1,32}(?:antes|acima))(?![A-Za-z0-9_])`;
+const OVERRIDE_FR_SOURCE = String.raw`(?<![A-Za-z0-9_])(?:ignore[rsz]?|oublie[rsz]?|n[ée]glige[rsz]?|(?:fais|faites)\s{1,32}abstraction\s{1,32}(?:de|des|du)|ne\s{1,32}(?:tiens|tenez)\s{1,32}pas\s{1,32}compte\s{1,32}(?:de|des|du)|(?:passe|passez)\s{1,32}outre)\s{1,32}(?:toutes|tous|toute|tout|tes|vos|ses|mes|ces|aucune)\s{1,32}(?:(?:les|des|de|du|la|le|aux)\s{1,32}|[ld]['’]){0,2}(?:instructions?|consignes?|r[èe]gles|directives?|restrictions?|ordres|commandes|limitations|prompts?|garde-fous|invites?\s{1,32}syst[èe]me|messages?\s{1,32}syst[èe]me)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:ignore[rsz]?|oublie[rsz]?|n[ée]glige[rsz]?|(?:fais|faites)\s{1,32}abstraction\s{1,32}(?:de|des|du)|ne\s{1,32}(?:tiens|tenez)\s{1,32}pas\s{1,32}compte\s{1,32}(?:de|des|du)|(?:passe|passez)\s{1,32}outre)\s{1,32}(?:(?:les|des|de|du|la|le|aux)\s{1,32}|[ld]['’]){0,2}(?:instructions?|consignes?|r[èe]gles|directives?|restrictions?|ordres|commandes|limitations|prompts?|garde-fous|invites?\s{1,32}syst[èe]me|messages?\s{1,32}syst[èe]me)\s{1,32}(?:pr[ée]c[ée]dentes?|ant[ée]rieures?|initiales?|originales?|ci-dessus|du\s{1,32}syst[èe]me|syst[èe]me|de\s{1,32}s[ée]curit[ée]|d[ée]j[àa]\s{1,32}donn[ée]es?)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:ignore[rsz]?|oublie[rsz]?|n[ée]glige[rsz]?|(?:fais|faites)\s{1,32}abstraction\s{1,32}(?:de|des|du)|ne\s{1,32}(?:tiens|tenez)\s{1,32}pas\s{1,32}compte\s{1,32}(?:de|des|du)|(?:passe|passez)\s{1,32}outre)\s{1,32}(?:(?:les|des|de|du|la|le|aux)\s{1,32}|[ld]['’]){0,2}(?:instructions|consignes|directives|prompts?\s{1,32}syst[èe]me)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:ignore[rsz]?|oublie[rsz]?|n[ée]glige[rsz]?|(?:fais|faites)\s{1,32}abstraction\s{1,32}(?:de|des|du)|ne\s{1,32}(?:tiens|tenez)\s{1,32}pas\s{1,32}compte\s{1,32}(?:de|des|du)|(?:passe|passez)\s{1,32}outre)\s{1,32}(?:tout|toutes)\s{1,32}(?:ce\s{1,32}qui\s{1,32}pr[ée]c[èe]de|ce\s{1,32}qui\s{1,32}est\s{1,32}ci-dessus|ce\s{1,32}qui\s{1,32}a\s{1,32}[ée]t[ée]\s{1,32}dit\s{1,32}avant)(?![A-Za-z0-9_])`;
+const OVERRIDE_DE_SOURCE = String.raw`(?<![A-Za-z0-9_])(?:ignorier(?:e)|ignorieren\s{1,8}sie|vergiss|vergesst|vergessen\s{1,8}sie|missachte|missachten\s{1,8}sie|verwirf|verwerft|verwerfen\s{1,8}sie|[uü]bergehe|[uü]bergehen\s{1,8}sie)\s{1,32}(?:alle|alles|jegliche|jegliches|s[aä]mtliche|deine|eure|ihre|meine|diese|jede|jeden)\s{1,32}(?:(?:die|der|den|das|diese|deine)\s{1,32})?(?:(?:vorherig|vorhergehend|vorig|fr[uü]her|bisherig|obig|urspr[uü]nglich|anf[aä]nglich|oben\s{1,32}(?:genannt|stehend))(?:e|en|er|es|em)?\s{1,32}){0,2}(?:(?:system-?)?(?:anweisungen|instruktionen|regeln|richtlinien|vorgaben|befehle|anordnungen|einschr[aä]nkungen|beschr[aä]nkungen)|(?:system-?)?prompts?|system-?nachrichten?)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:ignorier(?:e)|ignorieren\s{1,8}sie|vergiss|vergesst|vergessen\s{1,8}sie|missachte|missachten\s{1,8}sie|verwirf|verwerft|verwerfen\s{1,8}sie|[uü]bergehe|[uü]bergehen\s{1,8}sie)\s{1,32}(?:(?:die|der|den|das|diese|deine)\s{1,32})?(?:(?:vorherig|vorhergehend|vorig|fr[uü]her|bisherig|obig|urspr[uü]nglich|anf[aä]nglich|oben\s{1,32}(?:genannt|stehend))(?:e|en|er|es|em)?\s{1,32}){1,2}(?:(?:system-?)?(?:anweisungen|instruktionen|regeln|richtlinien|vorgaben|befehle|anordnungen|einschr[aä]nkungen|beschr[aä]nkungen)|(?:system-?)?prompts?|system-?nachrichten?)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:ignorier(?:e)|ignorieren\s{1,8}sie|vergiss|vergesst|vergessen\s{1,8}sie|missachte|missachten\s{1,8}sie|verwirf|verwerft|verwerfen\s{1,8}sie|[uü]bergehe|[uü]bergehen\s{1,8}sie)\s{1,32}(?:(?:die|der|den|das|diese|deine)\s{1,32})?(?:(?:system-?)?(?:anweisungen|instruktionen)|system-?prompts?)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])(?:ignorier(?:e)|ignorieren\s{1,8}sie|vergiss|vergesst|vergessen\s{1,8}sie|missachte|missachten\s{1,8}sie|verwirf|verwerft|verwerfen\s{1,8}sie|[uü]bergehe|[uü]bergehen\s{1,8}sie)\s{1,32}alles\s{1,32}(?:davor|zuvor|obige|oben(?:\s{1,32}(?:gesagte|genannte|stehende))?)(?![A-Za-z0-9_])`;
+
 const INJECTION_RULES = [
   { id: 'pi:ignore_previous', pattern: new RegExp(overrideRuleSource('ignore'), 'i'), description: 'Override prior instructions' },
   { id: 'pi:disregard', pattern: new RegExp(overrideRuleSource('disregard'), 'i'), description: 'Disregard instructions' },
-  { id: 'pi:forget', pattern: /(?<![A-Za-z0-9_])forget\s+(?:about\s+)?(?:everything|all|your)(?![A-Za-z0-9_])(?!\s+(?:of\s+)?(?:the\s+)?(?:cached?|caches|entries|changes|data|files?|records|sessions?|cookies|state|tabs|devices?|passwords?|history|items|keys|tokens|credentials|settings|preferences|accounts?|connections?|logins?|networks?)(?![A-Za-z0-9_]))/i, description: 'Forget-context attack' },
+  { id: 'pi:forget', pattern: /(?<![A-Za-z0-9_])forget\s+(?:about\s+)?(?:everything|all|your)(?![A-Za-z0-9_])(?!\s+(?:of\s+)?(?:the\s+)?(?:cached?|caches|entries|changes|data|files?|records|sessions?|cookies|state|tabs|devices?|passwords?|history|items|keys|tokens|credentials|settings|preferences|accounts?|connections?|logins?|networks?)(?![A-Za-z0-9_]))|(?<![A-Za-z0-9_])(?<!n't )(?<!n’t )(?<!n't ever )(?<!n’t ever )(?<!(?<![A-Za-z0-9_])do not )(?<!(?<![A-Za-z0-9_])does not )(?<!(?<![A-Za-z0-9_])did not )(?<!(?<![A-Za-z0-9_])will not )(?<!(?<![A-Za-z0-9_])must not )(?<!(?<![A-Za-z0-9_])should not )(?<!(?<![A-Za-z0-9_])never )(?<!(?<![A-Za-z0-9_])dont )forget\s+(?:(?:(?:the|my|these|those|our|its|their)\s+)?(?:(?:previous|prior|above|earlier|preceding|foregoing|original|initial|existing|system|safety|security|former|developer)\s+){1,2}(?:instructions?|guidelines?|directives?|guardrails?|directions)|(?:the\s+)?(?:instructions|guardrails|directives))(?![A-Za-z0-9_])/i,description: 'Forget-context attack' },
   { id: 'pi:identity_override', pattern: /you\s+are\s+now/i, description: 'Identity override' },
   { id: 'pi:new_instructions', pattern: /new\s+instructions?:/i, description: 'Instruction replacement' },
   { id: 'pi:system_tag', pattern: /(?:^|[\r\n"'`\[<])[ \t]*system\s*:|<[\s/]*system(?![A-Za-z0-9_])[^<>]*>/i, description: 'Fake system tag' },
@@ -106,13 +123,13 @@ const INJECTION_RULES = [
   { id: 'pi:bypass', pattern: /bypass\s+(your|the|all)/i, description: 'Guardrail bypass attempt' },
   { id: 'pi:override', pattern: /(?<![A-Za-z0-9_])override\s+(?:all\s+|your\s+|the\s+)?(?:system|policy|safety|rules|instructions|guidelines|restrictions)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])system\s+override\s*:/i, description: 'Policy override attempt' },
   { id: 'pi:template_boundary', pattern: /\[INST\]|\[\/INST\]|<<<SYS>>>|<\/<<SYS>>>|<\|im_start\|>|<\|im_end\|>/i, description: 'Chat template boundary injection' },
-  { id: 'pi:multi_es', pattern: /ignora\s+(todas\s+las\s+)?(instrucciones|anteriores|previas)|olvida\s+(todo|las\s+instrucciones)|act[uú]a\s+como|ahora\s+eres/iu, description: 'Multilingual prompt injection (Spanish)' },
-  { id: 'pi:multi_pt', pattern: /ignor(?:e|a|em|ar)\s+(?:(?:todas|todos|qualquer|quaisquer|cualquier)\s+)?(?:(?:as|os|las|los|suas|seus|sus|tus|estas|estes|essas|esses)\s+)?(?:instru[cç][oõ]es|instrucciones|regras|reglas|diretrizes|directrices|orienta[cç][oõ]es|ordens|[oó]rdenes|comandos|restri[cç][oõ]es|restricciones|mensagens|anteriores|pr[eé]vias)|ignore\s+(?:tudo|qualquer|quaisquer)(?![A-Za-z0-9_])|ignora\s+(?:todo|tudo|cualquier)(?![A-Za-z0-9_])/i, description: 'Multilingual prompt injection (Portuguese)' },
-  { id: 'pi:multi_fr', pattern: /ignore[rz]?\s+(toutes\s+les\s+)?instructions|oublie[rz]?\s+tout|agis\s+comme|tu\s+es\s+maintenant/iu, description: 'Multilingual prompt injection (French)' },
-  { id: 'pi:multi_de', pattern: /ignoriere\s+(alle\s+)?(anweisungen|instruktionen)|vergiss\s+(alles|jede)|du\s+bist\s+jetzt|handle\s+als/iu, description: 'Multilingual prompt injection (German)' },
+  { id: 'pi:multi_es', pattern: new RegExp(String.raw`ignora\s+(todas\s+las\s+)?(instrucciones|anteriores|previas)|olvida\s+(todo|las\s+instrucciones)|act[uú]a\s+como|ahora\s+eres|${OVERRIDE_PREFILTER}(?:${OVERRIDE_ES_SOURCE})`, 'iu'), description: 'Multilingual prompt injection (Spanish)' },
+  { id: 'pi:multi_pt', pattern: new RegExp(String.raw`ignor(?:e|a|em|ar)\s+(?:(?:todas|todos|qualquer|quaisquer|cualquier)\s+)?(?:(?:as|os|las|los|suas|seus|sus|tus|estas|estes|essas|esses)\s+)?(?:instru[cç][oõ]es|instrucciones|regras|reglas|diretrizes|directrices|orienta[cç][oõ]es|ordens|[oó]rdenes|comandos|restri[cç][oõ]es|restricciones|mensagens|anteriores|pr[eé]vias)|ignore\s+(?:tudo|qualquer|quaisquer)(?![A-Za-z0-9_])|ignora\s+(?:todo|tudo|cualquier)(?![A-Za-z0-9_])|${OVERRIDE_PREFILTER}(?:${OVERRIDE_PT_SOURCE})`, 'iu'), description: 'Multilingual prompt injection (Portuguese)' },
+  { id: 'pi:multi_fr', pattern: new RegExp(String.raw`ignore[rz]?\s+(toutes\s+les\s+)?instructions|oublie[rz]?\s+tout|agis\s+comme|tu\s+es\s+maintenant|${OVERRIDE_PREFILTER}(?:${OVERRIDE_FR_SOURCE})`, 'iu'), description: 'Multilingual prompt injection (French)' },
+  { id: 'pi:multi_de', pattern: new RegExp(String.raw`ignoriere\s+(alle\s+)?(anweisungen|instruktionen)|vergiss\s+(alles|jede)|du\s+bist\s+jetzt|handle\s+als|${OVERRIDE_PREFILTER}(?:${OVERRIDE_DE_SOURCE})`, 'iu'), description: 'Multilingual prompt injection (German)' },
   { id: 'pi:multi_ru', pattern: /забудь\s+[^\n]{0,80}?(все|инструкции)|игнорируй\s+[^\n]{0,80}?(все|предыдущие)|действуй\s+как|ты\s+теперь|найди\s+пароли/iu, test: testMultiRu, description: 'Multilingual prompt injection (Russian)' },
   { id: 'pi:multi_zh', pattern: /忽略[^\n]{0,80}?(指示|指令|提示)|忘记[^\n]{0,80}?(指示|指令|一切)|你现在是|初始提示词/u, test: testMultiZh, description: 'Multilingual prompt injection (Chinese)' },
-  { id: 'pi:identity_request', pattern: new RegExp(String.raw`(?<![A-Za-z0-9_])(?<!never\s)(?<!not\s)(?<!n't\s)(?<!n\u2019t\s)(?<!avoid\s)(?:run|execute|invoke|call)\s{1,4}[\x60\x27\x22]{0,2}(?:whoami|git\s{1,4}config\s{1,4}(?:--[a-z-]{1,12}\s{1,4}){0,2}user\.(?:email|name))(?![A-Za-z0-9_.-])[^\n]{0,100}?(?:\n[^\n]{0,100}?)?(?<![A-Za-z0-9_])(?:include|add|put|attach|append|insert|embed|send|pass|forward|submit|post|write|place|share|transmit|inject|encode|set)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:http\s{1,4}|request\s{1,4}|custom\s{1,4}|response\s{1,4})?headers?|(?<![A-Za-z0-9_])x-[a-z0-9-]{1,40}|url\s{1,4}param(?:eter)?s?|query\s{1,4}(?:string|param(?:eter)?s?)|\?[a-z_]{1,20}=|cookies?|form\s{1,4}(?:fields?|inputs?|data)|request\s{1,4}(?:body|payload)|next\s{1,4}(?:request|call|message)|(?:in|into|inside|within|with|to|on)\s{1,4}(?:an?|the|your|every|each|any|all|subsequent|following|outgoing|next)\s{1,4}(?:(?:http|outgoing|network|api|subsequent|following)\s{1,4}){0,2}(?:requests?|calls?))|(?<![A-Za-z0-9_])(?<!never\s)(?<!not\s)(?<!n't\s)(?<!n\u2019t\s)(?<!avoid\s)(?:include|add|put|attach|append|insert|embed|send|pass|forward|submit|post|write|place|share|transmit|inject|encode|set)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:output|result|value)\s{1,4}of\s{1,4}[\x60\x27\x22]{0,2}(?:whoami|git\s{1,4}config\s{1,4}(?:--[a-z-]{1,12}\s{1,4}){0,2}user\.(?:email|name))(?![A-Za-z0-9_.-])|[\x60\x27\x22]{0,2}(?:whoami|git\s{1,4}config\s{1,4}(?:--[a-z-]{1,12}\s{1,4}){0,2}user\.(?:email|name))[\x60\x27\x22]{0,2}\s{1,4}(?:output|result))(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:http\s{1,4}|request\s{1,4}|custom\s{1,4}|response\s{1,4})?headers?|(?<![A-Za-z0-9_])x-[a-z0-9-]{1,40}|url\s{1,4}param(?:eter)?s?|query\s{1,4}(?:string|param(?:eter)?s?)|\?[a-z_]{1,20}=|cookies?|form\s{1,4}(?:fields?|inputs?|data)|request\s{1,4}(?:body|payload)|next\s{1,4}(?:request|call|message)|(?:in|into|inside|within|with|to|on)\s{1,4}(?:an?|the|your|every|each|any|all|subsequent|following|outgoing|next)\s{1,4}(?:(?:http|outgoing|network|api|subsequent|following)\s{1,4}){0,2}(?:requests?|calls?))|(?<![A-Za-z0-9_])(?<!never\s)(?<!not\s)(?<!n't\s)(?<!n\u2019t\s)(?<!avoid\s)(?:include|add|put|attach|append|insert|embed|set|send|pass|forward|submit|post|write|specify|provide|supply|encode|inject|place|share|transmit|reveal|disclose|expose)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:(?:the|your)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)\s{1,4}(?:(?:full|real|login|primary)\s{1,4})?(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|phone(?:\s{1,4}number)?)|their\s{1,4}(?:(?:primary|login|account|real)\s{1,4})?e-?mail(?:\s{1,4}address(?:es)?)?(?=[^\n]{0,80}?(?:(?<![A-Za-z0-9_])x-[a-z0-9-]{1,40}|next\s{1,4}(?:http\s{1,4})?(?:request|call)))(?!(?:(?!(?<![A-Za-z0-9_])x-[a-z0-9-]|next\s)[^\n]){0,80}?(?:user-agent|mailto|(?<![A-Za-z0-9_])from\s{1,4}h[a-z]{3,5}|(?:request\s{1,4})?(?:body|payload)|(?<![A-Za-z0-9_])form(?![A-Za-z0-9_])))|(?:(?:your|the)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)|your\s{1,4}(?:end\s{1,4})?(?:customer|account\s{1,4}holder))[\x27’]s\s{1,4}(?:(?:full|real|first|last|login|primary|account|email|e-mail)\s{1,4}){0,2}(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|usernames?|user\s{0,2}ids?|accounts?|api[\s-]{0,2}keys?|access\s{1,4}tokens?|tokens?|credentials?|passwords?|logins?|identity|identifier|phone(?:\s{1,4}number)?|address|keys?|secrets?)|(?:(?:full|real|first|last|login|primary|account|email|e-mail)\s{1,4}){0,2}(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|usernames?|user\s{0,2}ids?|accounts?|api[\s-]{0,2}keys?|access\s{1,4}tokens?|tokens?|credentials?|passwords?|logins?|identity|identifier|phone(?:\s{1,4}number)?|address|keys?|secrets?)\s{1,4}(?:of|for)\s{1,4}(?:(?:your|the)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)|your\s{1,4}(?:end\s{1,4})?(?:customer|account\s{1,4}holder)))(?![A-Za-z0-9_])[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:http\s{1,4}|request\s{1,4}|custom\s{1,4}|response\s{1,4})?headers?|x-[a-z0-9-]{1,40}|url\s{1,4}param(?:eter)?s?|query\s{1,4}(?:string|param(?:eter)?s?)|\?[a-z_]{1,20}=|cookies?|form\s{1,4}(?:fields?|inputs?|data)|(?:request\s{1,4})?(?:body|payload)|next\s{1,4}(?:request|call|message)|(?:subsequent|following|every|each|outgoing)\s{1,4}(?:http\s{1,4})?(?:requests?|calls?|fetch(?:es)?))|(?:(?:http\s{1,4}|request\s{1,4}|custom\s{1,4}|response\s{1,4})?headers?|x-[a-z0-9-]{1,40}|url\s{1,4}param(?:eter)?s?|query\s{1,4}(?:string|param(?:eter)?s?)|\?[a-z_]{1,20}=|cookies?|form\s{1,4}(?:fields?|inputs?|data)|(?:request\s{1,4})?(?:body|payload)|next\s{1,4}(?:request|call|message)|(?:subsequent|following|every|each|outgoing)\s{1,4}(?:http\s{1,4})?(?:requests?|calls?|fetch(?:es)?))[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:the|your)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)\s{1,4}(?:(?:full|real|login|primary)\s{1,4})?(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|phone(?:\s{1,4}number)?)|their\s{1,4}(?:(?:primary|login|account|real)\s{1,4})?e-?mail(?:\s{1,4}address(?:es)?)?(?=[^\n]{0,80}?(?:(?<![A-Za-z0-9_])x-[a-z0-9-]{1,40}|next\s{1,4}(?:http\s{1,4})?(?:request|call)))(?!(?:(?!(?<![A-Za-z0-9_])x-[a-z0-9-]|next\s)[^\n]){0,80}?(?:user-agent|mailto|(?<![A-Za-z0-9_])from\s{1,4}h[a-z]{3,5}|(?:request\s{1,4})?(?:body|payload)|(?<![A-Za-z0-9_])form(?![A-Za-z0-9_])))|(?:(?:your|the)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)|your\s{1,4}(?:end\s{1,4})?(?:customer|account\s{1,4}holder))[\x27’]s\s{1,4}(?:(?:full|real|first|last|login|primary|account|email|e-mail)\s{1,4}){0,2}(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|usernames?|user\s{0,2}ids?|accounts?|api[\s-]{0,2}keys?|access\s{1,4}tokens?|tokens?|credentials?|passwords?|logins?|identity|identifier|phone(?:\s{1,4}number)?|address|keys?|secrets?)|(?:(?:full|real|first|last|login|primary|account|email|e-mail)\s{1,4}){0,2}(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|usernames?|user\s{0,2}ids?|accounts?|api[\s-]{0,2}keys?|access\s{1,4}tokens?|tokens?|credentials?|passwords?|logins?|identity|identifier|phone(?:\s{1,4}number)?|address|keys?|secrets?)\s{1,4}(?:of|for)\s{1,4}(?:(?:your|the)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)|your\s{1,4}(?:end\s{1,4})?(?:customer|account\s{1,4}holder)))(?![A-Za-z0-9_]))|(?<![A-Za-z0-9_])(?:(?:identify|reveal|disclose|state|report|announce)\s{1,4}(?:to\s{1,4}(?:me|us|this\s{1,4}[a-z]{3,10})\s{1,4})?(?:who\s{1,4})?your\s{1,4}(?:user|operator|owner|human|principal)(?:\s{1,4}is)?(?![A-Za-z0-9_])|(?:tell|inform)\s{1,4}(?:me|us)\s{1,4}who\s{1,4}(?:your|the)\s{1,4}(?:user|operator|owner|human|principal)\s{1,4}is(?![A-Za-z0-9_])|(?:tell|state|say|reveal|report)[^\n]{0,20}?who\s{1,4}you(?:\s{1,4}are|\s{0,4}[\x27’]re)\s{1,4}(?:working|acting)\s{1,4}for(?![A-Za-z0-9_]))`, 'i'), description: 'Tool result asks the agent to identify its user or put the user identity in a request' },
+  { id: 'pi:identity_request', pattern: new RegExp(String.raw`(?<![A-Za-z0-9_])(?<!never\s)(?<!not\s)(?<!n't\s)(?<!n\u2019t\s)(?<!avoid\s)(?:run|execute|invoke|call)\s{1,4}[\x60\x27\x22]{0,2}(?:whoami|git\s{1,4}config\s{1,4}(?:--[a-z-]{1,12}\s{1,4}){0,2}user\.(?:email|name))(?![A-Za-z0-9_.-])[^\n]{0,100}?(?:\n[^\n]{0,100}?)?(?<![A-Za-z0-9_])(?:include|add|put|attach|append|insert|embed|send|pass|forward|submit|post|write|place|share|transmit|inject|encode|set)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:http\s{1,4}|request\s{1,4}|custom\s{1,4}|response\s{1,4})?headers?|(?<![A-Za-z0-9_])x-[a-z0-9-]{1,40}|url\s{1,4}param(?:eter)?s?|query\s{1,4}(?:string|param(?:eter)?s?)|\?[a-z_]{1,20}=|cookies?|form\s{1,4}(?:fields?|inputs?|data)|request\s{1,4}(?:body|payload)|next\s{1,4}(?:request|call|message)|(?:in|into|inside|within|with|to|on)\s{1,4}(?:an?|the|your|every|each|any|all|subsequent|following|outgoing|next)\s{1,4}(?:(?:http|outgoing|network|api|subsequent|following)\s{1,4}){0,2}(?:requests?|calls?))|(?<![A-Za-z0-9_])(?<!never\s)(?<!not\s)(?<!n't\s)(?<!n\u2019t\s)(?<!avoid\s)(?:include|add|put|attach|append|insert|embed|send|pass|forward|submit|post|write|place|share|transmit|inject|encode|set)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:output|result|value)\s{1,4}of\s{1,4}[\x60\x27\x22]{0,2}(?:whoami|git\s{1,4}config\s{1,4}(?:--[a-z-]{1,12}\s{1,4}){0,2}user\.(?:email|name))(?![A-Za-z0-9_.-])|[\x60\x27\x22]{0,2}(?:whoami|git\s{1,4}config\s{1,4}(?:--[a-z-]{1,12}\s{1,4}){0,2}user\.(?:email|name))[\x60\x27\x22]{0,2}\s{1,4}(?:output|result))(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:http\s{1,4}|request\s{1,4}|custom\s{1,4}|response\s{1,4})?headers?|(?<![A-Za-z0-9_])x-[a-z0-9-]{1,40}|url\s{1,4}param(?:eter)?s?|query\s{1,4}(?:string|param(?:eter)?s?)|\?[a-z_]{1,20}=|cookies?|form\s{1,4}(?:fields?|inputs?|data)|request\s{1,4}(?:body|payload)|next\s{1,4}(?:request|call|message)|(?:in|into|inside|within|with|to|on)\s{1,4}(?:an?|the|your|every|each|any|all|subsequent|following|outgoing|next)\s{1,4}(?:(?:http|outgoing|network|api|subsequent|following)\s{1,4}){0,2}(?:requests?|calls?))|(?<![A-Za-z0-9_])(?<!never\s)(?<!not\s)(?<!n't\s)(?<!n\u2019t\s)(?<!avoid\s)(?:include|add|put|attach|append|insert|embed|set|send|pass|forward|submit|post|write|specify|provide|supply|encode|inject|place|share|transmit|reveal|disclose|expose)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:(?:the|your)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)\s{1,4}(?:(?:full|real|login|primary)\s{1,4})?(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|phone(?:\s{1,4}number)?)|their\s{1,4}(?:(?:primary|login|account|real)\s{1,4})?e-?mail(?:\s{1,4}address(?:es)?)?(?=[^\n]{0,80}?(?:(?<![A-Za-z0-9_])x-[a-z0-9-]{1,40}|next\s{1,4}(?:http\s{1,4})?(?:request|call)))(?!(?:(?!(?<![A-Za-z0-9_])x-[a-z0-9-]|next\s)[^\n]){0,80}?(?:user-agent|mailto|(?<![A-Za-z0-9_])from\s{1,4}h[a-z]{3,5}|next\s{1,4}(?:http\s{1,4})?(?:request|call)\s{1,4}(?:body|payload)|(?:request\s{1,4})?(?:body|payload)|(?<![A-Za-z0-9_])form(?![A-Za-z0-9_])))|(?:(?:your|the)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)|your\s{1,4}(?:end\s{1,4})?(?:customer|account\s{1,4}holder))[\x27’]s\s{1,4}(?:(?:full|real|first|last|login|primary|account|email|e-mail)\s{1,4}){0,2}(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|usernames?|user\s{0,2}ids?|accounts?|api[\s-]{0,2}keys?|access\s{1,4}tokens?|tokens?|credentials?|passwords?|logins?|identity|identifier|phone(?:\s{1,4}number)?|address|keys?|secrets?)|(?:(?:full|real|first|last|login|primary|account|email|e-mail)\s{1,4}){0,2}(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|usernames?|user\s{0,2}ids?|accounts?|api[\s-]{0,2}keys?|access\s{1,4}tokens?|tokens?|credentials?|passwords?|logins?|identity|identifier|phone(?:\s{1,4}number)?|address|keys?|secrets?)\s{1,4}(?:of|for)\s{1,4}(?:(?:your|the)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)|your\s{1,4}(?:end\s{1,4})?(?:customer|account\s{1,4}holder)))(?![A-Za-z0-9_])[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:http\s{1,4}|request\s{1,4}|custom\s{1,4}|response\s{1,4})?headers?|x-[a-z0-9-]{1,40}|url\s{1,4}param(?:eter)?s?|query\s{1,4}(?:string|param(?:eter)?s?)|\?[a-z_]{1,20}=|cookies?|form\s{1,4}(?:fields?|inputs?|data)|(?:request\s{1,4})?(?:body|payload)|next\s{1,4}(?:request|call|message)|(?:subsequent|following|every|each|outgoing)\s{1,4}(?:http\s{1,4})?(?:requests?|calls?|fetch(?:es)?))|(?:(?:http\s{1,4}|request\s{1,4}|custom\s{1,4}|response\s{1,4})?headers?|x-[a-z0-9-]{1,40}|url\s{1,4}param(?:eter)?s?|query\s{1,4}(?:string|param(?:eter)?s?)|\?[a-z_]{1,20}=|cookies?|form\s{1,4}(?:fields?|inputs?|data)|(?:request\s{1,4})?(?:body|payload)|next\s{1,4}(?:request|call|message)|(?:subsequent|following|every|each|outgoing)\s{1,4}(?:http\s{1,4})?(?:requests?|calls?|fetch(?:es)?))[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:the|your)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)\s{1,4}(?:(?:full|real|login|primary)\s{1,4})?(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|phone(?:\s{1,4}number)?)|their\s{1,4}(?:(?:primary|login|account|real)\s{1,4})?e-?mail(?:\s{1,4}address(?:es)?)?(?=[^\n]{0,80}?(?:(?<![A-Za-z0-9_])x-[a-z0-9-]{1,40}|next\s{1,4}(?:http\s{1,4})?(?:request|call)))(?!(?:(?!(?<![A-Za-z0-9_])x-[a-z0-9-]|next\s)[^\n]){0,80}?(?:user-agent|mailto|(?<![A-Za-z0-9_])from\s{1,4}h[a-z]{3,5}|next\s{1,4}(?:http\s{1,4})?(?:request|call)\s{1,4}(?:body|payload)|(?:request\s{1,4})?(?:body|payload)|(?<![A-Za-z0-9_])form(?![A-Za-z0-9_])))|(?:(?:your|the)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)|your\s{1,4}(?:end\s{1,4})?(?:customer|account\s{1,4}holder))[\x27’]s\s{1,4}(?:(?:full|real|first|last|login|primary|account|email|e-mail)\s{1,4}){0,2}(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|usernames?|user\s{0,2}ids?|accounts?|api[\s-]{0,2}keys?|access\s{1,4}tokens?|tokens?|credentials?|passwords?|logins?|identity|identifier|phone(?:\s{1,4}number)?|address|keys?|secrets?)|(?:(?:full|real|first|last|login|primary|account|email|e-mail)\s{1,4}){0,2}(?:names?|e-?mail(?:\s{1,4}address(?:es)?)?|usernames?|user\s{0,2}ids?|accounts?|api[\s-]{0,2}keys?|access\s{1,4}tokens?|tokens?|credentials?|passwords?|logins?|identity|identifier|phone(?:\s{1,4}number)?|address|keys?|secrets?)\s{1,4}(?:of|for)\s{1,4}(?:(?:your|the)\s{1,4}(?:end\s{1,4})?(?:user|operator|owner|human|principal)|your\s{1,4}(?:end\s{1,4})?(?:customer|account\s{1,4}holder)))(?![A-Za-z0-9_]))|(?<![A-Za-z0-9_])(?:(?:identify|reveal|disclose|state|report|announce)\s{1,4}(?:to\s{1,4}(?:me|us|this\s{1,4}[a-z]{3,10})\s{1,4})?(?:who\s{1,4})?your\s{1,4}(?:user|operator|owner|human|principal)(?:\s{1,4}is)?(?![A-Za-z0-9_])|(?:tell|inform)\s{1,4}(?:me|us)\s{1,4}who\s{1,4}(?:your|the)\s{1,4}(?:user|operator|owner|human|principal)\s{1,4}is(?![A-Za-z0-9_])|(?:tell|state|say|reveal|report)[^\n]{0,20}?who\s{1,4}you(?:\s{1,4}are|\s{0,4}[\x27’]re)\s{1,4}(?:working|acting)\s{1,4}for(?![A-Za-z0-9_]))`, 'i'), description: 'Tool result asks the agent to identify its user or put the user identity in a request' },
   { id: 'pi:identity_request_multi', pattern: new RegExp(String.raw`(?<![A-Za-z0-9_])(?:ejecuta|ejecute|corre|lanza)\s{1,4}[\x60\x27\x22]{0,2}(?:whoami|git\s{1,4}config\s{1,4}(?:--[a-z-]{1,12}\s{1,4}){0,2}user\.(?:email|name))(?![A-Za-z0-9_.-])[^\n]{0,100}?(?:\n[^\n]{0,100}?)?(?<![A-Za-z0-9_])(?:incluye|incluya|a[ñn]ade|a[ñn]ada|agrega|agregue|pon|ponga|env[ií]a|env[ií]e|adjunta|adjunte|inserta|pasa)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:cabecera|encabezado|header|par[aá]metro|cookie|formulario|campo|(?:siguiente|pr[oó]xima)\s{1,4}(?:petici[oó]n|solicitud)|url)|(?<![A-Za-z0-9_])(?:incluye|incluya|incluyas|añade|añada|agrega|agregue|pon|ponga|envía|envia|envíe|adjunta|adjunte|inserta|pasa|indica|comparte|revela)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:(?:usuario|operador|due[ñn]o|propietario)[^\n]{0,30}?(?:correo(?:\s{1,4}electr[oó]nico)?|e-?mail|nombre(?:\s{1,4}completo)?|cuenta|clave(?:\s{1,4}de\s{1,4}api)?|token|credenciales|contrase[ñn]a|identidad)|(?:correo(?:\s{1,4}electr[oó]nico)?|e-?mail|nombre(?:\s{1,4}completo)?|cuenta|clave(?:\s{1,4}de\s{1,4}api)?|token|credenciales|contrase[ñn]a|identidad)[^\n]{0,30}?(?:usuario|operador|due[ñn]o|propietario))[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:cabecera|encabezado|header|par[aá]metro|cookie|formulario|campo|(?:siguiente|pr[oó]xima)\s{1,4}(?:petici[oó]n|solicitud)|url)|(?:cabecera|encabezado|header|par[aá]metro|cookie|formulario|campo|(?:siguiente|pr[oó]xima)\s{1,4}(?:petici[oó]n|solicitud)|url)[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:usuario|operador|due[ñn]o|propietario)[^\n]{0,30}?(?:correo(?:\s{1,4}electr[oó]nico)?|e-?mail|nombre(?:\s{1,4}completo)?|cuenta|clave(?:\s{1,4}de\s{1,4}api)?|token|credenciales|contrase[ñn]a|identidad)|(?:correo(?:\s{1,4}electr[oó]nico)?|e-?mail|nombre(?:\s{1,4}completo)?|cuenta|clave(?:\s{1,4}de\s{1,4}api)?|token|credenciales|contrase[ñn]a|identidad)[^\n]{0,30}?(?:usuario|operador|due[ñn]o|propietario)))|(?:cabecera|encabezado|header|par[aá]metro|cookie|formulario|campo|(?:siguiente|pr[oó]xima)\s{1,4}(?:petici[oó]n|solicitud)|url)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?<![A-Za-z0-9_])(?:incluye|incluya|incluyas|añade|añada|agrega|agregue|pon|ponga|envía|envia|envíe|adjunta|adjunte|inserta|pasa|indica|comparte|revela)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:usuario|operador|due[ñn]o|propietario)[^\n]{0,30}?(?:correo(?:\s{1,4}electr[oó]nico)?|e-?mail|nombre(?:\s{1,4}completo)?|cuenta|clave(?:\s{1,4}de\s{1,4}api)?|token|credenciales|contrase[ñn]a|identidad)|(?:correo(?:\s{1,4}electr[oó]nico)?|e-?mail|nombre(?:\s{1,4}completo)?|cuenta|clave(?:\s{1,4}de\s{1,4}api)?|token|credenciales|contrase[ñn]a|identidad)[^\n]{0,30}?(?:usuario|operador|due[ñn]o|propietario))|(?<![A-Za-z0-9_])(?:inclua|inclui|adicione|adiciona|coloque|coloca|envie|envia|anexe|insira|passe|compartilhe|revele)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:(?:usu[aá]rio|operador|dono|propriet[aá]rio)[^\n]{0,30}?(?:e-?mail|nome(?:\s{1,4}completo)?|conta|chave(?:\s{1,4}de\s{1,4}api)?|token|credenciais|senha|identidade)|(?:e-?mail|nome(?:\s{1,4}completo)?|conta|chave(?:\s{1,4}de\s{1,4}api)?|token|credenciais|senha|identidade)[^\n]{0,30}?(?:usu[aá]rio|operador|dono|propriet[aá]rio))[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:cabe[cç]alho|header|par[aâ]metro|cookie|formul[aá]rio|campo|pr[oó]xima\s{1,4}requisi[cç][aã]o|url)|(?:cabe[cç]alho|header|par[aâ]metro|cookie|formul[aá]rio|campo|pr[oó]xima\s{1,4}requisi[cç][aã]o|url)[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:usu[aá]rio|operador|dono|propriet[aá]rio)[^\n]{0,30}?(?:e-?mail|nome(?:\s{1,4}completo)?|conta|chave(?:\s{1,4}de\s{1,4}api)?|token|credenciais|senha|identidade)|(?:e-?mail|nome(?:\s{1,4}completo)?|conta|chave(?:\s{1,4}de\s{1,4}api)?|token|credenciais|senha|identidade)[^\n]{0,30}?(?:usu[aá]rio|operador|dono|propriet[aá]rio)))|(?:cabe[cç]alho|header|par[aâ]metro|cookie|formul[aá]rio|campo|pr[oó]xima\s{1,4}requisi[cç][aã]o|url)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?<![A-Za-z0-9_])(?:inclua|inclui|adicione|adiciona|coloque|coloca|envie|envia|anexe|insira|passe|compartilhe|revele)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:usu[aá]rio|operador|dono|propriet[aá]rio)[^\n]{0,30}?(?:e-?mail|nome(?:\s{1,4}completo)?|conta|chave(?:\s{1,4}de\s{1,4}api)?|token|credenciais|senha|identidade)|(?:e-?mail|nome(?:\s{1,4}completo)?|conta|chave(?:\s{1,4}de\s{1,4}api)?|token|credenciais|senha|identidade)[^\n]{0,30}?(?:usu[aá]rio|operador|dono|propriet[aá]rio))|(?<![A-Za-z0-9_])(?:inclus|incluez|ajoute|ajoutez|mets|mettez|envoie|envoyez|joins|joignez|insère|insérez|transmets|transmettez|partage|partagez|révèle|révélez)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:(?:utilisateur|opérateur|propriétaire)[^\n]{0,30}?(?:e-?mail|courriel|adresse\s{1,4}e-?mail|nom(?:\s{1,4}complet)?|compte|clé(?:\s{1,4}d\x27api)?|jeton|identifiants?|mot\s{1,4}de\s{1,4}passe|identité)|(?:e-?mail|courriel|adresse\s{1,4}e-?mail|nom(?:\s{1,4}complet)?|compte|clé(?:\s{1,4}d\x27api)?|jeton|identifiants?|mot\s{1,4}de\s{1,4}passe|identité)[^\n]{0,30}?(?:utilisateur|opérateur|propriétaire))[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:en-t[eê]te|header|param[eè]tre|cookie|formulaire|champ|prochaine\s{1,4}requ[eê]te|url)|(?:en-t[eê]te|header|param[eè]tre|cookie|formulaire|champ|prochaine\s{1,4}requ[eê]te|url)[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:utilisateur|opérateur|propriétaire)[^\n]{0,30}?(?:e-?mail|courriel|adresse\s{1,4}e-?mail|nom(?:\s{1,4}complet)?|compte|clé(?:\s{1,4}d\x27api)?|jeton|identifiants?|mot\s{1,4}de\s{1,4}passe|identité)|(?:e-?mail|courriel|adresse\s{1,4}e-?mail|nom(?:\s{1,4}complet)?|compte|clé(?:\s{1,4}d\x27api)?|jeton|identifiants?|mot\s{1,4}de\s{1,4}passe|identité)[^\n]{0,30}?(?:utilisateur|opérateur|propriétaire)))|(?:en-t[eê]te|header|param[eè]tre|cookie|formulaire|champ|prochaine\s{1,4}requ[eê]te|url)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?<![A-Za-z0-9_])(?:inclus|incluez|ajoute|ajoutez|mets|mettez|envoie|envoyez|joins|joignez|insère|insérez|transmets|transmettez|partage|partagez|révèle|révélez)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:utilisateur|opérateur|propriétaire)[^\n]{0,30}?(?:e-?mail|courriel|adresse\s{1,4}e-?mail|nom(?:\s{1,4}complet)?|compte|clé(?:\s{1,4}d\x27api)?|jeton|identifiants?|mot\s{1,4}de\s{1,4}passe|identité)|(?:e-?mail|courriel|adresse\s{1,4}e-?mail|nom(?:\s{1,4}complet)?|compte|clé(?:\s{1,4}d\x27api)?|jeton|identifiants?|mot\s{1,4}de\s{1,4}passe|identité)[^\n]{0,30}?(?:utilisateur|opérateur|propriétaire))|(?<![A-Za-z0-9_])(?:füge|fuege|sende|schicke|übergib|uebergib|setze|gib|teile|nenne|hänge|binde)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:(?:nutzers|benutzers|bedieners|betreibers|besitzers|operators)[^\n]{0,30}?(?:e-?mail(?:-adresse)?|name|vollständigen\s{1,4}namen|konto|api-?schlüssel|schlüssel|token|zugangsdaten|passwort|identität|benutzernamen?)|(?:e-?mail(?:-adresse)?|name|vollständigen\s{1,4}namen|konto|api-?schlüssel|schlüssel|token|zugangsdaten|passwort|identität|benutzernamen?)[^\n]{0,30}?(?:nutzers|benutzers|bedieners|betreibers|besitzers|operators))[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:header|kopfzeile|parameter|cookie|formular|feld|nächste\s{1,4}anfrage|url)|(?:header|kopfzeile|parameter|cookie|formular|feld|nächste\s{1,4}anfrage|url)[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:nutzers|benutzers|bedieners|betreibers|besitzers|operators)[^\n]{0,30}?(?:e-?mail(?:-adresse)?|name|vollständigen\s{1,4}namen|konto|api-?schlüssel|schlüssel|token|zugangsdaten|passwort|identität|benutzernamen?)|(?:e-?mail(?:-adresse)?|name|vollständigen\s{1,4}namen|konto|api-?schlüssel|schlüssel|token|zugangsdaten|passwort|identität|benutzernamen?)[^\n]{0,30}?(?:nutzers|benutzers|bedieners|betreibers|besitzers|operators)))|(?:header|kopfzeile|parameter|cookie|formular|feld|nächste\s{1,4}anfrage|url)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?<![A-Za-z0-9_])(?:füge|fuege|sende|schicke|übergib|uebergib|setze|gib|teile|nenne|hänge|binde)(?![A-Za-z0-9_])[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:nutzers|benutzers|bedieners|betreibers|besitzers|operators)[^\n]{0,30}?(?:e-?mail(?:-adresse)?|name|vollständigen\s{1,4}namen|konto|api-?schlüssel|schlüssel|token|zugangsdaten|passwort|identität|benutzernamen?)|(?:e-?mail(?:-adresse)?|name|vollständigen\s{1,4}namen|konto|api-?schlüssel|schlüssel|token|zugangsdaten|passwort|identität|benutzernamen?)[^\n]{0,30}?(?:nutzers|benutzers|bedieners|betreibers|besitzers|operators))|(?:добавь|добавьте|включи|включите|отправь|отправьте|передай|передайте|укажи|укажите|вставь|вставьте)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:(?:пользовател[а-яё]+|оператор[а-яё]*|владельц[а-яё]+|хозяин[а-яё]*)[^\n]{0,30}?(?:почт[а-яё]+|email|e-mail|имя|имени|логин[а-яё]*|аккаунт[а-яё]*|ключ[а-яё]*|токен[а-яё]*|парол[а-яё]+|учётн[а-яё]+\s{1,4}запис[а-яё]+)|(?:почт[а-яё]+|email|e-mail|имя|имени|логин[а-яё]*|аккаунт[а-яё]*|ключ[а-яё]*|токен[а-яё]*|парол[а-яё]+|учётн[а-яё]+\s{1,4}запис[а-яё]+)[^\n]{0,30}?(?:пользовател[а-яё]+|оператор[а-яё]*|владельц[а-яё]+|хозяин[а-яё]*))[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:заголов[а-яё]+|header|параметр[а-яё]*|cookie|куки|форм[а-яё]+|поле|следующ[а-яё]+\s{1,4}запрос[а-яё]*|url)|(?:заголов[а-яё]+|header|параметр[а-яё]*|cookie|куки|форм[а-яё]+|поле|следующ[а-яё]+\s{1,4}запрос[а-яё]*|url)[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:пользовател[а-яё]+|оператор[а-яё]*|владельц[а-яё]+|хозяин[а-яё]*)[^\n]{0,30}?(?:почт[а-яё]+|email|e-mail|имя|имени|логин[а-яё]*|аккаунт[а-яё]*|ключ[а-яё]*|токен[а-яё]*|парол[а-яё]+|учётн[а-яё]+\s{1,4}запис[а-яё]+)|(?:почт[а-яё]+|email|e-mail|имя|имени|логин[а-яё]*|аккаунт[а-яё]*|ключ[а-яё]*|токен[а-яё]*|парол[а-яё]+|учётн[а-яё]+\s{1,4}запис[а-яё]+)[^\n]{0,30}?(?:пользовател[а-яё]+|оператор[а-яё]*|владельц[а-яё]+|хозяин[а-яё]*)))|(?:заголов[а-яё]+|header|параметр[а-яё]*|cookie|куки|форм[а-яё]+|поле|следующ[а-яё]+\s{1,4}запрос[а-яё]*|url)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:добавь|добавьте|включи|включите|отправь|отправьте|передай|передайте|укажи|укажите|вставь|вставьте)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:пользовател[а-яё]+|оператор[а-яё]*|владельц[а-яё]+|хозяин[а-яё]*)[^\n]{0,30}?(?:почт[а-яё]+|email|e-mail|имя|имени|логин[а-яё]*|аккаунт[а-яё]*|ключ[а-яё]*|токен[а-яё]*|парол[а-яё]+|учётн[а-яё]+\s{1,4}запис[а-яё]+)|(?:почт[а-яё]+|email|e-mail|имя|имени|логин[а-яё]*|аккаунт[а-яё]*|ключ[а-яё]*|токен[а-яё]*|парол[а-яё]+|учётн[а-яё]+\s{1,4}запис[а-яё]+)[^\n]{0,30}?(?:пользовател[а-яё]+|оператор[а-яё]*|владельц[а-яё]+|хозяин[а-яё]*))|(?:添加|加入|包含|附上|发送|传递|提供|填写|放入|带上|附加)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:(?:用户|使用者|操作者|主人|所有者)[^\n]{0,30}?(?:邮箱|电子邮件|电子邮箱|姓名|名字|用户名|账号|帐号|账户|密钥|令牌|凭据|凭证|身份|密码)|(?:邮箱|电子邮件|电子邮箱|姓名|名字|用户名|账号|帐号|账户|密钥|令牌|凭据|凭证|身份|密码)[^\n]{0,30}?(?:用户|使用者|操作者|主人|所有者))[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:请求头|头部|标头|header|参数|cookie|表单|字段|下一个请求|下一次请求|下个请求|url|查询字符串)|(?:请求头|头部|标头|header|参数|cookie|表单|字段|下一个请求|下一次请求|下个请求|url|查询字符串)[^\n]{0,80}?(?:\n[^\n]{0,80}?)?(?:(?:用户|使用者|操作者|主人|所有者)[^\n]{0,30}?(?:邮箱|电子邮件|电子邮箱|姓名|名字|用户名|账号|帐号|账户|密钥|令牌|凭据|凭证|身份|密码)|(?:邮箱|电子邮件|电子邮箱|姓名|名字|用户名|账号|帐号|账户|密钥|令牌|凭据|凭证|身份|密码)[^\n]{0,30}?(?:用户|使用者|操作者|主人|所有者)))|(?:请求头|头部|标头|header|参数|cookie|表单|字段|下一个请求|下一次请求|下个请求|url|查询字符串)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:添加|加入|包含|附上|发送|传递|提供|填写|放入|带上|附加)[^\n]{0,60}?(?:\n[^\n]{0,60}?)?(?:(?:用户|使用者|操作者|主人|所有者)[^\n]{0,30}?(?:邮箱|电子邮件|电子邮箱|姓名|名字|用户名|账号|帐号|账户|密钥|令牌|凭据|凭证|身份|密码)|(?:邮箱|电子邮件|电子邮箱|姓名|名字|用户名|账号|帐号|账户|密钥|令牌|凭据|凭证|身份|密码)[^\n]{0,30}?(?:用户|使用者|操作者|主人|所有者))`, 'iu'), description: 'Tool result asks the agent to identify its user or put the user identity in a request (non-English)' },
 ];
 
@@ -280,7 +297,7 @@ const EVASION_RULES = [
 
 const EXFIL_VERB_SOURCE = '(?<![A-Za-z0-9_])(give|reveal|send|show|print|expose|leak|paste|dump|read|open|cat|fetch|extract|steal)(?![A-Za-z0-9_])';
 const CRED_OBJECT_SOURCE =
-  '(?<![A-Za-z0-9_])(passwords?|api[_ -]?keys?|secrets?|credentials?|tokens?|ssh[ _-]?keys?|private[ _-]?keys?|aws_secret[a-z0-9_]*|aws_access[a-z0-9_]*)(?![A-Za-z0-9_])|(?:^|\\s|[\'"\`])\\.env(?:\\.[a-z0-9]+)?(?![A-Za-z0-9_])';
+  '(?<![A-Za-z0-9_])(passwords?|api[_ -]?keys?|secrets?|credentials?|tokens?|ssh[ _-]?keys?|private[ _-]?keys?|aws_secret[a-z0-9_]*|aws_access[a-z0-9_]*)(?![A-Za-z0-9_])|(?:^|\\s|[\'"\`/\\\\,])\\.env(?!(?:\\.[a-z0-9]+)?\\.(?:example|sample|template)(?=$|[\\s;&|()<>,:"\']))(?:\\.[a-z0-9]+)?(?![A-Za-z0-9_])';
 
 // The verb must start a clause (an instruction, not a description such as
 // "this library reads tokens from ...") or be followed by "me"/"us", and the
@@ -319,10 +336,140 @@ function matchesRule(rule, text) {
   return rule.test ? rule.test(text) : rule.pattern.test(text);
 }
 
+// Protected files: .env files (not templates such as .env.example), SSH
+// private keys and authorized_keys under .ssh (not the .pub public keys),
+// .aws/credentials, /etc/shadow and /etc/passwd, in any directory.
+//
+// The rule matches the text as written and also a path view of it, in which
+// every word is read the way a shell or the Windows file functions would read
+// it. The view is lexical only: it never touches the file system, so symbolic
+// links and Windows short (8.3) names are not resolved.
+//   - ASCII letters are lower-cased;
+//   - home variables ($HOME, ${HOME}, %USERPROFILE%, $env:USERPROFILE) become
+//     ~ and working-directory variables ($PWD, %CD%) become .;
+//   - quotes inside a word are removed; a backslash is read both as a path
+//     separator and as an escape (two forms of the word);
+//   - ~user becomes ~; ./, repeated separators and dir/.. are collapsed;
+//   - trailing dots and spaces of every segment are dropped (Windows).
+// Every step is linear in the length of the text.
+const SENSITIVE_PATH_RE = /(?:^|[\s"'`(\[\/])\.(?:ssh\/(?:id_(?:rsa|dsa|ecdsa|ed25519|xmss)(?:_sk)?(?!\.pub(?=$|[\s;&|()<>,:"']))|authorized_keys)|aws\/credentials|env(?!(?:\.[a-z0-9]+)?\.(?:example|sample|template)(?=$|[\s;&|()<>,:"']))(?:\.[a-z0-9]+)?)(?![A-Za-z0-9_])|\/etc\/(?:shadow|passwd)(?![A-Za-z0-9_])/i;
+const PATH_HOME_VAR_RE = /\$\{(?:env:)?(?:home|userprofile)\}|\$(?:env:)?(?:home|userprofile)(?![a-z0-9_])|%(?:userprofile|home)%|%homedrive%%homepath%/g;
+const PATH_CWD_VAR_RE = /\$\{(?:env:)?pwd\}|\$(?:env:)?pwd(?![a-z0-9_])|%cd%/g;
+const PATH_WORD_SPLIT_RE = /[ \t\r\n\f\v|&;<>()\[\]{}`,]+/;
+const PATH_QUOTE_RE = /["']/g;
+const PATH_TILDE_USER_RE = /^~[^/]*/;
+const PATH_DRIVE_RE = /^[a-z]:$/;
+
+function lowerAscii(s) {
+  return s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
+}
+
+// Drop the trailing dots and spaces of a path segment (Windows ignores them).
+function trimSegmentTail(seg) {
+  let end = seg.length;
+  while (end > 0 && (seg[end - 1] === '.' || seg[end - 1] === ' ')) end--;
+  return seg.slice(0, end);
+}
+
+// Lexical normalization of one word that uses / as its only separator.
+function normalizePathWord(word) {
+  const abs = word.startsWith('/');
+  const s = word.startsWith('~') ? word.replace(PATH_TILDE_USER_RE, '~') : word;
+  const out = [];
+  for (let seg of s.split('/')) {
+    if (seg !== '.' && seg !== '..') seg = trimSegmentTail(seg);
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      const last = out.length ? out[out.length - 1] : null;
+      // A parent of the root or of a drive root is the root itself.
+      if ((abs && last === null) || (last !== null && PATH_DRIVE_RE.test(last))) continue;
+      if (last !== null && last !== '..' && last !== '~') {
+        out.pop();
+        continue;
+      }
+    }
+    out.push(seg);
+  }
+  return (abs ? '/' : '') + out.join('/');
+}
+
+// The path view of a text: its normalized words, one per line.
+function sensitivePathView(text) {
+  const lowered = lowerAscii(text).replace(PATH_HOME_VAR_RE, '~').replace(PATH_CWD_VAR_RE, '.');
+  const words = [];
+  for (const raw of lowered.split(PATH_WORD_SPLIT_RE)) {
+    if (!raw) continue;
+    const word = raw.replace(PATH_QUOTE_RE, '');
+    words.push(normalizePathWord(word.replace(/\\/g, '/')));
+    if (word.includes('\\')) words.push(normalizePathWord(word.replace(/\\/g, '')));
+  }
+  return words.join('\n');
+}
+
+// The text as written: next to the path view, this keeps the home, drive and
+// variable prefixes the view does not need.
+const SENSITIVE_PATH_TEXT_RE = /(?:^|[\s"'`(\[@,\/\\])(?:~|\/home\/[^\t\n\f\r \/]+|\/root|[A-Za-z]:[\/\\]Users[\/\\][^\t\n\f\r \/\\"']+(?: [^\t\n\f\r \/\\"']+)*|%(?:USERPROFILE|HOMEPATH)%|\$env:(?:USERPROFILE|HOME)(?![A-Za-z0-9_])|\$\{?(?:HOME|USERPROFILE)\}?)?[\/\\]?\.(?:ssh[\/\\](?:id_(?:rsa|dsa|ecdsa|ed25519|xmss)(?:_sk)?(?!\.pub(?=$|[\s;&|()<>,:"']))|authorized_keys)|aws[\/\\]credentials|env(?!(?:\.[a-z0-9]+)?\.(?:example|sample|template)(?=$|[\s;&|()<>,:"']))(?:\.[a-z0-9]+)?)(?![A-Za-z0-9_])|=(?:~|\/home\/[^\t\n\f\r \/]+|\/root|[A-Za-z]:[\/\\]Users[\/\\][^\t\n\f\r \/\\"']+(?: [^\t\n\f\r \/\\"']+)*|%(?:USERPROFILE|HOMEPATH)%|\$env:(?:USERPROFILE|HOME)(?![A-Za-z0-9_])|\$\{?(?:HOME|USERPROFILE)\}?)[\/\\]?\.(?:ssh[\/\\](?:id_(?:rsa|dsa|ecdsa|ed25519|xmss)(?:_sk)?(?!\.pub(?=$|[\s;&|()<>,:"']))|authorized_keys)|aws[\/\\]credentials|env(?!(?:\.[a-z0-9]+)?\.(?:example|sample|template)(?=$|[\s;&|()<>,:"']))(?:\.[a-z0-9]+)?)(?![A-Za-z0-9_])|\/etc\/(?:shadow|passwd)(?![A-Za-z0-9_])/i;
+
+// cmd.exe reads a command in steps: %VAR% is expanded first, then a ^ outside double quotes escapes the next character, so
+// `type .e^nv`, `type ^.env` and `type %CD%\.e^nv` all open .env. These readings apply only where a cmd reader or cmd itself
+// is named: in a POSIX shell `^` is an ordinary character, and `grep ^.env notes.md` must stay allowed.
+const CMD_READER_RE = /(?:^|[\s;&|("'`])(?:cmd(?:\.exe)?|type|more|findstr|copy)(?=[\s"']|$)/i;
+const CMD_PERCENT_UNIT_RE = /%[^%!:\r\n]+(?::[^%!\r\n]*)?%/g;
+const CMD_SET_RE = /(?:^|[\s&|(])set\s+"?([A-Za-z_][A-Za-z0-9_]*)=([^&|"\r\n]*)"?/gi;
+const CMD_NAMED_PERCENT_RE = /%([A-Za-z_][A-Za-z0-9_]*)%/g;
+const CMD_C_QUOTED_RE = /(\/[ck]\s+)"([\s\S]*)"(\s*)$/i;
+function dropCmdCarets(text) {
+  let out = '';
+  let inQuote = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') { inQuote = !inQuote; out += c; continue; }
+    if (c === '^' && !inQuote) {
+      const nx = text[i + 1];
+      if (nx === undefined) break;
+      if (nx === '\r' && text[i + 2] === '\n') { i += 2; continue; }
+      if (nx === '\n') { i++; continue; }
+      out += nx;
+      i++;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+// %NAME% of a variable the same text sets (set X=.env) is replaced by its value; every other % unit is taken out, as its value is unknown.
+function expandCmdPercent(text) {
+  const vars = new Map();
+  for (const m of text.matchAll(CMD_SET_RE)) vars.set(m[1].toLowerCase(), m[2].replace(/\s+$/, ''));
+  const known = vars.size ? text.replace(CMD_NAMED_PERCENT_RE, (all, name) => (vars.has(name.toLowerCase()) ? vars.get(name.toLowerCase()) : all)) : text;
+  return known.replace(CMD_PERCENT_UNIT_RE, (unit) => (/^%(?:userprofile|homepath|homedrive|home|cd)%$/i.test(unit) ? unit : ''));
+}
+function cmdReadings(text) {
+  const out = [];
+  if ((text.indexOf('^') < 0 && text.indexOf('%') < 0) || !CMD_READER_RE.test(text)) return out;
+  const unwrapped = text.replace(CMD_C_QUOTED_RE, '$1$2$3');
+  const views = [unwrapped];
+  if (text.indexOf('%') >= 0) views.push(expandCmdPercent(unwrapped));
+  for (const v of views) {
+    if (v !== text) out.push(v);
+    if (v.indexOf('^') >= 0) out.push(dropCmdCarets(v));
+  }
+  return out;
+}
+
+function testSensitivePathAs(text) {
+  return SENSITIVE_PATH_TEXT_RE.test(text) || SENSITIVE_PATH_RE.test(text) || SENSITIVE_PATH_RE.test(sensitivePathView(text));
+}
+function testSensitivePath(text) {
+  return testSensitivePathAs(text) || cmdReadings(text).some(testSensitivePathAs);
+}
+
 const SENSITIVE_PATH_RULES = [
   {
     id: 'path:sensitive_file',
-    pattern: /(?:^|[\s"'`(\[@])(?:~|\/home\/[^\t\n\f\r \/]+|\/root|[A-Za-z]:[\/\\]Users[\/\\][^\t\n\f\r \/\\"']+(?: [^\t\n\f\r \/\\"']+)*|%(?:USERPROFILE|HOMEPATH)%|\$env:(?:USERPROFILE|HOME)(?![A-Za-z0-9_])|\$\{?(?:HOME|USERPROFILE)\}?)?[\/\\]?\.(?:ssh[\/\\](?:id_rsa|id_ed25519|authorized_keys)|aws[\/\\]credentials|env(?:\.[a-z0-9]+)?)(?![A-Za-z0-9_])|=(?:~|\/home\/[^\t\n\f\r \/]+|\/root|[A-Za-z]:[\/\\]Users[\/\\][^\t\n\f\r \/\\"']+(?: [^\t\n\f\r \/\\"']+)*|%(?:USERPROFILE|HOMEPATH)%|\$env:(?:USERPROFILE|HOME)(?![A-Za-z0-9_])|\$\{?(?:HOME|USERPROFILE)\}?)[\/\\]?\.(?:ssh[\/\\](?:id_rsa|id_ed25519|authorized_keys)|aws[\/\\]credentials|env(?:\.[a-z0-9]+)?)(?![A-Za-z0-9_])|\/etc\/(?:shadow|passwd)(?![A-Za-z0-9_])/i,
+    // `.pattern` matches the text as written; the rule itself is test().
+    pattern: SENSITIVE_PATH_TEXT_RE,
+    test: testSensitivePath,
     description: 'Targeting sensitive system credentials or environment file',
   },
 ];
@@ -381,7 +528,7 @@ const ADVISORY_BY_DEFAULT = new Set([
 ]);
 
 function strictMode(options, cfg) {
-  return (options && options.strict === true) || process.env.ZN_STRICT === '1' || (cfg && cfg.strict === true);
+  return (options && options.strict === true) || envFlag('ZN_STRICT') || (cfg && cfg.strict === true);
 }
 
 // Local custom rules cache (.znrules or zn.config.json)
@@ -818,7 +965,7 @@ function evaluateUncached(input, options = {}) {
 
     // 2. Sensitive Path Traversal / Credential File Access
     for (const rule of SENSITIVE_PATH_RULES) {
-      if (rule.pattern.test(text)) {
+      if (rule.test ? rule.test(text) : rule.pattern.test(text)) {
         return { verdict: 'block', confidence: 0.92, reason: rule.description, rule: rule.id, engine: 'oss-local', rules_version: RULES_VERSION };
       }
     }
@@ -1604,9 +1751,9 @@ const MIN_INVISIBLE_CHECK_CHARS = 64 * 1024;
 const MAX_INVISIBLE_CHARS = 200000;
 const INVISIBLE_BLOCK_REASON = 'Output is mostly invisible characters';
 
-// The characters invisibleStats counts or pairs up: the invisible ones and any high surrogate (the start of a
+// The characters invisibleStats counts or pairs up: the invisible ones (C0 control characters included) and any high surrogate (the start of a
 // pair). A text with none of them has nothing to count, and one native scan says so far faster than the loop.
-const INVISIBLE_STATS_CANDIDATE_RE = /[\u00AD\u061C\u115F\u1160\u180E\u200B-\u200F\u2060\u3164\uFEFF\uFE00-\uFE0F\uFFA0\uD800-\uDBFF]/;
+const INVISIBLE_STATS_CANDIDATE_RE = /[\u0000-\u0008\u000E-\u001A\u001C-\u001F\u00AD\u061C\u115F\u1160\u180E\u200B-\u200F\u2060\u3164\uFEFF\uFE00-\uFE0F\uFFA0\uD800-\uDBFF]/;
 
 function invisibleStats(text, budget) {
   const n = text.length;
@@ -1615,7 +1762,15 @@ function invisibleStats(text, budget) {
   let pairs = 0;
   for (let i = 0; i < n; i++) {
     const c = text.charCodeAt(i);
-    if (c < 0xAD) continue;
+    if (c < 0xAD) {
+      // C0 control characters are invisible for matching (lib/invisible.js CONTROL_CLASS), as in Python: all but
+      // tab, line feed, vertical tab, form feed, carriage return and ESC.
+      if (c < 0x20 && (c <= 0x08 || (c >= 0x0E && c !== 0x1B))) {
+        count++;
+        if (count > budget) break;
+      }
+      continue;
+    }
     if ((c >= 0x200B && c <= 0x200F) || c === 0x2060 || c === 0xFEFF || c === 0xAD || (c >= 0xFE00 && c <= 0xFE0F) || c === 0x61C || c === 0x180E || c === 0x115F || c === 0x1160 || c === 0x3164 || c === 0xFFA0) {
       count++;
     } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
@@ -1668,7 +1823,7 @@ function invisibleBlock() {
 // options.blockTruncated or ZN_BLOCK_TRUNCATED=1 (the former opt-in) still
 // forces the block and wins over the opt-out.
 function truncatedBlocks(options) {
-  if (options.blockTruncated === true || process.env.ZN_BLOCK_TRUNCATED === '1') return true;
+  if (options.blockTruncated === true || envFlag('ZN_BLOCK_TRUNCATED')) return true;
   return !(options.allowTruncated === true || process.env.ZN_ALLOW_TRUNCATED === '1');
 }
 
@@ -1837,7 +1992,9 @@ module.exports = {
     CREDENTIAL_PLACEHOLDER_WORDS, CREDENTIAL_CODE_RE, CREDENTIAL_IDENTIFIER_RE, CREDENTIAL_PATH_RE,
     CREDENTIAL_FILE_NAME_RE, CREDENTIAL_HOST_NAME_RE, CREDENTIAL_SLUG_RE, CREDENTIAL_SLUG_SHORT_WORD_RE, CREDENTIAL_OBJECT_NAME_RE,
     CREDENTIAL_DOTTED_WORDS_RE, CREDENTIAL_FILE_EXT_RE, CREDENTIAL_LETTERS_RE, CREDENTIAL_DESCRIPTIVE_WORDS, CREDENTIAL_HEX_RE, WORD_TOKEN_RE,
+    PATH_HOME_VAR_RE, PATH_CWD_VAR_RE, PATH_WORD_SPLIT_RE, PATH_QUOTE_RE, PATH_TILDE_USER_RE, PATH_DRIVE_RE,
   },
+  sensitivePathView,
   SECRET_PATTERNS,
   SCAN_SECRET_PATTERNS,
   RULES_VERSION,

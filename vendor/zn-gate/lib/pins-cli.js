@@ -40,7 +40,10 @@ async function run(args, io = {}) {
     for (const s of servers) {
       process.stdout.write('  ' + s.key + '  ' + s.command + '\n');
       process.stdout.write('      ' + s.tools + ' tool(s) pinned' + (s.pinnedAt ? ' ' + s.pinnedAt : '') + '\n');
-      if (s.pending.length) process.stdout.write('      changed or new since then: ' + s.pending.slice(0, 20).join(', ') + (s.pending.length > 20 ? ', ...' : '') + '\n');
+      if (s.pending.length) {
+        process.stdout.write('      changed or new since then: ' + s.pending.slice(0, 20).join(', ') + (s.pending.length > 20 ? ', ...' : '') + '\n');
+        for (const c of s.changes) process.stdout.write('        ' + c.tool + ': ' + c.what + '\n');
+      }
     }
     if (servers.some((s) => s.pending.length)) {
       process.stdout.write('\nReview what changed, then accept it with: zn-gate pins approve <server>\n');
@@ -66,6 +69,11 @@ async function run(args, io = {}) {
     const typed = await ask('Type ' + (which === '--all' ? '"all"' : 'the server key') + ' again to approve: ');
     if (typed !== expected) {
       process.stderr.write(messages.PINS_NOT_APPROVED + '\n');
+      return 2;
+    }
+    const asked = await require('./broker/approval-channel').confirmApproval('pins', process.cwd(), which === '--all' ? 'all servers' : 'server ' + String(which).slice(0, 16), { vault: io.vault, env: io.env || process.env, accountVault: io.accountVault });
+    if (!asked.ok) {
+      process.stderr.write('zn-gate pins: ' + String((asked.error && asked.error.message) || 'not confirmed').slice(0, 400) + '\n');
       return 2;
     }
     const r = pins.approve(which);

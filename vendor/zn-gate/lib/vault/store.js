@@ -231,6 +231,10 @@ async function writeEncrypted(file, data, recipient) {
 /* Housekeeping                                                        */
 /* ------------------------------------------------------------------ */
 
+const MAX_PLAUSIBLE_GAP_DAYS = 400;
+const PRUNE_MARK = '.last-prune';
+const PRUNE_SKIPPED = '.prune-skipped-since';
+
 /** Delete project token maps unused for `days` (default 30). Returns count. */
 function pruneStale(opts) {
   const days = (opts && opts.days) || STALE_DAYS;
@@ -238,14 +242,54 @@ function pruneStale(opts) {
   let removed = 0;
   let names = [];
   try { names = fs.readdirSync(dir); } catch (err) { return 0; }
-  const limit = Date.now() - days * 86400000;
+  const now = Date.now();
+  const limit = now - days * 86400000;
+  const maps = [];
+  let newest = -Infinity;
   for (const n of names) {
     if (!PROJECT_FILE_RE.test(n)) continue;
     const f = path.join(dir, n);
     try {
-      if (fs.statSync(f).mtimeMs < limit) { fs.unlinkSync(f); removed++; }
+      const m = fs.statSync(f).mtimeMs;
+      maps.push([f, m]);
+      if (m > newest) newest = m;
     } catch (err) { /* ignore */ }
   }
+  // A wrong clock must never delete token maps (there is no way back): skip when the newest map is dated
+  // in the future, or when now is implausibly far ahead of it.
+  if (maps.length && (newest > now + 86400000 || now - newest > MAX_PLAUSIBLE_GAP_DAYS * 86400000)) {
+    process.stderr.write('zn-gate: vault prune skipped, the system clock looks wrong\n');
+    return 0;
+  }
+  // The clock can also be wrong by 31 to 400 days, which the checks above cannot see. So every prune that
+  // runs on a sane clock records its time on disk, and a later prune only deletes while the clock is within
+  // `days` of that record. A jump ahead skips the prune and the record is not moved, so a wrong clock cannot
+  // approve itself. The skip is time-bound (a user who was simply away must not keep stale maps for ever):
+  // the first skip notes its time, and once the clock has kept running for 7 days since then it is accepted.
+  // If the clock returns to normal before that, the next prune deletes as usual and the note is cleared.
+  const run = paths(opts).runDir;
+  const marker = path.join(run, PRUNE_MARK);
+  const skipFile = path.join(run, PRUNE_SKIPPED);
+  let last = NaN;
+  let since = NaN;
+  try { last = Number(fs.readFileSync(marker, 'utf8').trim()); } catch (err) { /* no record yet */ }
+  try { since = Number(fs.readFileSync(skipFile, 'utf8').trim()); } catch (err) { /* not skipping */ }
+  if (maps.length && Number.isFinite(last) && now - last > days * 86400000) {
+    if (!(Number.isFinite(since) && now - since >= 7 * 86400000)) {
+      if (!Number.isFinite(since)) {
+        try { fs.mkdirSync(run, { recursive: true, mode: 0o700 }); fs.writeFileSync(skipFile, String(now), { mode: 0o600 }); } catch (err) { /* ignore */ }
+      }
+      process.stderr.write('zn-gate: vault prune skipped, the system clock looks wrong; it resumes after 7 days unless the clock is fixed\n');
+      return 0;
+    }
+  }
+  for (const [f, m] of maps) {
+    try {
+      if (m < limit) { fs.unlinkSync(f); removed++; }
+    } catch (err) { /* ignore */ }
+  }
+  try { fs.mkdirSync(run, { recursive: true, mode: 0o700 }); fs.writeFileSync(marker, String(now), { mode: 0o600 }); } catch (err) { /* ignore */ }
+  try { fs.unlinkSync(skipFile); } catch (err) { /* none */ }
   return removed;
 }
 

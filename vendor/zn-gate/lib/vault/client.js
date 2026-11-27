@@ -66,7 +66,7 @@ const CONFIRM_TIMEOUT_MS = 150000;
 // zn team join asks two questions in a row (the organization lookup, then the join), each with
 // up to 120 s to answer, so the join waits longer than the other confirmed operations.
 const JOIN_CONFIRM_TIMEOUT_MS = 300000;
-const CONFIRMED_OPS = new Set(['recordApproval', 'updateSecretMeta', 'confirmFileWrite', 'readBackup', 'teamJoin', 'teamLeave', 'confirmOrgOpening']); // teamLeave also asks the server (10 s at most)
+const CONFIRMED_OPS = new Set(['recordApproval', 'updateSecretMeta', 'confirmFileWrite', 'confirmApproval', 'readBackup', 'teamJoin', 'teamLeave', 'confirmOrgOpening']); // teamLeave also asks the server (10 s at most)
 // Network calls to the zn cloud (policy download and audit upload).
 const NETWORK_OPS = new Set(['teamSync']);
 const NETWORK_TIMEOUT_MS = 120000;
@@ -312,10 +312,12 @@ class VaultClient {
   isApproved(project, secret, argv0) { return this.call('isApproved', approvalArgs(Array.from(arguments))); }
   recordApproval(project, secret, argv0) { return this.call('recordApproval', approvalArgs(Array.from(arguments))); }
   confirmFileWrite(project, file, names, reason) { return this.call('confirmFileWrite', [project, file, names, reason]); }
+  confirmApproval(kind, project, summary) { return this.call('confirmApproval', [kind, project, summary]); }
   teamJoin(args) { return this.call('teamJoin', [args || {}]); }
   teamLeave() { return this.call('teamLeave', []); }
   teamInfo() { return this.call('teamInfo', []); }
-  teamHookInfo() { return this.call('teamHookInfo', []); }
+  teamHookInfo(args) { return this.call('teamHookInfo', args ? [args] : []); }
+  teamChangeShown(to) { return this.call('teamChangeShown', [to]); }
   teamSync(args) { return this.call('teamSync', [args || {}]); }
   confirmOrgOpening(secret, kind, value, agent, agentTrusted) { return this.call('confirmOrgOpening', [secret, kind, value, agent || null, agentTrusted === true]); }
   status() { return this.call('status', []); }
@@ -354,6 +356,7 @@ async function updateSecretMeta(name, meta) { return client().updateSecretMeta(n
 async function isApproved(project, secret, argv0) { return client().isApproved(...arguments); }
 async function recordApproval(project, secret, argv0) { return client().recordApproval(...arguments); }
 async function confirmFileWrite(project, file, names, reason) { return client().confirmFileWrite(project, file, names, reason); }
+async function confirmApproval(kind, project, summary) { return client().confirmApproval(kind, project, summary); }
 async function adoptToken(project, token, name, meta) { return client().adoptToken(project, token, name, meta); }
 async function sameSecretValue(name, value) { return client().sameSecretValue(name, value); }
 async function readBackup(project, name, file) { return client().readBackup(project, name, file); }
@@ -373,6 +376,7 @@ module.exports = {
   isApproved,
   recordApproval,
   confirmFileWrite,
+  confirmApproval,
   adoptToken,
   sameSecretValue,
   readBackup,

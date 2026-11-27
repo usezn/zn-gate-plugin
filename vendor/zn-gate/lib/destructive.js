@@ -21,11 +21,14 @@
  *   fork_bomb        the classic shell fork bomb
  *   rc_download     a download written into a shell startup file
  *
+ * A cd or pushd earlier in the same command line is followed: after `cd ~ && find . -delete` the "." is the home folder.
+ * A cd made by an earlier tool call, or inside a subshell or a pipeline, is not seen.
+ *
  * The command is split with the hook policy's own tokenizer (scanFirstCommand),
  * so quotes and escapes read the same as in the rest of the policy.
  */
 
-const COMMAND_RULES_VERSION = '2026-10-29.5';
+const COMMAND_RULES_VERSION = '2026-11-16.29';
 
 const REASONS = {
   rm_root_home: 'it deletes the home folder, the filesystem root or a system folder, recursively',
@@ -45,6 +48,7 @@ const MAX_CHARS = 200 * 1024;
 const QUOTE_SCAN_MAX = 20000;
 
 const ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const shellVars = require('./shell-vars');
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'mksh', 'rbash']);
 const POWERSHELLS = new Set(['pwsh', 'powershell']);
 const DOWNLOADERS = new Set(['curl', 'wget', 'iwr', 'irm', 'invoke-webrequest', 'invoke-restmethod', 'aria2c', 'fetch']);
@@ -52,7 +56,12 @@ const RM_HEADS = new Set(['rm', 'remove-item', 'ri', 'del', 'erase', 'rd', 'rmdi
 const CMD_HEADS = new Set(['rd', 'rmdir', 'del', 'erase']);
 const DISK_TOOLS = /^(?:mkfs(?:\.[a-z0-9]+)?|mke2fs|mkswap|wipefs|shred|blkdiscard)$/;
 const FIND_TESTS = /^-(?:i?name|i?path|i?wholename|i?regex|type|[acm]time|[acm]min|newer\w*|size|user|group|perm|empty|links|inum|samefile|executable|readable|writable|uid|gid)$/;
-const SUDO_ARG_FLAGS = new Set(['-u', '-g', '-h', '-p', '-C', '-T', '-r', '-t', '-U', '-D', '-R']);
+// Words that start a command without being one: a group, the branches of if / while / until / for, and negation.
+const SHELL_KEYWORDS = new Set(['{', 'then', 'do', 'else', 'elif', 'if', 'while', 'until', '!']);
+const SUDO_ARG_FLAGS = new Set(['-u', '-g', '-h', '-p', '-C', '-T', '-r', '-t', '-U', '-D', '-R', '--user', '--group', '--host', '--prompt',
+  '--close-from', '--other-user', '--role', '--type', '--command-timeout', '--chroot']);
+// More words than this that could each be the command behind an unsure wrapper chain: the line is refused, not guessed at.
+const LATER_HEADS_MAX = 64;
 
 const SYSTEM_DIRS = new Set(['/bin', '/boot', '/dev', '/etc', '/home', '/lib', '/lib32', '/lib64', '/opt', '/proc', '/root',
   '/sbin', '/srv', '/sys', '/usr', '/var', '/Users', '/System', '/Library', '/Applications', '/private', '/Volumes']);
@@ -64,8 +73,14 @@ const RC_PS_RE = /^\$profile(?:\.\w+)?$|(?:^|[\\/])(?:microsoft\.powershell_)?pr
 const QUOTED_RE = /'[^']*'|"(?:[^"\\]|\\.)*"/g;
 const FORK_BOMB_RE = /(?<![\w:])([A-Za-z_:][\w:]*)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}\s*;?\s*\1(?!\w)/;
 // Unquoted command substitutions and process substitutions are not split into words by the tokenizer.
-const SHELL_RUNS_DOWNLOAD_RE = /(?:^|[\s;&|(])(?:eval|(?:ba|z|da|k)?sh\s+(?:-\w+\s+)*-\w*c)\s+["']?(?:\$\(|`)\s*(?:curl|wget)\b/;
-const SOURCE_DOWNLOAD_RE = /(?:^|[\s;&|(])(?:source|\.|(?:ba|z|da|k)?sh)\s+(?:-\w+\s+)*<\(\s*(?:curl|wget)\b/;
+// The downloader inside the substitution may be written \curl, env curl, command -p curl or /usr/bin/curl, and the shell
+// /bin/sh or env sh. Every quantifier below is over a class that cannot also match the separator after it, so the scan is linear.
+const SUBST_DL_SRC = String.raw`(?:(?:env|command|exec|nohup)\s+(?:(?:-\S*|\w+=\S*)\s+)*)?\\?(?:[\w.~-]*\/)*(?:c\\?u\\?r\\?l|w\\?g\\?e\\?t)\b`;
+const SUBST_SHELL_SRC = String.raw`(?:[\w.~-]*\/)*(?:ba|z|da|k)?sh`;
+const SHELL_RUNS_DOWNLOAD_RE = new RegExp(String.raw`(?:^|[\s;&|(])(?:eval|` + SUBST_SHELL_SRC + String.raw`\s+(?:-\w+\s+)*-\w*c)\s+["']?(?:\$\(|` + '`' + String.raw`)\s*` + SUBST_DL_SRC);
+const SOURCE_DOWNLOAD_RE = new RegExp(String.raw`(?:^|[\s;&|(])(?:source|\.|` + SUBST_SHELL_SRC + String.raw`)\s+(?:-\w+\s+)*<\(\s*` + SUBST_DL_SRC);
+// A shell that reads its program from a substitution on stdin: bash < <(curl URL), sh <<< "$(curl URL)".
+const SHELL_STDIN_DOWNLOAD_RE = new RegExp(String.raw`(?:^|[\s;&|(])` + SUBST_SHELL_SRC + String.raw`\s+(?:-\S*\s+)*(?:<\s*<\(|<<<\s*["']?(?:\$\(|` + '`' + String.raw`))\s*` + SUBST_DL_SRC);
 const PS_PIPE_RE = /\b(?:iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget)\b[^|;\n]{0,300}\|\s*(?:iex|invoke-expression)\b|\bdownloadstring\([^)]{0,300}\)\s*\|\s*(?:iex|invoke-expression)\b/i;
 const PS_CALL_RE = /(?:^|[\s;&|(])(?:iex|invoke-expression)\b[\s($]*(?:\(\s*)*(?:iwr|irm|invoke-webrequest|invoke-restmethod|curl|wget|new-object\s+(?:system\.)?net\.webclient)\b/i;
 // PowerShell escapes a character with a backtick (i`wr, Invoke-`Expression). Only a backtick inside a word counts: in
@@ -97,13 +112,21 @@ const OI_HOME_RE = /^(?:(?:os\s{0,20}\.\s{0,20}path\s{0,20}\.\s{0,20})?expanduse
 const OI_LITERAL_RE = /^[rRbBuUfF]{0,2}(['"`])((?:[^'"`\\\r\n]|\\.){0,200})\1/;
 const OI_ENV_HOME_RE = /\$ENV\{['"]?HOME['"]?\}|\$\{?HOME\}?|%USERPROFILE%/gi;
 
+// policy.js requires this file back, so it is loaded on first use. The result is kept: calling require() for every word
+// repeats the module lookup (file-system checks), which is slow on Windows and was most of the time of a long line there.
+let policyCached = null;
+function policyModule() {
+  if (policyCached === null) policyCached = require('./hooks/policy');
+  return policyCached;
+}
+
 function programName(text) {
   return String(text).replace(/^\\+/, '').split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, '');
 }
 
 /* Simple commands of a command line, with the operator that follows each: [{ words: string[], sep }]. */
 function segmentsOf(cmd, posix = false) {
-  const { scanFirstCommand } = require('./hooks/policy');
+  const { scanFirstCommand } = policyModule();
   // 2>&1 and &> are redirections, not the control operator &.
   // A drive root C:\ before a space is a path, not an escaped space.
   let rest = String(cmd).replace(/(\d*[<>]+)&(\d+|-)/g, '$1_$2').replace(/&>>?/g, '>').replace(/(^|[\s"'])([A-Za-z]:)\\(?=\s|$)/g, '$1$2/');
@@ -113,12 +136,33 @@ function segmentsOf(cmd, posix = false) {
     const scan = scanFirstCommand(rest, posix);
     let sep = scan.operator;
     let adv = scan.end + 1;
+    // An unquoted word that starts with # opens a comment: it and the rest of the line are not part of the command.
+    const cAt = scan.words.findIndex((w) => rest[w.start] === '#');
+    if (cAt >= 0) {
+      const nlAt = rest.indexOf('\n', scan.words[cAt].start);
+      scan.words.length = cAt;
+      scan.end = nlAt < 0 ? rest.length : nlAt;
+      sep = nlAt < 0 ? null : '\n';
+      adv = scan.end + 1;
+    }
     if (sep === '|' || sep === '&') {
       const next = rest[scan.end + 1];
       if (next === sep) { sep += sep; adv++; } else if (sep === '|' && next === '&') { sep = '|&'; adv++; }
     }
-    out.push({ words: scan.words.map((w) => w.text), sep });
+    // The text of the command, kept only when it holds a backtick: its substitution starts from the folder reached by then.
+    const raw = rest.slice(0, scan.end);
+    const entry = { words: scan.words.map((w) => w.text), sep, raw: raw.includes('`') ? raw : '', opens: 0 };
+    out.push(entry);
     rest = rest.slice(adv);
+    // A pipe continues over a line break, and its target may be a group: curl URL |<nl>sh, curl URL | (sh).
+    // Each ( dropped here is still a group the line closes later: opens counts them so checkSegments pairs the ) with it.
+    if (sep === '|' || sep === '|&') {
+      const lead = /^(?:\s|\()+/.exec(rest);
+      if (lead) {
+        entry.opens = lead[0].split('(').length - 1;
+        rest = rest.slice(lead[0].length);
+      }
+    }
   }
   // Unread text left over: the caller must not treat the commands read so far as the whole line.
   out.truncated = rest.length > 0;
@@ -127,43 +171,239 @@ function segmentsOf(cmd, posix = false) {
 
 const isPipe = (sep) => sep === '|' || sep === '|&';
 
-/* The words of a command after wrappers that only run it (sudo, env, VAR=x, nohup, nice, time ...). */
-function unwrap(args) {
+const CD_HEADS = new Set(['cd', 'chdir', 'pushd', 'set-location', 'sl', 'push-location']);
+const ANCHORED_RE = /^(?:[\\/~$%]|[A-Za-z]:)/;
+const NOT_CD = Symbol('not-cd');
+// A folder path longer than this (after "." and ".." are resolved) is not followed: the line is refused instead.
+const MAX_CWD_CHARS = 4096;
+const CWD_OVERFLOW = Symbol('cwd-overflow');
+// A folder that stepped above the home folder or a drive root is unknown, and treated as protected for the rest of the line.
+const CWD_LOST = Symbol('cwd-lost');
+
+/* The folder a line has reached is kept as an immutable chain: an anchor (the root, a drive, a home word) and the
+   segments below it, newest first. A cd adds or drops one segment, so the cost of a step does not depend on how long
+   the folder is. kind is 'root', 'drive', 'home' or 'other' (a variable or ~user the line cannot see through). */
+function folderRoot(kind, a) { return { kind, a, up: null, seg: '', n: 0, len: a.length }; }
+
+/* One step from folder `f` (a chain, CWD_LOST or null): a segment name, "." or "..". Returns the new folder, CWD_LOST,
+   null (unknown) or CWD_OVERFLOW. */
+function folderStep(f, seg) {
+  if (f === null || f === CWD_LOST || f === CWD_OVERFLOW) return f;
+  if (seg === '' || seg === '.') return f;
+  if (seg === '..') {
+    if (f.n > 0) return f.up;
+    if (f.kind === 'home') return CWD_LOST;
+    return f.kind === 'other' ? null : f;
+  }
+  const len = f.len + seg.length + 1;
+  if (len > MAX_CWD_CHARS) return CWD_OVERFLOW;
+  return { kind: f.kind, a: f.a, up: f, seg, n: f.n + 1, len };
+}
+
+function folderWalk(f, path) {
+  for (const seg of path.split('/')) {
+    f = folderStep(f, seg);
+    if (f === null || f === CWD_LOST || f === CWD_OVERFLOW) return f;
+  }
+  return f;
+}
+
+/* The folder an anchored word names (absolute, drive, home or variable). */
+function folderOf(word) {
+  const t = String(word).replace(/\s+$/, '').replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  const drive = /^[A-Za-z]:(?:\/|$)/.exec(t);
+  if (t.startsWith('/')) return folderWalk(folderRoot('root', '/'), t.slice(1));
+  if (drive) return folderWalk(folderRoot('drive', t.slice(0, 2) + '/'), t.slice(drive[0].length));
+  const first = t.split('/')[0];
+  return folderWalk(folderRoot(HOME_WORDS.has(first.toLowerCase()) ? 'home' : 'other', first + '/'), t.slice(first.length + 1));
+}
+
+/* The text of the last `m` segments of folder `f`, as a path; when segments are left out it starts at a made-up anchor. */
+function folderText(f, m) {
+  const segs = [];
+  let g = f;
+  for (let i = 0; i < m && g.n > 0; i++, g = g.up) segs.push(g.seg);
+  segs.reverse();
+  const base = g.n > 0 ? '/__' : g.kind === 'root' ? '' : g.a.replace(/\/$/, '');
+  return base + (segs.length ? '/' + segs.join('/') : '');
+}
+
+/* The working folder a cd or pushd leaves behind: a folder chain, CWD_LOST, or null when it cannot be known (cd -, a
+   relative folder from an unknown place, popd). `cwd` is the folder before the command (null = unknown). Returns NOT_CD
+   when the words are not a directory change. */
+function cdTarget(args, cwd) {
+  if (!args.length) return NOT_CD;
+  const head = programName(args[0]);
+  if (head === 'popd' || head === 'pop-location') return null;
+  if (!CD_HEADS.has(head)) return NOT_CD;
+  // cmd.exe's /d (change the drive too) is an option, not the folder.
+  let ops = args.slice(1).filter((w) => (!/^-[A-Za-z]+$/.test(w) || w === '-') && !((head === 'cd' || head === 'chdir') && /^\/d$/i.test(w)));
+  if (ops[0] === '--') ops = ops.slice(1);
+  // A bare cd goes home; a bare pushd swaps directories, which is not known here.
+  if (!ops.length) return head === 'pushd' || head === 'push-location' ? null : folderOf('~');
+  const t = ops[0];
+  if (t === '-') return null;
+  // Anchored words (absolute, drive, home or variable) name the folder on their own; a relative word follows the old folder.
+  if (ANCHORED_RE.test(t)) return folderOf(t);
+  return folderRel(cwd, t);
+}
+
+/* A relative folder word followed from the folder `cwd` (null = unknown). */
+function folderRel(cwd, w) {
+  if (cwd === null || cwd === undefined) return null;
+  return folderWalk(cwd, String(w).replace(/\s+$/, '').replace(/\\/g, '/'));
+}
+
+/* A word read from the folder `cwd`: relative words are joined to it, anchored words are kept. Only as many trailing
+   segments of the folder as the word's ".." can reach (plus four) are written out: a protected folder is at most three
+   segments deep, so the rest cannot change the answer. */
+function fromCwd(cwd, word) {
+  const w = String(word);
+  if (!cwd || !w || ANCHORED_RE.test(w)) return w;
+  if (cwd === CWD_LOST) return '/';
+  const ups = w.split(/[\\/]/).filter((s) => s === '..').length;
+  return folderText(cwd, ups + 4) + '/' + w;
+}
+
+/* The text of every unquoted or double-quoted `...` command substitution of a command, joined into one text to be read
+   as commands, or '' when there is none. An escaped backtick inside one is a nested substitution. One pass over the text. */
+function backtickCode(text) {
+  const bodies = [];
+  let quote = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote === "'") { if (ch === "'") quote = ''; continue; }
+    if (ch === '\\') { i++; continue; }
+    if (ch === '"') { quote = quote === '"' ? '' : '"'; continue; }
+    if (ch === "'" && quote === '') { quote = "'"; continue; }
+    if (ch !== '`') continue;
+    let body = '';
+    let j = i + 1;
+    for (; j < text.length && text[j] !== '`'; j++) {
+      if (text[j] === '\\' && j + 1 < text.length && (text[j + 1] === '`' || text[j + 1] === '\\')) j++;
+      body += text[j];
+    }
+    bodies.push(body);
+    i = j;
+  }
+  return bodies.join('\n');
+}
+
+/* The folder a command runs in when it is wrapped in env -C / sudo -D: `dirs` are the words of its chdir options in
+   order, each read from the folder before it (an anchored word wins, a relative one follows the earlier one); `known`
+   is the folder before the command (null = unknown). */
+function inDir(known, dirs) {
+  for (const d of dirs) {
+    if (known === CWD_OVERFLOW) return known;
+    known = ANCHORED_RE.test(d) ? folderOf(d) : folderRel(known, d);
+  }
+  return known;
+}
+
+function addDir(dirs, w) { if (w) dirs.push(w); }
+
+// Programs that only run another command: more than 32 of them in a row is refused, not read.
+const WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'exec', 'nohup', 'time', 'builtin', 'setsid', 'nice', 'ionice', 'timeout']);
+
+/* One env option word f (args[i - 1]); returns the index of the next word. Options are read like GNU env (getopt_long "+C:iS:u:v0a:"):
+   a short cluster is walked letter by letter, and C, S, u or a take the rest of the cluster or the next word as their value; a long
+   option may be an unambiguous prefix (--split-s, --chd). The -S string is kept for a second reading. */
+const ENV_LONG = ['ignore-environment', 'null', 'unset', 'chdir', 'split-string', 'argv0', 'debug', 'default-signal', 'ignore-signal', 'block-signal', 'list-signal-handling', 'version', 'help'];
+const ENV_LONG_VALUE = new Set(['unset', 'chdir', 'split-string', 'argv0']);
+function envOption(f, args, i, dirs, splits) {
+  const take = (kind, val, hasVal) => {
+    if (!hasVal) { val = i < args.length ? args[i] : undefined; i++; }
+    if (val === undefined) return;
+    if (kind === 'C') addDir(dirs, val);
+    else if (kind === 'S') splits.push(val);
+  };
+  if (f.startsWith('--')) {
+    const eq = f.indexOf('=');
+    const key = eq < 0 ? f.slice(2) : f.slice(2, eq);
+    if (!key) return i;
+    const names = ENV_LONG.filter((n) => n.startsWith(key));
+    const name = names.includes(key) ? key : names.length === 1 ? names[0] : null;
+    if (name && ENV_LONG_VALUE.has(name)) {
+      take(name === 'chdir' ? 'C' : name === 'split-string' ? 'S' : 'u', eq < 0 ? undefined : f.slice(eq + 1), eq >= 0);
+    }
+    return i;
+  }
+  for (let k = 1; k < f.length; k++) {
+    const c = f[k];
+    if (c === 'C' || c === 'S' || c === 'u' || c === 'a') { take(c, f.slice(k + 1), k + 1 < f.length); break; }
+  }
+  return i;
+}
+
+/* The words of a command after wrappers that only run it (sudo, env, VAR=x, nohup, nice, time ...) and shell keywords,
+   with the words of the env -C / --chdir and sudo -D / --chdir options: { args, dir, overflow } (dir = null when none;
+   overflow = more wrappers than can be followed). */
+function unwrapDir(args) {
   let i = 0;
-  for (let guard = 0; guard < 8 && i < args.length; guard++) {
+  const dirs = [];
+  const splits = [];
+  // Where the words after the last -S value start: the string is read in place of the option, so what follows it
+  // (options env had taken, such as the -rf of env -S "-S rm" -rf DIR) belongs to the command the string names.
+  let splitEnd = -1;
+  let overflow = false;
+  // Set when the chain may not end on the program (see policy.skipWrapper): the caller also reads the later words.
+  const chain = { unsure: false };
+  // Where the first wrapper starts: when the chain is unsure, the words it skipped as option values are read as commands too.
+  let first = -1;
+  for (let guard = 0; i < args.length; guard++) {
+    // Assignments and keywords can repeat without limit (! ! ! rm -rf ~): they are skipped, not counted as wrappers.
+    // So are the words that only introduce a command: function NAME { ...; } (the body is read like any other commands,
+    // called or not) and coproc [NAME] { ...; } / coproc CMD (the command runs as a background job).
+    while (i < args.length) {
+      const w = args[i];
+      if (ASSIGN_RE.test(w) || SHELL_KEYWORDS.has(w)) i++;
+      else if (w === 'function' && i + 1 < args.length) i += 2;
+      else if (w === 'coproc') i += i + 2 < args.length && SHELL_KEYWORDS.has(args[i + 2]) ? 2 : 1;
+      else break;
+    }
+    if (i >= args.length) break;
     const a = args[i];
-    if (ASSIGN_RE.test(a)) { i++; continue; }
     const name = programName(a);
+    // The guard is used up and the next word is still a wrapper: the rest cannot be read, so the line is refused.
+    if (guard >= 32) { overflow = WRAPPERS.has(name) || policyModule().WRAPPER_NAMES.has(name); break; }
+    if (first < 0 && (name === 'sudo' || name === 'doas' || name === 'env' || policyModule().WRAPPER_NAMES.has(name))) first = i;
     if (name === 'sudo' || name === 'doas') {
       i++;
-      while (i < args.length && args[i].startsWith('-')) { const f = args[i++]; if (SUDO_ARG_FLAGS.has(f)) i++; }
+      while (i < args.length && args[i].startsWith('-')) {
+        const f = args[i++];
+        if (f === '-D' || f === '--chdir') { addDir(dirs, args[i++]); continue; }
+        if (/^-D./.test(f)) { addDir(dirs, f.slice(2)); continue; }
+        if (f.startsWith('--chdir=')) { addDir(dirs, f.slice(8)); continue; }
+        if (SUDO_ARG_FLAGS.has(f)) { i++; continue; }
+        // A flag zn does not know may take a value (a cluster such as -Eu root, a newer option).
+        if (!/^--[^=]+=/.test(f)) chain.unsure = true;
+      }
       continue;
     }
     if (name === 'env') {
       i++;
-      while (i < args.length && (args[i].startsWith('-') || ASSIGN_RE.test(args[i]))) { const f = args[i++]; if (f === '-u' || f === '-C' || f === '-S') i++; }
+      while (i < args.length && (args[i].startsWith('-') || ASSIGN_RE.test(args[i]))) {
+        const f = args[i++];
+        if (!f.startsWith('-')) continue;
+        const before = splits.length;
+        i = envOption(f, args, i, dirs, splits);
+        if (splits.length > before) splitEnd = i;
+      }
       continue;
     }
-    if (name === 'command' || name === 'exec' || name === 'nohup' || name === 'time' || name === 'builtin' || name === 'setsid') {
-      i++;
-      while (i < args.length && args[i].startsWith('-')) i++;
-      continue;
-    }
-    if (name === 'nice' || name === 'ionice') {
-      i++;
-      while (i < args.length && args[i].startsWith('-')) { const f = args[i++]; if (f === '-n' || f === '-c') i++; }
-      continue;
-    }
-    if (name === 'timeout') {
-      i++;
-      while (i < args.length && args[i].startsWith('-')) i++;
-      i++; // the duration
+    // Every other wrapper of the shared list (nohup, nice, ionice, timeout, stdbuf, command, exec, xargs, busybox ...).
+    const P = policyModule();
+    if (P.WRAPPER_NAMES.has(name)) {
+      i = P.skipWrapper(args, i, name, chain);
       continue;
     }
     break;
   }
-  return args.slice(i);
+  return { args: args.slice(i), dir: dirs.length ? dirs : null, splits, splitTail: splitEnd >= 0 ? args.slice(splitEnd) : [], overflow, unsure: chain.unsure, all: first >= 0 ? args.slice(first) : args };
 }
+
+/* The words of a command after wrappers and shell keywords. */
+function unwrap(args) { return unwrapDir(args).args; }
 
 /* Resolves "." and ".." segments lexically (no filesystem) for a path that starts at a known point: "/", a drive, or a home word.
    A ".." above "/" or a drive root stays there; a ".." that steps out of the home folder names its parent. Relative paths are left alone. */
@@ -314,9 +554,54 @@ function readsScriptFromStdin(kind, rest) {
   return true;
 }
 
-function checkSimple(words, depth) {
-  const args = unwrap(words);
+function checkSimple(words, depth, known) {
+  const un = unwrapDir(words);
+  const args = un.args;
+  if (un.overflow) return OVERFLOW;
+  if (un.dir !== null) {
+    known = inDir(known, un.dir);
+    if (known === CWD_OVERFLOW) return OVERFLOW;
+  }
+  // env -S "rm -rf ~": the split strings (env joins their words in order) are a command line of its own, followed by the
+  // words after them. One reading for all of them, so the cost does not multiply with the number of -S options.
+  // Strings inside strings (env -S "env -S 'rm -rf /home/alice'", env -S "-S rm -rf /home/alice") are read again the same
+  // way, up to MAX_DEPTH levels; a deeper one is refused, not skipped.
+  if (un.splits.length && depth >= MAX_DEPTH) return ENABLED === null || ENABLED.size > 0 ? OVERFLOW : null;
+  if (un.splits.length) {
+    const tail = un.splitTail.map((w) => "'" + w.replace(/'/g, "'\\''") + "'").join(' ');
+    // The string is read as the rest of an env command, so env options inside it (-i, -u NAME, -C DIR, -S) are read too.
+    const text = un.splits.map((x) => x.replace(/\\_/g, ' ').replace(/\\[tnvfr]/g, ' ')).join(' ');
+    const hit = analyze('env ' + text + ' ' + tail, depth + 1, known);
+    if (hit) return hit;
+  }
   if (!args.length) return null;
+  const hit = checkHead(args, depth, known);
+  if (hit || !un.unsure) return hit;
+  // From the first wrapper on, so a word skipped as an option's value is read as a possible command as well.
+  return checkLaterHeads(un.all, depth, known);
+}
+
+/* Whether the rules below read a command with this program name as its head. */
+function headIsRead(name) {
+  return RM_HEADS.has(name) || DISK_TOOLS.test(name) || SHELLS.has(name) || POWERSHELLS.has(name) || name === 'su' || name === 'eval' ||
+    name === 'cmd' || name === 'find' || name === 'chmod' || name === 'chown' || name === 'chgrp' || name === 'dd' || Boolean(interpreterKind(name));
+}
+
+/* A wrapper chain that may not end on the program (an option zn does not know may have taken the next word as its value):
+   each later word that names a program these rules read is checked as the head too, so the option cannot hide the command. */
+function checkLaterHeads(args, depth, known) {
+  let n = 0;
+  for (let j = 1; j < args.length; j++) {
+    if (!headIsRead(programName(args[j]))) continue;
+    if (++n > LATER_HEADS_MAX) return OVERFLOW;
+    const hit = checkHead(args.slice(j), depth, known);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/* The rules for one simple command whose head is args[0]. */
+function checkHead(args, depth, known) {
   const head = programName(args[0]);
   const rest = args.slice(1);
 
@@ -334,8 +619,10 @@ function checkSimple(words, depth) {
     const k = rest.findIndex((w) => /^\/[ck]$/i.test(w));
     if (k >= 0) code = rest.slice(k + 1).join(' ');
   }
+  // The code is a download in a substitution (X="$(curl URL)"; sh -c "$X"): the same as sh -c "$(curl URL)".
+  if (code !== null && (SHELLS.has(head) || head === 'su' || head === 'eval') && /^\s*(?:\$\(|`)/.test(code) && SHELL_RUNS_DOWNLOAD_RE.test('sh -c "' + code + '"') && on('pipe_to_shell')) return 'pipe_to_shell';
   if (code !== null && depth < MAX_DEPTH) {
-    const hit = analyze(code, depth + 1);
+    const hit = analyze(code, depth + 1, known);
     if (hit) return hit;
   }
 
@@ -344,21 +631,36 @@ function checkSimple(words, depth) {
   if (kind && on('rm_root_home') && interpreterCode(kind, rest).some((c) => codeDeletesProtected(c))) return 'rm_root_home';
 
   if (RM_HEADS.has(head)) {
-    if ((rest.some((w) => recursiveFlag(w, head)) && operands(rest, head).some((w) => dangerousPath(w))) && on('rm_root_home')) return 'rm_root_home';
+    if ((rest.some((w) => recursiveFlag(w, head)) && operands(rest, head).some((w) => dangerousPath(fromCwd(known, w)))) && on('rm_root_home')) return 'rm_root_home';
   }
   if (head === 'find') {
     const paths = [];
-    for (const w of rest) { if (w.startsWith('-') || w === '(' || w === '!') break; paths.push(w); }
-    const del = rest.includes('-delete') || rest.some((w, i) => w === '-exec' && /^(?:rm|shred)$/.test(programName(rest[i + 1] || '')));
+    // GNU find takes -P, -L, -H, -O<level> and -D <options> before the starting paths; they do not end the list of paths.
+    let first = 0;
+    while (first < rest.length) {
+      if (/^-(?:[PLH]|O\d*)$/.test(rest[first])) first += 1;
+      else if (rest[first] === '-D') first += 2;
+      else break;
+    }
+    for (const w of rest.slice(first)) { if (w.startsWith('-') || w === '(' || w === '!') break; paths.push(w); }
+    // After a cd to a protected folder, a find with no path starts at ".".
+    if (known && !paths.length) paths.push('.');
+    // -execdir, -ok and -okdir run the program like -exec does (in the folder of each file, or after a prompt).
+    const del = rest.includes('-delete') || rest.some((w, i) => /^-(?:exec|execdir|ok|okdir)$/.test(w) && /^(?:rm|shred)$/.test(programName(rest[i + 1] || '')));
     // With a test (-name, -type, -mtime ...) find removes only some files; with none it removes everything below the path.
+    // From the filesystem root even a filtered delete is refused: a test does not make that safe.
     const filtered = rest.some((w) => FIND_TESTS.test(w));
-    if ((del && !filtered && paths.some((w) => dangerousPath(w))) && on('rm_root_home')) return 'rm_root_home';
+    const fromRoot = paths.some((w) => dangerousPath(fromCwd(known, w)) === 'root');
+    if ((del && (!filtered || fromRoot) && paths.some((w) => dangerousPath(fromCwd(known, w)))) && on('rm_root_home')) return 'rm_root_home';
+    // -files0-from FILE (or - for stdin) loads the starting paths from a file the command text does not show, so a delete
+    // over them cannot be checked: refuse it (fail closed). It is never read. Non-deleting uses (-print) stay allowed.
+    if ((del && rest.includes('-files0-from')) && on('rm_root_home')) return 'rm_root_home';
   }
   if (head === 'chmod' || head === 'chown' || head === 'chgrp') {
     if (rest.some((w) => /^-[A-Za-z]*R[A-Za-z]*$/.test(w) || w === '--recursive')) {
       const ops = operands(rest, head);
       const mode = ops[0] || '';
-      const targets = ops.slice(1).map(dangerousPath).filter(Boolean);
+      const targets = ops.slice(1).map((w) => dangerousPath(fromCwd(known, w))).filter(Boolean);
       if ((targets.includes('root') || targets.includes('system')) && on('perm_root')) return 'perm_root';
       if ((head === 'chmod' && targets.includes('home') && worldWritable(mode)) && on('perm_root')) return 'perm_root';
     }
@@ -407,7 +709,7 @@ function expandSequences(w) {
 /* The words a brace list in `w` expands to (c{u,}rl -> curl, cl); just `w` when there is none, and null when there
    are too many: the caller reads that as a match, since the shell runs the first alternative and any of them may be it. */
 function braceAlts(w) {
-  return require('./hooks/policy').expandBraces(expandSequences(String(w)));
+  return policyModule().expandBraces(expandSequences(String(w)));
 }
 
 function isRcTarget(w) {
@@ -415,13 +717,44 @@ function isRcTarget(w) {
   return alts === null || alts.some(isRcPath);
 }
 
-function checkPipeline(pipe) {
+/* The words of a command without its redirections and their targets (>> ~/.bashrc curl URL is curl URL). */
+function stripRedirects(words) {
+  const out = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (/^\d*[<>]>?\|?$/.test(w)) { i++; continue; }
+    if (/^\d*[<>]>?\|?[^<>(\s]/.test(w)) continue;
+    out.push(w);
+  }
+  return out;
+}
+
+/* The folder a segment of a pipeline runs in: `known` (null = unknown) moved by an env -C / sudo -D in front of it. */
+function segmentDir(known, dir) {
+  return dir === null ? known : inDir(known, dir);
+}
+
+/* The words of a pipeline segment from its program on. When the wrapper chain may not end on the program (unwrapDir's
+   unsure) and its head is not a downloader, shell or interpreter, the first later word that is one starts it
+   (curl URL | nice --adj 5 sh). */
+function pipeArgs(un) {
+  const a = un.args;
+  if (!un.unsure || a.length < 2) return a;
+  const isProg = (w) => { const n = programName(w); return DOWNLOADERS.has(n) || SHELLS.has(n) || Boolean(interpreterKind(n)); };
+  if (isProg(a[0])) return a;
+  const j = a.findIndex((w, i) => i > 0 && isProg(w));
+  return j > 0 ? a.slice(j) : a;
+}
+
+function checkPipeline(pipe, known = null) {
   const heads = pipe.map((s) => {
-    const a = unwrap(s.words);
+    const un = unwrapDir(stripRedirects(s.words));
+    const a = pipeArgs(un);
     const alts = a.length ? braceAlts(a[0]) : [''];
     const names = (alts || [String(a[0])]).map(programName);
-    return { args: a, head: names[0], names, overflow: alts === null };
+    return { args: a, head: names[0], names, overflow: alts === null, dir: segmentDir(known, un.dir) };
   });
+  if (heads.some((h) => h.dir === CWD_OVERFLOW)) return OVERFLOW;
   const firstDl = heads.findIndex((h) => h.overflow || h.names.some((n) => DOWNLOADERS.has(n)));
   if (firstDl >= 0) {
     // a download whose output reaches a shell
@@ -451,8 +784,11 @@ function checkPipeline(pipe) {
         else if (/^\d*>>?\|?.+$/.test(w)) target = w.replace(/^\d*>>?\|?/, '');
         else if (outFlag(prev)) target = w;
         else if (/^(?:--output|--output-document|-OutFile)[=:]/i.test(w)) target = w.replace(/^[^=:]*[=:]/, '');
+        else if (/^-[A-Za-z]*?[oO][^\s]/.test(w)) target = w.replace(/^-[A-Za-z]*?[oO]/, ''); // curl -o$HOME/.bashrc
         else if (heads[j].head === 'tee' && !w.startsWith('-') && i > 0) target = w;
-        if ((target !== null && isRcTarget(target)) && on('rc_download')) return 'rc_download';
+        else if (heads[j].head === 'dd' && w.startsWith('of=')) target = w.slice(3);
+        // A relative file is read from the folder an earlier cd, pushd or env -C moved to.
+        if ((target !== null && isRcTarget(fromCwd(heads[j].dir, target))) && on('rc_download')) return 'rc_download';
       }
     }
   }
@@ -467,22 +803,81 @@ function checkPipeline(pipe) {
 let ENABLED = null;
 function on(rule) { return ENABLED === null || ENABLED.has(rule); }
 
-function checkSegments(segs, depth) {
-  let pipe = [];
-  for (const seg of segs) {
-    const hit = checkSimple(seg.words, depth);
+// Most backtick substitutions read from a changed folder in one command line; past it the line is refused.
+const MAX_TICK_READS = 200;
+
+// Most combinations of readings checked for one pipeline; past it the line is refused.
+const MAX_PIPE_READINGS = 64;
+
+/* A pipeline whose commands each have several readings is checked once for every combination. */
+function checkPipelineReadings(pipe, known) {
+  let total = 1;
+  for (const r of pipe) {
+    total *= r.length;
+    if (total > MAX_PIPE_READINGS) return OVERFLOW;
+  }
+  const idx = pipe.map(() => 0);
+  for (let n = 0; n < total; n++) {
+    const hit = checkPipeline(pipe.map((r, i) => r[idx[i]]), known);
     if (hit) return hit;
-    pipe.push(seg);
+    for (let i = idx.length - 1; i >= 0; i--) { if (++idx[i] < pipe[i].length) break; idx[i] = 0; }
+  }
+  return null;
+}
+
+/* `cwd0` is the folder a cd or pushd earlier in the same command line moved to (null = unknown). A cd inside a pipeline or a background command runs in a subshell and does not count. */
+function checkSegments(segs, depth, cwd0 = null) {
+  let pipe = []; // the commands of the current pipeline: for each, its readings (one per value its variables may hold)
+  let known = cwd0; // the folder reached so far: a chain, CWD_LOST, or null when unknown
+  // A ( group runs in a subshell: a cd inside it does not move the folder of what follows the ). Each "(" saves the folder.
+  const groups = [];
+  let ticks = 0;
+  const vars = shellVars.newScope();
+  for (let seg of segs) {
+    // Literal variables assigned earlier on the line are filled in (X=curl; $X url | sh). A variable an assignment may not
+    // have changed (after &&, in an if, ...) holds each of its values, and every reading is checked.
+    const readings = shellVars.applyVariants(vars, seg.words, seg.sep, seg.opens || 0);
+    if (vars.overflow) return OVERFLOW;
+    if (seg.sep === '(' && groups.length < MAX_SEGMENTS) groups.push(known);
+    const segs1 = readings.map((words) => (words === seg.words ? seg : { ...seg, words }));
+    for (const s1 of segs1) {
+      const hit = checkSimple(s1.words, depth, known);
+      if (hit) return hit;
+    }
+    seg = segs1[0];
+    // A command substitution in backticks starts in the folder the line has reached, like $( ) and sh -c. While the folder is
+    // still the one the line started in, the whole-line reading in analyze() has already covered it.
+    if (seg.raw && known !== cwd0 && depth < MAX_DEPTH) {
+      if (++ticks > MAX_TICK_READS) return OVERFLOW;
+      const inner = backtickCode(seg.raw);
+      const innerHit = inner ? analyze(inner, depth + 1, known) : null;
+      if (innerHit) return innerHit;
+    }
+    if (seg.sep !== '|' && seg.sep !== '|&' && seg.sep !== '&') {
+      // A cd whose target depends on which value a variable holds leaves the folder unknown (protected).
+      let to = NOT_CD;
+      for (const s1 of segs1) {
+        const t = cdTarget(unwrap(s1.words), known);
+        if (t === CWD_OVERFLOW) return OVERFLOW;
+        if (segs1.length === 1) to = t;
+        else if (t !== NOT_CD) to = CWD_LOST;
+      }
+      if (to !== NOT_CD) known = to;
+    }
+    pipe.push(segs1);
     if (!isPipe(seg.sep)) {
-      const hit2 = checkPipeline(pipe);
+      const hit2 = checkPipelineReadings(pipe, known);
       if (hit2) return hit2;
       pipe = [];
     }
+    // A ( dropped after a pipe (curl URL | (sh)) opens a group of its own: save the folder so its ) pops that entry, not the enclosing one.
+    for (let i = 0; i < (seg.opens || 0) && groups.length < MAX_SEGMENTS; i++) groups.push(known);
+    if (seg.sep === ')' && groups.length) known = groups.pop();
   }
-  return pipe.length ? checkPipeline(pipe) : null;
+  return pipe.length ? checkPipelineReadings(pipe, known) : null;
 }
 
-function analyze(cmd, depth = 0) {
+function analyze(cmd, depth = 0, known = null) {
   const text = String(cmd);
   if (text.length > MAX_CHARS) return ENABLED === null || ENABLED.size > 0 ? OVERFLOW : null;
   // Text inside quotes is data (echo "a fork bomb is :(){ :|:& };:"); the code a shell runs from a string is checked
@@ -495,22 +890,28 @@ function analyze(cmd, depth = 0) {
   const psBare = bare.includes('`') || bare.includes('\n')
     ? bare.replace(/`\r?\n/g, ' ').replace(PS_TICK_RE, '').replace(PS_NEXT_PIPE_RE, ' |')
     : bare;
-  if ((SHELL_RUNS_DOWNLOAD_RE.test(text) || SOURCE_DOWNLOAD_RE.test(bare) || PS_PIPE_RE.test(psBare) || PS_CALL_RE.test(psBare)) && on('pipe_to_shell')) return 'pipe_to_shell';
+  if ((SHELL_RUNS_DOWNLOAD_RE.test(text) || SOURCE_DOWNLOAD_RE.test(bare) || SHELL_STDIN_DOWNLOAD_RE.test(text) || PS_PIPE_RE.test(psBare) || PS_CALL_RE.test(psBare)) && on('pipe_to_shell')) return 'pipe_to_shell';
   if ((PS_DISK_RE.test(bare)) && on('disk_overwrite')) return 'disk_overwrite';
   const segs = segmentsOf(text);
-  const hit = checkSegments(segs, depth);
+  const hit = checkSegments(segs, depth, known);
   if (hit) return hit;
+  // A command substitution in backticks runs its text as commands (echo `rm -rf ~`); read them like a sh -c string.
+  if (depth < MAX_DEPTH && text.includes('`')) {
+    const inner = backtickCode(text);
+    const innerHit = inner ? analyze(inner, depth + 1, known) : null;
+    if (innerHit) return innerHit;
+  }
   // POSIX reading: an unquoted backslash escapes the next character and is removed (r\m, cu\rl, .bash\rc). The Windows
   // reading above keeps it as a path separator and runs first, so this one only adds blocks: any rule it hits counts.
   if (text.includes('\\')) {
-    const posixHit = checkSegments(segmentsOf(text, true), depth);
+    const posixHit = checkSegments(segmentsOf(text, true), depth, known);
     if (posixHit) return posixHit;
   }
   // ANSI-C quoting: bash reads $'\x63url' as curl. The words are decoded the way bash does, then read again; as above,
   // this reading only adds a block, and only for the rules that name a program, a file or a path ($'\x73h',
   // $'.bash\x72c', $'\x72m' -rf $'\x7e').
   if (text.includes("$'")) {
-    const ansiHit = checkSegments(segmentsOf(require('./hooks/policy')._decodeAnsiC(text), true), depth);
+    const ansiHit = checkSegments(segmentsOf(policyModule()._decodeAnsiC(text), true), depth, known);
     if (ansiHit === 'pipe_to_shell' || ansiHit === 'rc_download' || ansiHit === 'rm_root_home') return ansiHit;
   }
   // Fail closed: never allow a line whose tail was not read.
@@ -542,7 +943,8 @@ function denial(command, rules) {
   let hit;
   try { hit = analyze(command, 0); } finally { ENABLED = saved; }
   if (!hit) return null;
-  return 'zn blocked this: ' + (REASONS[hit] || OVERFLOW_REASON) + '. Ask the user to confirm before running this command. If they want it, they can run it in their own terminal; do not run it yourself.';
+  return 'zn blocked this: ' + (REASONS[hit] || OVERFLOW_REASON) + ' (rule: destructive:' + hit + '). ' +
+    'Ask the user to confirm before running this command. If they want it, they can run it in their own terminal; do not run it yourself.';
 }
 
 /** The rules the agent hooks apply when the user has not changed anything. The other four are opt-in. */

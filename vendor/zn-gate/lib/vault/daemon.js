@@ -344,6 +344,12 @@ function headKey(secrets) {
   return secrets.auditHead ? secrets.auditHead.seq + ':' + secrets.auditHead.mac : '';
 }
 
+/* Plain message for a log that could not be read (a permission problem, a failing disk). */
+function readErrorText(err) {
+  const code = err && err.code ? String(err.code).replace(/[^A-Za-z0-9_]/g, '').slice(0, 40) : '';
+  return 'the audit log cannot be read' + (code ? ' (' + code + ')' : '') + '; this is a read error, not a sign that it was changed. Next step: check the permissions and free space of ~/.zn/audit.jsonl, then try again.';
+}
+
 function chainStatus(state, opts) {
   const secrets = state.secrets;
   if (!secrets) throw znError(CODES.LOCKED, 'vault locked');
@@ -364,9 +370,10 @@ function chainStatus(state, opts) {
   state.chainCache = null;
   let r;
   try {
-    r = audit.verify({ file, key: Buffer.from(secrets.auditKey, 'hex'), checkpoint: secrets.auditHead });
+    r = audit.verify({ file, key: Buffer.from(secrets.auditKey, 'hex'), checkpoint: secrets.auditHead, hash: true });
   } catch (err) {
-    r = { ok: false, records: 0, error: 'the audit log cannot be read' };
+    // An IO error is not evidence of tampering: report it, keep the checkpoint, store no mark.
+    return { ok: false, records: 0, readError: true, error: readErrorText(err) };
   }
   if (!r.ok) {
     recordTamper(state, r.error + (r.line ? ' (record ' + r.line + ')' : ''), null);
@@ -513,6 +520,7 @@ function makeOps(state, ctl) {
     const trusted = purpose === 'http' && o.agentTrusted === true && agentId !== null;
     const [eff] = await team.effectiveList([localOf(inner, s)], agentId, trusted);
     if (eff && eff.deny) {
+      if (eff.denyReason === 'policy:org_invalid') return refuse('policy:org_invalid', 'secret ' + inner + ' is blocked: ' + messages.TEAM_POLICY_UNVERIFIED);
       return refuse('policy:org_deny', 'secret ' + inner + ' is blocked by your organization policy. Next step: do not use this secret here. If the task needs it, review the organization policy, or, if you are an agent, ask the user.');
     }
     const meta = eff || localOf(inner, s);
@@ -835,6 +843,25 @@ function makeOps(state, ctl) {
       return true;
     },
 
+    /* `zn audit --approve` and `zn-gate pins approve`: the person's decision, asked on the daemon's own channel (its terminal or an OS
+     * dialog), never on the terminal of the command that asked, so an agent that holds a pseudo-terminal cannot answer for them. */
+    async confirmApproval(kind, project, summary) {
+      const what = { audit: 'approve the executable configuration of a project?', pins: 'approve changed MCP tools?' }[kind];
+      if (!what) throw znError(CODES.POLICY_DENIED, 'unknown approval. Next step: nothing was changed.');
+      const shown = (v, n) => String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, '?').slice(0, n);
+      await confirmOutOfBand({
+        kind: 'config-approval',
+        title: what,
+        warnings: [kind === 'audit'
+          ? 'zn audit --approve records the MCP servers, hooks, permissions and install scripts of this project as the ones you accept; a later change is reported against them.'
+          : 'zn-gate pins approve accepts the MCP tools that changed since you approved them; the agent will be able to use them.'],
+        fields: [['Project', shown(project, 300)], ['What', shown(summary, 300)]],
+        footer: 'If you did not ask for this, choose Deny.',
+      }, { mode: 'approval:' + kind });
+      writeAudit({ mode: 'approval:' + kind, decision: 'ask:yes', reason: 'approval_confirmed' });
+      return true;
+    },
+
     /* opts.effective: apply the organization policy for opts.agent (what
      * the broker enforces). Without it, the local settings as stored. */
     async listSecrets(opts) {
@@ -851,6 +878,7 @@ function makeOps(state, ctl) {
     teamLeave: team.teamLeave,
     teamInfo: team.teamInfo,
     teamHookInfo: team.teamHookInfo,
+    teamChangeShown: team.teamChangeShown,
     teamSync: team.teamSync,
     confirmOrgOpening: team.confirmOrgOpening,
 
@@ -970,7 +998,13 @@ function makeOps(state, ctl) {
       // The encrypted vault remembers the last record (sequence number and
       // MAC): a lost tail or a replaced one is reported, and the warning is stored.
       const secrets = state.secrets;
-      const r = audit.verify({ file: auditFile, key: Buffer.from(secrets.auditKey, 'hex'), checkpoint: secrets.auditHead });
+      let r;
+      try {
+        r = audit.verify({ file: auditFile, key: Buffer.from(secrets.auditKey, 'hex'), checkpoint: secrets.auditHead });
+      } catch (err) {
+        if (secrets.auditTamper) r = { ok: false, records: 0 };
+        else return { ok: false, records: 0, readError: true, error: readErrorText(err) };
+      }
       if (!r.ok && !secrets.auditTamper) recordTamper(state, r.error + (r.line ? ' (record ' + r.line + ')' : ''), null);
       const t = secrets.auditTamper;
       if (!t) return r;
@@ -997,6 +1031,8 @@ function makeOps(state, ctl) {
       const c = chainStatus(state);
       if (!c.ok) return { ok: false, tampered: c.tampered === true, error: c.error, line: c.line };
       const a = args && typeof args === 'object' ? args : {};
+      // verifyOnly: the caller streams the file itself; the content is not built here (a big log would not fit one message). sha256 and bytes are those of the log bytes that were verified, so the caller can tell whether the file changed afterwards.
+      if (a.verifyOnly === true) return { ok: true, records: c.records, sha256: c.sha256, bytes: c.bytes };
       const r = require('../team/otel').exportAuditFile({ auditFile, since: a.since, installId: a.installId, orgId: a.orgId });
       return Object.assign({ ok: true }, r);
     },
@@ -1205,7 +1241,7 @@ async function serve(opts) {
           } catch (err) {
             const code = err && typeof err.code === 'string' && err.code.startsWith('ZN_') ? err.code : 'ZN_ERROR';
             // Never echo arbitrary error text: it could carry a value.
-            const message = err && err.code && err.code.startsWith('ZN_') ? String(err.message).slice(0, 200) : 'internal error';
+            const message = err && err.code && err.code.startsWith('ZN_') ? String(err.message).slice(0, 200) : (vaultFsMessage(err) || 'internal error');
             send({ id, ok: false, error: { code, message } });
           }
         });
@@ -1411,4 +1447,12 @@ if (require.main === module && process.argv.includes('--serve')) {
   daemonMain(process.argv.slice(2));
 }
 
-module.exports = { serve, unlock, unlockForeground, lock, isRunning, endpoint, DEFAULT_TTL_MS, DEFAULT_IDLE_MS, PROTOCOL, DESTINATION_POLICY, assertPrivateEndpoint };
+/* A disk or permission failure of the vault, in the plain sentences of lib/errors.js, or null for any other error.
+ * Only the code is passed on: the vault file is named as "the vault" (write errors carry no path), so no internal
+ * detail reaches the person. Values never appear here. */
+function vaultFsMessage(err) {
+  if (!err || typeof err !== 'object') return null;
+  return require('../errors').fsErrorText({ code: err.code, errno: err.errno }, 'the vault');
+}
+
+module.exports = { serve, unlock, unlockForeground, lock, isRunning, endpoint, DEFAULT_TTL_MS, DEFAULT_IDLE_MS, PROTOCOL, DESTINATION_POLICY, assertPrivateEndpoint, vaultFsMessage };

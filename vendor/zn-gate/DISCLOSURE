@@ -22,8 +22,9 @@ It does not need an account. Its source code is open (MIT license).
 2. Changes to the configuration of other programs
 
 zn-gate adds hooks to the configuration of the coding agents it protects:
-Claude Code, Codex CLI, Cursor, OpenCode, Antigravity, the ZCode desktop app
-and, as experimental support, Gemini CLI and GitHub Copilot CLI. A hook is an
+Claude Code, Codex CLI, Cursor, OpenCode, Antigravity, the ZCode desktop app,
+GitHub Copilot (VS Code and Copilot CLI) and, as experimental support, Gemini
+CLI. A hook is an
 entry that tells the agent to ask zn-gate before it runs a tool, reads a file or
 sends a prompt. For OpenCode the hook is a small JavaScript plugin file that
 zn-gate writes into OpenCode's plugins folder. The hooks start a short launcher

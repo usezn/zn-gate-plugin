@@ -10,17 +10,21 @@ const PATCHED_MINIMUM = { 22: '22.23.4', 24: '24.22.1', 26: '26.12.1' };
 const EOL_BELOW = 22;
 const ADVISORY_URL = 'https://nodejs.org/en/blog/vulnerability/october-2026-security-releases';
 
+// Nightly and canary builds are named after the next version and built from its branch: they get no advice.
+const NIGHTLY = /^-(?:nightly|v8-canary)/;
+
 function parse(version) {
   if (typeof version !== 'string') return null;
-  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?/.exec(version.trim());
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3]), m[4] && !NIGHTLY.test(m[4]) ? 1 : 0] : null;
 }
 
+// A prerelease (22.23.4-rc.1, flag 1) sorts below its release (22.23.4), as in semver.
 function atLeast(have, want) {
   for (let i = 0; i < 3; i++) {
     if (have[i] !== want[i]) return have[i] > want[i];
   }
-  return true;
+  return have[3] <= want[3];
 }
 
 /* nodeAdvice('20.19.0') -> null when there is nothing to say (patched, odd-numbered line, newer line, or a
@@ -29,7 +33,7 @@ function nodeAdvice(version) {
   const v = parse(version);
   if (!v) return null;
   const major = v[0];
-  const shown = v.join('.');
+  const shown = v.slice(0, 3).join('.') + (v[3] ? (/-[0-9A-Za-z.-]+/.exec(version) || [''])[0] : '');
   const patched = Object.values(PATCHED_MINIMUM).join(', ');
   if (major % 2 === 0 && major < EOL_BELOW) {
     const minimum = PATCHED_MINIMUM[EOL_BELOW];

@@ -51,6 +51,7 @@ const launcher = require('./launcher');
 const { whichSync } = require('../broker/markers');
 const { shQuote, portablePath } = require('../shell-quote');
 const { writeFileAtomic } = require('../broker/files');
+const { configParseError } = require('../config-parse');
 
 const id = 'zcode';
 
@@ -153,18 +154,33 @@ function firstString(obj, keys) {
 }
 
 /**
+ * Reads a ZCode JSON file for a read-only check, with the same plain-language message as the install paths
+ * (lib/config-parse.js). Returns { data } when it parses, { missing: true } when there is no file, { unreadable: true }
+ * on another read error, and { error } with the message when the text is not JSON. A leading BOM is dropped before
+ * parsing, as lib/agents/config-file.js does. Nothing is written.
+ */
+function readForCheck(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    return err.code === 'ENOENT' ? { missing: true } : { unreadable: true };
+  }
+  try {
+    return { data: JSON.parse(text.replace(/^﻿/, '')) };
+  } catch (err) {
+    return { error: configParseError(file, text, err) };
+  }
+}
+
+/**
  * Whether the "secrets" MCP server a call goes to is zn's own: the user's config names it, and it is zn's
  * (`secrets-mcp` run through zn-gate's bin/cli.js, `zn` or `zn-gate`). ZCode lets the user's server win over a
  * project server of the same name (the official MCP documentation, https://zcode.z.ai/en/docs/mcp-services: to be verified on the desktop app), so a project cannot stand in for it. Anything unreadable gives null.
  */
 function znMcpServerIsOurs(server, opts = {}) {
   if (server !== MCP_SERVER_NAME) return null;
-  let data;
-  try {
-    data = JSON.parse(fs.readFileSync(configFile(opts), 'utf8').replace(/^﻿/, ''));
-  } catch (_) {
-    return null;
-  }
+  const data = readForCheck(configFile(opts)).data;
   const s = data && isObj(data.mcp) && isObj(data.mcp.servers) ? data.mcp.servers[MCP_SERVER_NAME] : undefined;
   if (!s || s.enabled === false) return null;
   return require('./claude-code').isZnSecretsServer(s) ? 'secrets' : null;
@@ -186,9 +202,21 @@ function normalize(raw) {
   if (event === 'user_prompt') return { ...base, tool: null, input: { prompt: typeof raw.prompt === 'string' ? raw.prompt : '' } };
 
   const toolName = typeof (raw.tool_name || raw.toolName) === 'string' ? String(raw.tool_name || raw.toolName) : '';
-  const rawInput = raw.tool_input !== undefined ? raw.tool_input : raw.toolInput;
+  let rawInput = raw.tool_input !== undefined ? raw.tool_input : raw.toolInput;
+  // A JSON string is read as its object. Anything else that is not an object (a number, a list, text that does not parse) cannot be checked.
+  let malformed = false;
+  if (event === 'pre_tool' && rawInput !== undefined && rawInput !== null) {
+    if (typeof rawInput === 'string') {
+      try { rawInput = JSON.parse(rawInput); } catch (_) { malformed = true; }
+    }
+    if (!malformed && !isObj(rawInput)) malformed = true;
+  }
   const args = isObj(rawInput) ? rawInput : {};
   const ev = { ...base, toolName, rawArgs: args };
+  const unreadable = (what) => ({ ...ev, tool: 'unreadable', input: { texts: [] }, unreadable: 'zn: could not read ' + what + ' of this call, so zn cannot check it.' });
+  // Arguments that are not a JSON object are refused before anything else reads the call, MCP tools included
+  // (malformed is only ever set for a pre-tool event).
+  if (malformed) return unreadable('the arguments');
   const mcp = MCP_TOOL_RE.exec(toolName);
 
   if (event === 'post_tool') {
@@ -198,14 +226,14 @@ function normalize(raw) {
     return { ...ev, tool, mcp: mcp ? { server: mcp[1], tool: mcp[2] } : null, input: { texts: [] }, output };
   }
 
-  const unreadable = (what) => ({ ...ev, tool: 'unreadable', input: { texts: [] }, unreadable: 'zn: could not read ' + what + ' of this call, so zn cannot check it.' });
   if (!toolName) return unreadable('the tool name');
 
   // pathsOf is shared with the Gemini CLI adapter: every string argument whose key looks like a file or folder.
   const { pathsOf } = require('./gemini');
   if (mcp) {
     const mp = pathsOf(args);
-    const ours = znMcpServerIsOurs(mcp[1]);
+    // Only an exact tool of zn's server counts (a server named secrets_ or secrets__x parses as server secrets).
+    const ours = require('../broker/secrets-tools').isSecretsToolName(mcp[2]) ? znMcpServerIsOurs(mcp[1]) : null;
     const e = { ...ev, tool: 'mcp', mcp: { server: mcp[1], tool: mcp[2], ...(ours ? { ours } : {}) }, input: { args: rawInput === undefined || rawInput === null ? {} : rawInput, paths: mp.paths, texts: [] } };
     if (mp.bad) e.unreadable = 'zn: could not read a file address in this call, so zn cannot check it.';
     return e;
@@ -223,7 +251,7 @@ function normalize(raw) {
     const tooLong = text.length > PATCH_SCAN_CAP;
     const scan = tooLong ? { files: [], suspicious: false } : patchScan(text);
     const home = os.homedir();
-    const zn = scan.files.find((f) => path.resolve(cwd, f).replace(/\\/g, '/').startsWith(path.join(home, '.zn').replace(/\\/g, '/')));
+    const zn = require('./codex').znStateFile(scan.files, cwd, home);
     return {
       ...ev, tool: 'write', input: { paths: scan.files, path: zn || scan.files[0], tooLong, unparsed: !tooLong && (scan.files.length === 0 || scan.suspicious), texts: [] },
     };
@@ -241,8 +269,24 @@ function normalize(raw) {
     if (!file) e.unreadable = 'zn: could not read the file this call uses, so zn cannot check it. Name the file explicitly.';
     return e;
   }
-  // Any other tool that names a file (a tool zn does not know) gets the read and write checks on every path.
-  const { paths, bad } = pathsOf(args);
+  // Any other tool (one zn does not know): commands and files in its nested arguments, within bounds, get the shell,
+  // read and write checks; arguments zn cannot read to the end are refused.
+  let scanned = null;
+  if (!NAMES_ONLY_TOOLS.has(toolName)) {
+    const scan = require('./copilot').commandScan(args, cwd);
+    scanned = scan;
+    if (scan.bad || scan.truncated) return unreadable(scan.bad ? 'the command' : 'the arguments (too deeply nested)');
+  }
+  const named = pathsOf(args);
+  const loose = NAMES_ONLY_TOOLS.has(toolName) ? { paths: [], bad: false } : require('./copilot').pathsOf(args, { loose: true });
+  const paths = [...new Set([...named.paths, ...loose.paths])];
+  const bad = named.bad || loose.bad;
+  if (scanned && scanned.command !== undefined) {
+    // The command is judged as a shell line, and the files the call also names keep their read and write checks.
+    const e = { ...ev, tool: 'bash', input: { command: scanned.command, alsoPaths: NAMES_ONLY_TOOLS.has(toolName) ? [] : paths, texts: [] } };
+    if (bad && !NAMES_ONLY_TOOLS.has(toolName)) e.unreadable = 'zn: could not read a file address in this call, so zn cannot check it.';
+    return e;
+  }
   if (!NAMES_ONLY_TOOLS.has(toolName) && (paths.length || bad)) {
     const e = { ...ev, tool: 'fileaccess', input: { path: paths[0], paths, texts: [] } };
     if (bad) e.unreadable = 'zn: could not read a file address in this call, so zn cannot check it.';
@@ -326,6 +370,7 @@ function processParts(h) {
 function commandText(h) {
   const parts = processParts(h);
   if (!parts) return h && typeof h.command === 'string' ? h.command : '';
+  if (require('./static-launcher').isStaticLauncher(parts[0])) return require('./static-launcher').execText(parts);
   if (/(^|[\\/])zn-hook-[a-z-]+\.sh$/.test(parts[0])) return shQuote(parts[0]) + (parts.length > 1 ? ' ' + parts.slice(1).join(' ') : '');
   return parts.join(' ');
 }
@@ -349,7 +394,7 @@ function stripOurs(groups) {
  * call run when a hook cannot start, so a Node.js that has gone away must block (exit 2) instead. On Windows the
  * same three steps are an inline PowerShell script. A command given by the caller keeps the plain command.
  */
-function handlerFor(opts = {}) {
+function handlerFor(opts = {}, notes = []) {
   const base = { timeoutMs: ENTRY_TIMEOUT_MS, statusMessage: HOOK_STATUS };
   if (opts.command) return () => ({ type: 'command', command: opts.command, ...base });
   const platform = opts.platform || process.platform;
@@ -364,6 +409,10 @@ function handlerFor(opts = {}) {
     };
   }
   const file = launcher.writeLauncher(id, node, runner, { ...opts, deadlineS: LAUNCHER_DEADLINE_S });
+  // Linux: the static launcher first (see static-launcher.js), which starts the launcher script with no loader variable left.
+  const sl = require('./static-launcher');
+  const st = sl.useStatic(opts, notes, id);
+  if (st) return (event) => ({ type: 'process', command: st, args: sl.execParts(st, id, event, portablePath(file, platform), [event]).slice(1), ...base });
   return (event) => ({ type: 'process', command: portablePath(file, platform), args: [event], ...base });
 }
 
@@ -467,7 +516,9 @@ function install(opts = {}) {
   const { hooks, events } = hooksTree(data, file);
   const servers = mcpServers(data, file, false);
   const report = { settings: file, backup: null, warnings: [] };
-  const ours = hookGroups(handlerFor(opts));
+  const notes = [];
+  const ours = hookGroups(handlerFor(opts, notes));
+  report.warnings.push(...notes);
   const wasOff = hooks.enabled !== true;
   const previousEnabled = hooks.enabled;
   const userHooks = wasOff ? userHookNames(events) : [];
@@ -595,13 +646,16 @@ function uninstall(opts = {}) {
 function configWarnings(opts = {}) {
   const file = opts.file || configFile(opts);
   const out = { problems: [], notes: [], fix: 'run `zn hooks install zcode` in your own terminal (it turns the hooks back on), then run `zn-gate check` again' };
-  let data;
-  try {
-    data = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
-  } catch (err) {
-    if (err.code !== 'ENOENT') out.notes.push('could not read ' + file + ' to see whether hooks are switched on');
+  const r = readForCheck(file);
+  if (r.error) {
+    out.notes.push(r.error);
     return out;
   }
+  if (r.unreadable) {
+    out.notes.push('could not read ' + file + ' to see whether hooks are switched on');
+    return out;
+  }
+  const data = r.data;
   if (!isObj(data)) return out;
   const hooks = isObj(data.hooks) ? data.hooks : {};
   if (hooks.enabled !== true) {
@@ -632,12 +686,8 @@ function configWarnings(opts = {}) {
 function pluginState(opts = {}) {
   const base = path.join(opts.home || os.homedir(), '.zcode', 'cli');
   const out = { root: null, id: null, version: null, enabled: false, pluginsOff: false, listed: false };
-  let list;
-  try {
-    list = JSON.parse(fs.readFileSync(path.join(base, 'plugins', 'installed_plugins.json'), 'utf8').replace(/^﻿/, ''));
-  } catch (_) {
-    return out;
-  }
+  const list = readForCheck(path.join(base, 'plugins', 'installed_plugins.json')).data;
+  if (!list) return out;
   const entries = list && Array.isArray(list.plugins) ? list.plugins : [];
   const mine = entries.find((p) => isObj(p) && typeof p.id === 'string' && /^zn-gate@/.test(p.id) && typeof p.installPath === 'string' &&
     fs.existsSync(path.join(p.installPath, '.zcode-plugin', 'plugin.json')) && fs.existsSync(path.join(p.installPath, 'scripts', 'zn-hook.sh')));
@@ -646,10 +696,7 @@ function pluginState(opts = {}) {
   out.root = mine.installPath;
   out.id = mine.id;
   out.version = typeof mine.version === 'string' ? mine.version : null;
-  let conf = {};
-  try {
-    conf = JSON.parse(fs.readFileSync(path.join(base, 'config.json'), 'utf8').replace(/^﻿/, ''));
-  } catch (_) { conf = {}; }
+  const conf = readForCheck(path.join(base, 'config.json')).data || {};
   const plugins = isObj(conf) && isObj(conf.plugins) ? conf.plugins : {};
   out.pluginsOff = plugins.enabled === false;
   const flags = isObj(plugins.enabledPlugins) ? plugins.enabledPlugins : {};

@@ -62,7 +62,7 @@ function gitStatusOf(file) {
  * The path a file has, or would have once created: the nearest existing
  * ancestor with its symlinks resolved, then the rest of the path as typed.
  */
-function realTargetOf(file) {
+function resolveTarget(file, realpath) {
   const abs = path.resolve(file);
   const root = path.parse(abs).root;
   const parts = abs.slice(root.length).split(path.sep).filter(Boolean);
@@ -78,10 +78,35 @@ function realTargetOf(file) {
     i++;
   }
   try {
-    return path.join(fs.realpathSync(cur), ...parts.slice(i));
+    const real = realpath(cur);
+    return path.join(real, ...parts.slice(i));
   } catch (_) {
     return abs;
   }
+}
+
+function realTargetOf(file) {
+  return resolveTarget(file, fs.realpathSync);
+}
+
+/**
+ * Like realTargetOf, but on Windows it uses the native call, which also turns 8.3 short names (JOSPRE~1\AWS~1\CREDEN~1)
+ * into the long names the protected-path rules read: a short name of a folder with spaces or accents is not a prefix of its
+ * long name. It only adds a candidate path for the rules to check; realTargetOf stays the identity of an approved location.
+ * Elsewhere it is the same as realTargetOf. The platform and the resolver can be passed in for tests.
+ */
+function nativeTargetOf(file, { platform = process.platform, realpath = fs.realpathSync.native } = {}) {
+  return platform === 'win32' ? resolveTarget(file, realpath) : realTargetOf(file);
+}
+
+/**
+ * Every candidate target of a path for the protected-path rules: the realTargetOf result, plus nativeTargetOf on Windows only.
+ * Off Windows nativeTargetOf is that same result, so it is not resolved again (one realpath per candidate, as before on Linux
+ * and macOS paying for a second identical walk). Windows gets exactly the two targets it always had.
+ */
+function targetsOf(file, opts = {}) {
+  const real = realTargetOf(file);
+  return (opts.platform || process.platform) === 'win32' ? [real, nativeTargetOf(file, opts)] : [real];
 }
 
 /**
@@ -101,4 +126,4 @@ function writeFileAtomic(file, data, mode = 0o600) {
   }
 }
 
-module.exports = { gitStatusOf, realTargetOf, writeFileAtomic };
+module.exports = { gitStatusOf, realTargetOf, nativeTargetOf, targetsOf, writeFileAtomic };

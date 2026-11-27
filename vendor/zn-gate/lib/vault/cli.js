@@ -168,7 +168,12 @@ async function readStdin() {
 }
 
 async function getPassphrase(args, creating, prompterOpts) {
-  if (args.includes('--passphrase-stdin')) return readStdin();
+  if (args.includes('--passphrase-stdin')) {
+    const fromStdin = await readStdin();
+    // Nothing piped in (closed or empty stdin): say so, instead of "at least 12 characters".
+    if (fromStdin === '') throw new Error(messages.passphraseStdinEmpty());
+    return fromStdin;
+  }
   const prompter = createHiddenPrompter(prompterOpts);
   try {
     const p1 = await prompter.ask(creating ? 'New vault passphrase (min ' + keychain.MIN_PASSPHRASE + ' chars): ' : 'Vault passphrase: ');

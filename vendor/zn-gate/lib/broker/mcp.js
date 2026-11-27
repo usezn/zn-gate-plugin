@@ -511,7 +511,7 @@ function createSecretsServer(opts = {}) {
     const reason = String(args.reason || '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 300);
     const rec = { ts: new Date().toISOString(), name, reason, agent };
     try {
-      const dir = path.join(home, '.zn');
+      const dir = process.env.ZN_HOME ? require('../stats').znHome() : path.join(home, '.zn');
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       fs.appendFileSync(path.join(dir, 'requests.jsonl'), JSON.stringify(rec) + '\n', { mode: 0o600 });
     } catch (_) { /* best effort */ }

@@ -44,9 +44,12 @@
  *    scrubber) and the ES modules of its bundled dependencies are loaded from
  *    disk by Node after the check, so a change made in between is not seen.
  *  - Whoever controls the environment the agent starts hooks with decides
- *    which `node` runs this file, can preload code with NODE_OPTIONS before
- *    this file starts, and chooses the PATH used to find zn-gate (only an
- *    exact copy of the pinned release passes the check).
+ *    which `node` runs this file and chooses the PATH used to find zn-gate
+ *    (only an exact copy of the pinned release passes the check). The hook
+ *    scripts (scripts/zn-node.sh, the ZCode zn-hook scripts) remove
+ *    NODE_OPTIONS, NODE_PATH and the other loader variables before they
+ *    start Node.js; started any other way, a preload set there runs before
+ *    this file.
  *  - Code running as the user can edit this plugin or ~/.zn/config.json.
  * It reduces what a prompt-injected agent can do through its own tools; it
  * is not a sandbox.
@@ -125,10 +128,13 @@ function loadLock() {
   return lock;
 }
 
+// The marketplace is added at the plugin tag of the pinned version (plugin-v<version>), created on the commit that pins it;
+// a release tag holds the pin of the previous release.
 function installHint(lock) {
   if (lock.bundled) return 'Reinstall the zn-gate plugin to restore its copy of zn-gate ' + lock.version + '.';
   return 'In Claude Code, the plugin installs it: make sure npm is on your PATH, then run ' +
-    'claude plugin update zn-gate@usezn and start a new session. In other agents, install the pinned release with: ' +
+    'claude plugin marketplace remove usezn, claude plugin marketplace add usezn/zn#plugin-v' + lock.version + ' and ' +
+    'claude plugin install zn-gate@usezn, and start a new session. In other agents, install the pinned release with: ' +
     'npm install -g zn-gate@' + lock.version + ' && npm audit signatures (see the plugin README).';
 }
 

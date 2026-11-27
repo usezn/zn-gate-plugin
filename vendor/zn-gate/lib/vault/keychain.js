@@ -397,6 +397,7 @@ module.exports = {
   initIdentity,
   deleteIdentity,
   readMeta,
+  writeMeta,
   MIN_PASSPHRASE,
   DEFAULT_WORK_FACTOR,
   CLOUD_SLOT,

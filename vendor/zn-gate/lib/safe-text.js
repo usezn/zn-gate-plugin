@@ -37,16 +37,28 @@ function isUnsafeText(s) {
   return false;
 }
 
-/** true when any string in a JSON value (a key or a value, at any depth) is unsafe. */
-function hasUnsafeText(value, depth = 0) {
-  if (typeof value === 'string') return isUnsafeText(value);
-  if (value === null || typeof value !== 'object') return false;
-  if (depth > 64) return true; // nothing real nests this deep: refuse rather than stop looking
-  if (Array.isArray(value)) return value.some((v) => hasUnsafeText(v, depth + 1));
-  for (const k of Object.keys(value)) {
-    if (isUnsafeText(k) || hasUnsafeText(value[k], depth + 1)) return true;
+const MAX_DEPTH = 64;
+
+/** Why a JSON value is refused: 'deep' (nested more than 64 levels), 'text' (an unsafe string, a key or a value), or null. */
+function unsafeKind(value, depth = 0) {
+  if (typeof value === 'string') return isUnsafeText(value) ? 'text' : null;
+  if (value === null || typeof value !== 'object') return null;
+  if (depth > MAX_DEPTH) return 'deep'; // nothing real nests this deep: refuse rather than stop looking
+  const items = Array.isArray(value) ? value : null;
+  const keys = items ? null : Object.keys(value);
+  let found = null;
+  for (let i = 0; i < (items ? items.length : keys.length); i++) {
+    if (keys && isUnsafeText(keys[i])) { found = found || 'text'; continue; }
+    const k = unsafeKind(items ? items[i] : value[keys[i]], depth + 1);
+    if (k === 'deep') return 'deep';
+    if (k) found = found || k;
   }
-  return false;
+  return found;
 }
 
-module.exports = { isUnsafeText, hasUnsafeText };
+/** true when any string in a JSON value (a key or a value, at any depth) is unsafe, or the value nests absurdly deep. */
+function hasUnsafeText(value) {
+  return unsafeKind(value) !== null;
+}
+
+module.exports = { isUnsafeText, hasUnsafeText, unsafeKind };

@@ -10,6 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const { writeFileAtomic } = require('../broker/files');
 const { shQuote, portablePath, windowsCommand, windowsCommandScript } = require('../shell-quote');
+const { configParseError } = require('../config-parse');
 
 /**
  * How a JSON file was written, so it can be written back the same way:
@@ -68,7 +69,7 @@ function readJson(file) {
   try {
     data = parseJson(text);
   } catch (err) {
-    throw new Error('cannot parse ' + file + ': ' + err.message + ' (left unchanged)');
+    throw new Error(configParseError(file, text, err));
   }
   if (data === null || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error(file + ' must hold a JSON object, not ' + (data === null ? 'null' : Array.isArray(data) ? 'an array' : typeof data) + ' (left unchanged)');

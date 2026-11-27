@@ -30,6 +30,7 @@
  */
 
 const fs = require('fs');
+const { ASTRAL_CLASS } = require('../invisible');
 
 const DEFAULT_TIMEOUT_MS = 120000;
 const MAX_TEXT = 1500;
@@ -37,9 +38,15 @@ const MAX_FIELD = 300;
 
 // Control, line-break and invisible formatting characters (bidi overrides,
 // zero-width, soft hyphen): they could fake extra lines or reorder text.
-const INVISIBLE = '\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\ufeff\\ufff9-\\ufffb';
-const INVISIBLE_RE = new RegExp('[' + INVISIBLE + ']', 'g');
-const CLEAN_RE = new RegExp('[' + INVISIBLE.replace('\\u0000-\\u001f', '\\u0000-\\u0009\\u000b-\\u001f') + ']', 'g');
+const INVISIBLE = '\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\ufeff\\ufff9-\\ufffb' +
+  // variation selectors and Hangul fillers (they render as blanks)
+  '\\ufe00-\\ufe0f\\u115f\\u1160\\u3164\\uffa0';
+// The same set plus the astral ones (Unicode tag characters U+E0000-E007F and the supplementary variation
+// selectors U+E0100-E01EF): the pattern for text that comes from the organization's admin or server. It has the
+// u flag, so it matches whole code points.
+const INVISIBLE_ANY_RE = new RegExp('[' + INVISIBLE + ASTRAL_CLASS + ']', 'gu');
+const INVISIBLE_RE = INVISIBLE_ANY_RE;
+const CLEAN_RE = new RegExp('[' + INVISIBLE.replace('\\u0000-\\u001f', '\\u0000-\\u0009\\u000b-\\u001f') + ASTRAL_CLASS + ']', 'gu');
 
 /* Free text written by zn itself: keeps newlines, drops other controls. */
 function clean(text) {
@@ -51,7 +58,10 @@ function clean(text) {
  * so both ends stay visible. */
 function field(value, max) {
   const limit = max || MAX_FIELD;
-  let s = String(value == null ? '' : value).replace(INVISIBLE_RE, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+  let s = String(value == null ? '' : value).replace(INVISIBLE_RE, (c) => {
+    const cp = c.codePointAt(0);
+    return cp > 0xffff ? '\\u{' + cp.toString(16) + '}' : '\\u' + cp.toString(16).padStart(4, '0');
+  });
   if (s.length > limit) {
     const keep = limit - 3;
     s = s.slice(0, Math.ceil(keep / 2)) + '...' + s.slice(s.length - Math.floor(keep / 2));
@@ -265,5 +275,6 @@ module.exports = {
   render,
   field,
   INVISIBLE,
+  INVISIBLE_ANY_RE,
   DEFAULT_TIMEOUT_MS,
 };
