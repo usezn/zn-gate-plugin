@@ -1,6 +1,7 @@
 'use strict';
 
 const https = require('https');
+const { deadlineLookup } = require('./dns-deadline');
 const http = require('http');
 const { URL } = require('url');
 const { evaluate, redactSecrets, sanitizeToolResult, RULES_VERSION } = require('./rules');
@@ -16,10 +17,15 @@ try {
  *
  *  - Tool results, tool-call arguments and tool/parameter descriptions are
  *    evaluated ONLY in-process (analyzeLocal / checkToolResult). They never
- *    leave the machine, under any configuration.
- *  - The only code path that can reach the network is analyze() — the
- *    prompt-analysis API used by the `analyze_prompt` MCP tool and the
- *    `zn-gate analyze` CLI command — and only when BOTH ZN_API_KEY and
+ *    leave the machine through this module's own entry points.
+ *  - One opt-in exception (since 1.15): the Claude Code PostToolUse hook
+ *    (lib/hooks/runner.js, cloudOutputNote) passes a capped sample of the
+ *    output of web, MCP and shell tools to analyze() with pinOrigin, only when
+ *    the person ran zn-gate connect and set hooks.cloudCheckToolOutput to true in their own user config (off by default).
+ *  - Text reaches the network only through analyze(), in two cases: prompt
+ *    analysis (the `analyze_prompt` MCP tool and the `zn-gate analyze` CLI
+ *    command) and, as described above, the tool-output sample of the Claude
+ *    Code hook. Either only when BOTH ZN_API_KEY and
  *    ZN_CLOUD=1 are set, or the user ran `zn-gate connect` (and
  *    ZN_LOCAL_ONLY is not "true"). Secrets are redacted locally with
  *    redactSecrets() before the request is built. `connect` and `disconnect`
@@ -68,6 +74,8 @@ function isCloudEnabled(options = {}) {
 
 /** A usable key from --key / ZN_API_KEY together with ZN_CLOUD=1: the person's own, explicit opt-in. */
 function explicitOptIn(options = {}) {
+  // storedOnly (tool output in the hooks): the environment and --key never count, only what `zn-gate connect` saved.
+  if (options.storedOnly) return false;
   return Boolean(usableApiKey(options.apiKey || process.env.ZN_API_KEY)) && process.env.ZN_CLOUD === '1';
 }
 
@@ -104,6 +112,39 @@ function longInputMode(options = {}) {
   return ['off', 'none', 'truncate', '0', 'false', 'no'].includes(v) ? 'off' : 'windows';
 }
 
+// One plain sentence on what a failed cloud call means and what to do (same wording as zn-gate-py).
+function cloudErrorHint(err) {
+  if (err && err.httpStatus) {
+    if (err.httpStatus === 401 || err.httpStatus === 403) return 'The cloud service did not accept the API key: check ZN_API_KEY.';
+    return `The cloud service answered with an error (HTTP ${err.httpStatus}): try again later.`;
+  }
+  if (err && err.code === 'ETIMEDOUT') return 'The cloud service took too long to answer: check your network connection.';
+  if (err && typeof err.code === 'string') return 'The cloud service could not be reached: check your network connection and ZN_API_URL.';
+  return 'The cloud check failed.';
+}
+
+// The cloud gate answers "allow" or "block". The verdict is read once here, without case or surrounding spaces, so every
+// caller compares a lowercase value; any other verdict (missing, empty, unknown) blocks the text: fail closed. A body that
+// is not a JSON object is a failed cloud call (the local rules decide), as in the Python package.
+const UNKNOWN_CLOUD_VERDICT = {
+  verdict: 'block', confidence: 1.0, rule: 'cloud:unknown-verdict',
+  reason: 'The cloud gate answered with a verdict zn does not know, so the text is blocked.',
+};
+function cloudVerdict(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new TypeError('the gateway response is not a JSON object');
+  const v = typeof parsed.verdict === 'string' ? parsed.verdict.trim().toLowerCase() : '';
+  if (v === 'allow' || v === 'block') return { ...parsed, verdict: v };
+  return { ...parsed, ...UNKNOWN_CLOUD_VERDICT };
+}
+
+// When the gate could not reach its model, it still answers from the rules alone and says so in decided_by ("ml-error...").
+// That answer is not a model verdict: it is marked degraded so callers can tell it apart.
+const DEGRADED_REASON = 'model unavailable, rules only';
+function degradedFields(cloudRes) {
+  const decidedBy = typeof cloudRes.decided_by === 'string' ? cloudRes.decided_by.trim().toLowerCase() : '';
+  return decidedBy.startsWith('ml-error') ? { degraded: true, degraded_reason: DEGRADED_REASON } : {};
+}
+
 function analyzeCloud(input, apiKey, endpointUrl, timeoutMs = 4000, extra = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(endpointUrl);
@@ -122,6 +163,8 @@ function analyzeCloud(input, apiKey, endpointUrl, timeoutMs = 4000, extra = {}) 
           'User-Agent': `zn-gate/${PKG_VERSION} (mcp-client)`,
         },
         timeout: timeoutMs,
+        // Name resolution ends within the same time (getaddrinfo alone can take 20 s on a silent network).
+        lookup: deadlineLookup(timeoutMs),
         // Always verify the certificate: NODE_TLS_REJECT_UNAUTHORIZED=0 must not let the key travel unverified.
         ...(isHttps ? { rejectUnauthorized: true } : {}),
       },
@@ -133,12 +176,14 @@ function analyzeCloud(input, apiKey, endpointUrl, timeoutMs = 4000, extra = {}) 
             try {
               const parsed = JSON.parse(body);
               const stageName = endpointUrl.includes('/v30') ? 'cloud-v30' : 'cloud-prod';
-              resolve({ ...parsed, engine: stageName });
+              resolve({ ...cloudVerdict(parsed), engine: stageName });
             } catch (err) {
               reject(new Error(`Failed to parse gateway response: ${err.message}`));
             }
           } else {
-            reject(new Error(`Gateway responded with HTTP ${res.statusCode}: ${body.slice(0, 120)}`));
+            const err = new Error(`Gateway responded with HTTP ${res.statusCode}: ${body.slice(0, 120)}`);
+            err.httpStatus = res.statusCode;
+            reject(err);
           }
         });
       }
@@ -146,7 +191,9 @@ function analyzeCloud(input, apiKey, endpointUrl, timeoutMs = 4000, extra = {}) 
 
     req.on('timeout', () => {
       req.destroy();
-      reject(new Error('Gateway request timed out'));
+      const err = new Error('Gateway request timed out');
+      err.code = 'ETIMEDOUT';
+      reject(err);
     });
 
     req.on('error', (err) => reject(err));
@@ -189,7 +236,8 @@ async function analyze(input, options = {}) {
   }
 
   // Only the marker turns the cloud on: use the key `connect` stored, never ZN_API_KEY or --key.
-  const markerOnly = !explicitOptIn(options);
+  // storedOnly never falls back to ZN_API_KEY or --key: if the saved key cannot be read, nothing is sent.
+  const markerOnly = Boolean(options.storedOnly) || !explicitOptIn(options);
   const found = markerOnly
     ? await cloudKey.loadStoredKey().then((s) => (s ? { key: s.key, source: s.store } : null))
     : await cloudKey.resolveApiKey(options);
@@ -201,13 +249,16 @@ async function analyze(input, options = {}) {
   const apiKey = found.key;
   const { sanitized, detections } = redactSecrets(typeof input === 'string' ? input : String(input ?? ''));
   const storedKey = found.source === 'keychain' || found.source === 'vault';
-  const tlsWhy = storedKey ? cloudKey.tlsRefusal() : null;
+  // pinOrigin (the hooks): the key and the text go only to the fixed zn origin, with the TLS check held to the same strictness as a saved key,
+  // because the environment of an agent can be set by the project it works in.
+  const pinned = storedKey || Boolean(options.pinOrigin);
+  const tlsWhy = pinned ? cloudKey.tlsRefusal() : null;
   if (tlsWhy) {
     // The saved key is never sent over a connection that is not checked against the system's authorities.
     return { ...local, mode: 'oss-local', fallback: true, cloud_error: tlsWhy };
   }
-  const endpoint = resolveEndpoint(options, { stored: storedKey });
-  if (storedKey && endpoint.indexOf(FIXED_API_ORIGIN + '/') !== 0) {
+  const endpoint = resolveEndpoint(options, { stored: pinned });
+  if (pinned && endpoint.indexOf(FIXED_API_ORIGIN + '/') !== 0) {
     return { ...local, mode: 'oss-local', fallback: true, cloud_error: 'the saved key is only sent to ' + FIXED_API_ORIGIN };
   }
   const urlIgnored = storedKey && Boolean(options.apiUrl || process.env.ZN_API_URL);
@@ -219,6 +270,7 @@ async function analyze(input, options = {}) {
       ...cloudRes,
       mode: 'hybrid-cloud',
       secrets_redacted_before_upload: detections.length,
+      ...degradedFields(cloudRes),
     };
     if (urlIgnored) out.note = 'The saved key is only sent to api.usezn.com, so the custom URL was ignored. Use --key or ZN_API_KEY to send to another URL.';
     if (cloudRes.long_input && cloudRes.long_input.capped) {
@@ -229,7 +281,7 @@ async function analyze(input, options = {}) {
     return out;
   } catch (err) {
     if (isVerbose()) {
-      process.stderr.write(`[zn-gate] Warning: Cloud gate error (${err.message}). Using local rules result.\n`);
+      process.stderr.write(`[zn-gate] Warning: Cloud gate error (${err.message}). ${cloudErrorHint(err)} The local rules were used instead, so the text was checked on this machine only.\n`);
     }
     return {
       ...local,
@@ -277,6 +329,7 @@ function logEvidence(...args) {
 }
 
 module.exports = {
+  _cloudVerdict: cloudVerdict,
   usableApiKey,
   analyze,
   analyzeLocal,

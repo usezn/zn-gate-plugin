@@ -52,10 +52,7 @@ function vaultFiles(opts) {
   return found;
 }
 
-function teamPresent(opts) {
-  const f = policy.paths(opts);
-  return [f.teamFile, f.policyFile].some((x) => fs.existsSync(x));
-}
+const teamPresent = (opts) => policy.onTeamMachine(opts);
 
 function stamp(now) {
   const d = now || new Date();
@@ -110,13 +107,24 @@ async function resetVault(opts, io) {
   out('This starts a new, empty vault. The old one is set aside, not deleted.');
   out('  - Every secret stored in it is lost. Without the old passphrase nobody can read them again, zn included.');
   out('  - The audit log of secret use starts again from zero.');
-  if (backend && backend !== 'passphrase') out('  - The old vault key is replaced in your ' + backend + ' keychain, so the backup cannot be opened afterwards.');
+  if (backend && backend !== 'passphrase') out('  - The old vault key stays in your ' + backend + ' keychain until you run `' + zn('unlock') + '` to create the new vault; it is replaced then, and after that the backup cannot be opened.');
   out('  - Your .env files and shadowed projects keep their markers; store the values again afterwards.');
   const answer = await (i.ask || ((q) => askLine(q, i)))('To go on, type "' + PHRASE + '" and press Enter: ');
   if (String(answer).trim().toLowerCase() !== PHRASE) { out(CANCELLED); return 1; }
 
   const dir = backup(files, o, i.now);
-  for (const f of files) fs.unlinkSync(f.src);
+  const left = [];
+  for (const f of files) {
+    try { fs.unlinkSync(f.src); } catch (err) { if (!err || err.code !== 'ENOENT') left.push(f.src + ' (' + ((err && err.code) || (err && err.message) || err) + ')'); }
+  }
+  if (left.length) {
+    // The backup is complete, so nothing is lost: say so, and what is still in the way of the new vault.
+    const err = i.err || ((s) => process.stderr.write(s + '\n'));
+    err('[zn] The old vault is saved in full in ' + dir + ', but ' + left.length + ' old file(s) could not be removed:');
+    for (const l of left) err('[zn]   ' + l);
+    err('[zn] Remove them by hand (the backup has a copy of each), then run `' + zn('unlock') + '` to create the new vault.');
+    return 1;
+  }
   clearUnlockFailures(o);
   out('Old vault saved in ' + dir + ' (it stays encrypted). `' + zn('vault purge') + '` deletes it, with every other backup, when you no longer need it.');
   out('Done. Run `' + zn('unlock') + '` to create the new vault, then store your values again:');

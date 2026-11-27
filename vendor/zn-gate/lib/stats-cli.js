@@ -4,6 +4,7 @@
  * zn-gate stats            what zn-gate did on this machine in the last 30 days (local counts only)
  * zn-gate stats --days N   another window (1-90)
  * zn-gate stats --json     the same as JSON
+ *                          both show a Top rules block (detector ids and counts only): 7 days, or --days N when given
  * zn-gate stats share on|off|status|show
  *                          opt-in sharing of pseudonymous daily counts (off by default; see lib/stats-share.js)
  */
@@ -20,10 +21,10 @@ function fmt(n) {
 const USAGE = 'Usage: zn-gate stats [--days 1-90] [--json]\n       zn-gate stats share on|off|status|show\n';
 
 function parse(args) {
-  const o = { days: 30, json: false, rest: [], bad: false };
+  const o = { days: 30, daysGiven: false, json: false, rest: [], bad: false };
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--json') o.json = true;
-    else if (args[i] === '--days') o.days = Number(args[++i]);
+    else if (args[i] === '--days') { o.days = Number(args[++i]); o.daysGiven = true; }
     else if (args[i].startsWith('-')) o.bad = true;
     else o.rest.push(args[i]);
   }
@@ -41,7 +42,17 @@ function confirmInTerminal(question) {
   });
 }
 
-function printSummary(s, out) {
+const WHY_HINT = 'To understand your last block, run: zn why';
+
+function printTopRules(rules, days, out) {
+  if (!rules.length) return;
+  out(`\n  Top rules, last ${days} day${days === 1 ? '' : 's'}:\n`);
+  for (const r of rules) out(`    ${r.id}  ${r.name}  ${fmt(r.count)}\n`);
+  out(`  Most frequent: ${rules[0].id}. ${WHY_HINT}\n`);
+}
+
+function printSummary(s, out, top) {
+  const topRules = top && Array.isArray(top.rules) ? top.rules : [];
   const t = s.total;
   out(`zn-gate on this machine, last ${s.days} day${s.days === 1 ? '' : 's'}` + (s.since ? ` (counting since ${s.since})` : '') + ':\n\n');
   if (!t.checked && !t.blocked && !t.redacted && !t.warned) {
@@ -54,6 +65,7 @@ function printSummary(s, out) {
     const types = Object.entries(s.detections).sort((a, b) => b[1] - a[1]).slice(0, 8);
     if (types.length) out('\n  Secret types found: ' + types.map(([k, n]) => `${k} ${fmt(n)}`).join(', ') + '\n');
     const keys = Object.entries(s.byKey).sort((a, b) => b[1].checked - a[1].checked);
+    printTopRules(topRules, top && top.days, out);
     if (keys.length) {
       out('\n  By agent:\n');
       for (const [key, c] of keys) {
@@ -116,13 +128,15 @@ async function run(args, out = (s) => process.stdout.write(s), { confirm = confi
     return 2;
   }
   const s = stats.summary({ days: o.days });
+  const topDays = o.daysGiven ? o.days : stats.TOP_RULES_DAYS;
+  const top = { days: topDays, rules: stats.topRules({ days: topDays }) };
   let res = { sent: 0, failed: 0, sentDays: [], failedDays: [] };
   if (share.status().share) res = await share.sendPending();
   const sentDays = res.sentDays;
   if (o.json) {
-    out(JSON.stringify({ ...s, sharing: share.status().share, sent_days: sentDays, send_failed: res.failed }, null, 2) + '\n');
+    out(JSON.stringify({ ...s, top_rules_days: top.days, top_rules: top.rules, sharing: share.status().share, sent_days: sentDays, send_failed: res.failed }, null, 2) + '\n');
   } else {
-    printSummary(s, out);
+    printSummary(s, out, top);
     for (const d of sentDays) out(`  Shared pseudonymous counts for ${d}.\n`);
     if (res.failed) out(`  ${res.failed} day(s) could not be shared; they will be tried next time.\n`);
   }

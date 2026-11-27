@@ -408,4 +408,4 @@ function failed(r, failOn) {
   return r.findings.some((f) => f.severity !== 'info' && SEVERITIES.indexOf(f.severity) <= limit);
 }
 
-module.exports = { reach, report, failed, FAIL_ON, VERSION, _internal: { dotenvFiles, credentialFiles, secretEnvNames, SECRET_ENV_NAME_RE, memoryFile } };
+module.exports = { reach, report, failed, FAIL_ON, VERSION, _internal: { safeText, dotenvFiles, credentialFiles, secretEnvNames, SECRET_ENV_NAME_RE, memoryFile } };

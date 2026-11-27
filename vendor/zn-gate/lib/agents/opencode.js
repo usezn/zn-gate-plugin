@@ -45,6 +45,8 @@ const { askAsDeny, isPlainAsk } = require('./ask-deny');
 const { writeFileAtomic } = require('../broker/files');
 const cfg = require('./config-file');
 const { patchScan, PATCH_SCAN_CAP } = require('./codex');
+const { cliName } = require('../zn-command');
+const { LOADER_SOURCE } = require('../loader-env');
 
 const id = 'opencode';
 const PLUGIN_FILE = 'zn-gate.js';
@@ -168,7 +170,7 @@ function pluginSource(opts = {}) {
   const launch = project ? 'const NODE = "zn";\nconst RUNNER = null;' : `const NODE = ${node};\nconst RUNNER = ${runner};`;
   const argv = project ? '["hook", "opencode"]' : '[RUNNER, "opencode"]';
   // The repair step a blocked call names: check what is wrong, then install the hook again (the same scope).
-  const repair = JSON.stringify('Run zn-gate check in a terminal, then zn hooks install opencode' + (project ? ' --project' : '') + '.');
+  const repair = JSON.stringify('Run ' + cliName('zn-gate') + ' check in a terminal, then ' + cliName('zn') + ' hooks install opencode' + (project ? ' --project' : '') + '.');
   // On Windows `zn` is zn.cmd, which spawn runs only through a shell. The
   // arguments are fixed strings, so the shell adds no input of its own; and
   // neither `zn` nor the `node` it starts may come from the folder OpenCode
@@ -176,7 +178,7 @@ function pluginSource(opts = {}) {
   // the PATH keeps only its absolute entries, and cmd.exe does not look in the
   // current directory first.
   const shell = project ? 'process.platform === "win32"' : 'false';
-  const env = project ? 'projectEnv()' : 'process.env';
+  const env = project ? 'hookEnv(projectEnv())' : 'hookEnv(process.env)';
   const projectEnvSource = project ? `
 // The environment of \`zn\`: the PATH without its relative or empty entries, and
 // on Windows no search of the current directory by cmd.exe.
@@ -188,7 +190,28 @@ function projectEnv() {
     if (k.toUpperCase() === "PATH") pathValue = String(v || "");
     else env[k] = v;
   }
-  const keep = (d) => (win ? /^(?:[A-Za-z]:[\\\\/]|\\\\\\\\)/.test(d) : d.startsWith("/"));
+  // A PATH entry, or the zn or node in it, can be a link into node_modules/.bin or into the project: the real paths count too.
+  // An entry whose real folder cannot be read, or that is in a node_modules folder or in the project, is dropped; so is an
+  // entry whose zn or node really is in a node_modules/.bin folder or in the project. The project is the folder OpenCode
+  // runs in, unless that is / or the home folder. (A global npm install links zn into <prefix>/node_modules/zn-gate: kept.)
+  const real = (p) => { try { return realpathSync(p).split("\\\\").join("/").toLowerCase(); } catch (_) { return null; } };
+  const here = real(process.cwd());
+  const home = real(homedir());
+  const inProject = (p) => !!here && here !== home && here.length > 3 && (p === here || p.startsWith(here + "/"));
+  const names = win ? ["zn.cmd", "zn.exe", "zn", "node.exe", "node.cmd"] : ["zn", "node"];
+  const sep = win ? ";" : ":";
+  const keep = (d) => {
+    if (!(win ? /^(?:[A-Za-z]:[\\\\/]|\\\\\\\\)/.test(d) : d.startsWith("/")) || /node_modules/i.test(d)) return false;
+    const rd = real(d);
+    if (!rd || rd.includes("/node_modules/") || rd.endsWith("/node_modules") || inProject(rd)) return false;
+    for (const n of names) {
+      const f = d + (win ? "/" : "/") + n;
+      if (!existsSync(f)) continue;
+      const rf = real(f);
+      if (!rf || rf.includes("/node_modules/.bin/") || inProject(rf)) return false;
+    }
+    return true;
+  };
   env.PATH = pathValue.split(win ? ";" : ":").filter(keep).join(win ? ";" : ":");
   if (win) env.NoDefaultCurrentDirectoryInExePath = "1";
   return env;
@@ -199,9 +222,19 @@ function projectEnv() {
 // which blocks reads of secret files, puts commands that use stored secrets
 // through \`zn run\`, and replaces secret values in tool output with __ZN_ tokens.
 import { spawn } from "node:child_process";
-
+${project ? 'import { existsSync, realpathSync } from "node:fs";\nimport { homedir } from "node:os";\n' : ''}
 ${launch}
-${projectEnvSource}const TIMEOUT_MS = ${HOOK_TIMEOUT_S * 1000};
+${projectEnvSource}
+// Variables that make Node.js or the dynamic loader load code of the caller's choosing (NODE_OPTIONS=--require, LD_PRELOAD
+// and the like) are not passed to the hook: a project can set the environment of OpenCode, and such code would run inside
+// the hook itself. NODE_EXTRA_CA_CERTS and the proxy settings are passed.
+const LOADER_VAR = new RegExp(${JSON.stringify(LOADER_SOURCE)}, "i");
+function hookEnv(base) {
+  const env = {};
+  for (const [k, v] of Object.entries(base)) if (!LOADER_VAR.test(k)) env[k] = v;
+  return env;
+}
+const TIMEOUT_MS = ${HOOK_TIMEOUT_S * 1000};
 // The only answers the plugin acts on. Any other answer is an error, which
 // blocks the call (before), withholds the output (after) or stops the message.
 const ACTIONS = ["none", "deny", "error", "args", "output"];
@@ -307,6 +340,14 @@ function pluginPath(opts = {}) {
   return path.join(configDir(opts), 'plugins', PLUGIN_FILE);
 }
 
+/** True when the file is a plugin that zn wrote (a regular file that starts with zn's mark). */
+function isOurs(file) {
+  try {
+    if (!fs.lstatSync(file).isFile()) return false;
+    return fs.readFileSync(file, 'utf8').startsWith(PLUGIN_MARK);
+  } catch (_) { return false; }
+}
+
 function install(opts = {}) {
   const file = pluginPath(opts);
   const report = { settings: file, backup: null, warnings: [] };
@@ -357,4 +398,5 @@ module.exports = {
   capabilities: { ask: false, rewriteInput: true, rewriteOutput: 'all' },
   pluginSource,
   pluginPath,
+  isOurs,
 };

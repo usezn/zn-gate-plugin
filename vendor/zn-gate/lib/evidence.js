@@ -2,12 +2,12 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const crypto = require('crypto');
 // rules (with the scrubber engine behind it), term and http are loaded where they are used, so an
 // append that does not need them (a hook block, see _plainPreview in logEvidence) stays cheap.
 
-const ZN_DIR = path.join(os.homedir(), '.zn');
+// The same folder as stats, pins, the vault and the config: ~/.zn, or ZN_HOME when it is set.
+const ZN_DIR = require('./stats').znHome();
 const EVIDENCE_FILE = path.join(ZN_DIR, 'evidence.jsonl');
 const GENESIS_HASH = '0000000000000000000000000000000000000000000000000000000000000000';
 
@@ -28,8 +28,19 @@ function ensureZnDir(filePath = EVIDENCE_FILE) {
  * the open descriptor before the line is written (POSIX only), so a symlink
  * swapped in between cannot redirect the chmod.
  */
+// True when the file is not empty and its last byte is not a newline, e.g. an editor or a cut-off
+// write left the last record without its line break. The caller holds the write lock.
+function lastByteIsNotNewline(fd) {
+  const size = fs.fstatSync(fd).size;
+  if (size === 0) return false;
+  const last = Buffer.alloc(1);
+  fs.readSync(fd, last, 0, 1, size - 1);
+  return last[0] !== 0x0a;
+}
+
 function appendLedgerLine(filePath, line) {
-  const fd = fs.openSync(filePath, 'a', LEDGER_FILE_MODE);
+  // 'a+' (append and read) so the last byte can be checked; every write still goes to the end.
+  const fd = fs.openSync(filePath, 'a+', LEDGER_FILE_MODE);
   try {
     if (process.platform !== 'win32') {
       try {
@@ -38,6 +49,9 @@ function appendLedgerLine(filePath, line) {
         // Best effort: a file system without POSIX modes keeps its own.
       }
     }
+    // Without this, a record appended to a ledger that lacks its final newline would join the
+    // previous line and verify would report Malformed JSON.
+    if (lastByteIsNotNewline(fd)) fs.writeSync(fd, '\n', null, 'utf8');
     fs.writeSync(fd, line, null, 'utf8');
   } finally {
     fs.closeSync(fd);
@@ -69,7 +83,11 @@ function readLockToken(lockPath) {
 }
 
 // Test seams: they let a test run code between two steps of the break protocol.
-const testHooks = { afterMutexCreate: null, beforeMutexRelease: null, beforeMutexReclaim: null };
+const testHooks = {
+  afterMutexCreate: null, beforeMutexRelease: null, beforeMutexReclaim: null,
+  // Export: the read chunk size, and a function called before each read (it may throw).
+  exportChunkSize: null, beforeExportRead: null,
+};
 
 // The break mutex holds its owner's token, like the lock: a breaker only deletes the mutex while
 // it is still its own. If it took longer than the stale window, another breaker may have
@@ -109,11 +127,19 @@ function breakStaleLock(lockPath, token) {
   let fd;
   try {
     fd = fs.openSync(mutex, 'wx', LEDGER_FILE_MODE);
-    try { fs.writeSync(fd, token); } catch { /* best effort: without it the mutex is never released by us */ }
   } catch {
     // Another breaker is working. A mutex left by a dead process is removed after a while.
     reclaimStaleMutex(mutex, token);
     return false;
+  }
+  try {
+    fs.writeSync(fd, token);
+  } catch (e) {
+    // Without the token this process cannot release the mutex. The mutex is ours (just created
+    // with 'wx'), so remove it and report the error instead of leaving an empty mutex behind.
+    try { fs.closeSync(fd); } catch { /* best effort */ }
+    try { fs.unlinkSync(mutex); } catch { /* best effort */ }
+    throw e;
   }
   try {
     try { fs.closeSync(fd); } catch { /* best effort */ }
@@ -245,13 +271,52 @@ function releaseLock(lockPath, token) {
 }
 
 // Canonical serialization of a record for hashing. Node writes UTF-8 as is; Python used to
-// escape non-ASCII as \uXXXX. Verification accepts both forms, so a log written by either
-// package (or by an older version) verifies in both. New records use the plain form.
-function canonical(record) {
-  return JSON.stringify(record);
+// escape non-ASCII as \uXXXX, and Python writes a small float such as 1e-05 where JavaScript
+// writes 0.00001. New records use the plain JavaScript form (the Python package writes the same
+// text); verification also accepts the ASCII-escaped form and the Python number form, so a log
+// written by either package (or by an older version) verifies in both.
+// The text Python's repr gives for a finite non-integer float (what json.dumps writes).
+function pythonNumber(x) {
+  const [mant, expText] = x.toExponential().split('e');
+  const exp = Number(expText);
+  const neg = mant.startsWith('-');
+  const digits = mant.replace('-', '').replace('.', '');
+  let out;
+  if (exp >= -4 && exp < 16) {
+    if (exp < 0) out = '0.' + '0'.repeat(-exp - 1) + digits;
+    else if (digits.length <= exp + 1) out = digits + '0'.repeat(exp + 1 - digits.length);
+    else out = digits.slice(0, exp + 1) + '.' + digits.slice(exp + 1);
+  } else {
+    out = digits[0] + (digits.length > 1 ? '.' + digits.slice(1) : '') + 'e' + (exp < 0 ? '-' : '+') + String(Math.abs(exp)).padStart(2, '0');
+  }
+  return (neg ? '-' : '') + out;
 }
-function canonicalAscii(record) {
-  return JSON.stringify(record).replace(/[\u007f-￿]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+
+function serialize(record, { ascii = false, pyNumbers = false } = {}) {
+  let text;
+  if (pyNumbers && typeof record.confidence === 'number' && Number.isFinite(record.confidence) && !Number.isInteger(record.confidence)) {
+    // The confidence is written on its own and joined in place, so no other text of the record (a preview, say) can be
+    // taken for it.
+    const keys = Object.keys(record);
+    const at = keys.indexOf('confidence');
+    const part = (ks) => JSON.stringify(Object.fromEntries(ks.map((k) => [k, record[k]]))).slice(1, -1);
+    text = '{' + [part(keys.slice(0, at)), '"confidence":' + pythonNumber(record.confidence), part(keys.slice(at + 1))]
+      .filter(Boolean).join(',') + '}';
+  } else {
+    text = JSON.stringify(record);
+  }
+  return ascii ? text.replace(/[\u007f-￿]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')) : text;
+}
+function canonical(record) {
+  return serialize(record);
+}
+function canonicalForms(record) {
+  return [
+    serialize(record),
+    serialize(record, { ascii: true }),
+    serialize(record, { pyNumbers: true }),
+    serialize(record, { ascii: true, pyNumbers: true }),
+  ];
 }
 
 const HASH_RE = /^[0-9a-f]{64}$/;
@@ -323,7 +388,10 @@ function readLastLine(filePath) {
   let fd;
   try {
     fd = fs.openSync(filePath, 'r');
-    const size = fs.fstatSync(fd).size;
+    const st = fs.fstatSync(fd);
+    // Windows opens a folder for reading without an error: a folder at the log path is unreadable, as elsewhere.
+    if (st.isDirectory()) { const e = new Error('is a directory'); e.code = 'EISDIR'; throw e; }
+    const size = st.size;
     let window = 65536;
     for (;;) {
       const start = Math.max(0, size - window);
@@ -462,7 +530,11 @@ function buildRecord(event, prevHash, plainPreview = false) {
   // Note: a payload with a lone surrogate hashes as U+FFFD here and as '?' in the Python package,
   // so payload_sha256 differs between the two for such text; record_hash and verification are
   // not affected.
-  const payloadStr = typeof event.payload === 'string' ? event.payload : JSON.stringify(event.payload || '');
+  // A missing or null payload is the empty string; any other non-string payload is its compact JSON
+  // (so 0 is "0" and false is "false"), as in the Python package.
+  const payloadStr = typeof event.payload === 'string'
+    ? event.payload
+    : (event.payload === undefined || event.payload === null ? '' : JSON.stringify(event.payload));
   const payloadSha256 = crypto.createHash('sha256').update(payloadStr).digest('hex');
 
   const baseRecord = {
@@ -481,8 +553,9 @@ function buildRecord(event, prevHash, plainPreview = false) {
     verdict: event.verdict || 'allow',
     rule: event.rule || null,
     reason: event.reason || null,
-    confidence: event.confidence || 1.0,
-    latency_us: event.latency_us || 0,
+    // A confidence of 0 is kept as 0; only a missing or non-numeric one defaults to 1.
+    confidence: typeof event.confidence === 'number' && Number.isFinite(event.confidence) ? event.confidence : 1.0,
+    latency_us: typeof event.latency_us === 'number' && Number.isFinite(event.latency_us) ? Math.trunc(event.latency_us) : 0,
     engine: event.engine || 'oss-deterministic',
     prev_hash: prevHash,
   };
@@ -494,6 +567,42 @@ function buildRecord(event, prevHash, plainPreview = false) {
     .digest('hex');
 
   return { ...baseRecord, record_hash: recordHash };
+}
+
+// A last line that is not JSON counts as a write cut off by a crash or a full disk only if it is
+// the last line, the file does not end with a newline (every complete write does), and the line
+// starts like a written record. It is still reported as not verified (valid: false), but with
+// truncated_tail: true so the output can say so and explain how to continue. Anything else
+// (text with a trailing newline, an edited record, text that is not a record) stays a tamper report.
+const RECORD_START = '{"id":"ev_';
+function endsWithNewline(filePath) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const size = fs.fstatSync(fd).size;
+    if (size === 0) return true;
+    const b = Buffer.alloc(1);
+    fs.readSync(fd, b, 0, 1, size - 1);
+    return b[0] === 0x0a;
+  } catch {
+    return true;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* ignore */ }
+  }
+}
+function isCutTail(filePath, line) {
+  return line.startsWith(RECORD_START) && !endsWithNewline(filePath);
+}
+const TRUNCATED_TAIL_MESSAGE = 'Last record is incomplete: the write was cut off (for example by a crash or a full disk) or the end of the file was removed, so it cannot be verified';
+function truncatedTailResult(total, index) {
+  return {
+    valid: false,
+    total,
+    verified: index,
+    broken_index: index,
+    error: `${TRUNCATED_TAIL_MESSAGE} at line ${index + 1}: the line is not valid JSON.`,
+    truncated_tail: true,
+  };
 }
 
 /**
@@ -524,6 +633,7 @@ function verifyEvidenceLedger(filePath = EVIDENCE_FILE) {
     try {
       rec = JSON.parse(lines[i]);
     } catch (e) {
+      if (i === lines.length - 1 && isCutTail(filePath, lines[i])) return truncatedTailResult(lines.length, i);
       return { valid: false, total: lines.length, verified: i, broken_index: i, error: `Malformed JSON at line ${i + 1}: ${e.message}` };
     }
     if (rec === null || typeof rec !== 'object' || Array.isArray(rec)) {
@@ -542,8 +652,9 @@ function verifyEvidenceLedger(filePath = EVIDENCE_FILE) {
 
     const { record_hash, ...baseRecord } = rec;
     const hashOf = (text) => crypto.createHash('sha256').update(expectedPrevHash + ':' + text).digest('hex');
-    // Records written by Python (or older versions) may have non-ASCII escaped: accept both forms.
-    if (hashOf(canonical(baseRecord)) !== record_hash && hashOf(canonicalAscii(baseRecord)) !== record_hash) {
+    // Records written by Python (or older versions) may have non-ASCII escaped or a small
+    // confidence written the Python way: accept every form.
+    if (!canonicalForms(baseRecord).some((text) => hashOf(text) === record_hash)) {
       return {
         valid: false,
         total: lines.length,
@@ -647,67 +758,91 @@ function exportEvidenceLedger(filePath = EVIDENCE_FILE, format = 'jsonl') {
     };
   }
 
-  const verifyResult = verifyEvidenceLedger(filePath);
-  let raw = '';
-  let lines = [];
+  // The log is read and checked in chunks (see evidence_export.js). This function returns the
+  // whole export as one string, so it suits small logs; the CLI and the dashboard stream it.
+  let out;
   try {
-    raw = LENIENT.decode(fs.readFileSync(filePath));
-    lines = readLedger(filePath).lines;
-  } catch {
-    // Unreadable: verifyResult already carries the reason.
-  }
-
-  let tipHash = GENESIS_HASH;
-  if (lines.length > 0) {
-    try {
-      tipHash = JSON.parse(lines[lines.length - 1]).record_hash || GENESIS_HASH;
-    } catch {}
-  }
-
-  if (normFormat === 'csv') {
-    const headers = [
-      'timestamp',
-      'verdict',
-      'phase',
-      'tool_name',
-      'agent_environment',
-      'rule',
-      'reason',
-      'payload_sha256',
-      'record_hash',
-      'prev_hash',
-      'latency_us'
-    ];
-    const rows = [headers.join(',')];
-    for (const line of lines) {
-      try {
-        const obj = JSON.parse(line);
-        const row = headers.map(h => {
-          const val = obj[h] !== undefined && obj[h] !== null ? String(obj[h]) : '';
-          return `"${val.replace(/"/g, '""')}"`;
-        });
-        rows.push(row.join(','));
-      } catch {}
-    }
-
+    out = exporter.exportToString(filePath, normFormat);
+  } catch (e) {
+    if (!(e instanceof EvidenceLedgerError)) throw e;
+    // A log that cannot be read in full exports nothing and is not valid.
     return {
-      content: rows.join('\n') + '\n',
-      format: 'csv',
-      valid: verifyResult.valid,
-      error: verifyResult.error,
-      tip_hash: tipHash,
-      total: lines.length,
+      content: normFormat === 'csv' ? exporter.CSV_HEADER_LINE + '\n' : '\n',
+      format: normFormat,
+      valid: false,
+      error: e.message,
+      tip_hash: GENESIS_HASH,
+      total: 0,
     };
   }
-
   return {
-    content: raw.endsWith('\n') ? raw : raw + '\n',
-    format: 'jsonl',
-    valid: verifyResult.valid,
-    error: verifyResult.error,
-    tip_hash: tipHash,
-    total: lines.length,
+    content: out.content,
+    format: normFormat,
+    valid: out.result.valid,
+    error: out.result.error,
+    tip_hash: out.result.tip_hash,
+    total: out.result.total,
   };
+}
+
+/**
+ * Streams the export of the ledger to a Writable stream (a file, stdout, an HTTP response) in
+ * bounded memory, checking the hash chain as it reads. Resolves with { format, valid, total,
+ * verified, broken_index, error, tip_hash, truncated_tail? }: the check fields are the same as
+ * verifyEvidenceLedger's, and total is the number of records read and exported. Rejects with an
+ * EvidenceLedgerError if the log cannot be read in full, or with the stream's error (writeError:
+ * true) if the output cannot be written. The stream is left open.
+ *
+ * @param {string} filePath
+ * @param {('jsonl'|'csv')} format
+ * @param {import('stream').Writable} out
+ */
+async function writeEvidenceExport(filePath, format, out) {
+  const normFormat = (format || 'jsonl').toLowerCase() === 'csv' ? 'csv' : 'jsonl';
+  return exporter.writeExport(filePath, normFormat, out);
+}
+
+/**
+ * Answers /api/export. The log is read twice up to the same size: the first pass checks the chain
+ * (its result goes in the headers), the second streams the records. A read error before the
+ * headers is a 500 with the reason; one after them cuts the connection, so a download is never
+ * complete unless the whole log was read.
+ */
+async function sendEvidenceExport(res, filePath, format) {
+  let check;
+  try {
+    const state = {};
+    let n = 0;
+    for (const piece of exporter.exportChunks(filePath, 'none', state)) {
+      void piece;
+      // Let other requests in now and then while a large log is checked.
+      if (++n % 16 === 0) await new Promise((resolve) => setImmediate(resolve));
+    }
+    check = state.result;
+  } catch (e) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `${e.message}. Nothing was exported.` }));
+    return;
+  }
+  const contentType = format === 'csv' ? 'text/csv; charset=utf-8' : 'application/x-ndjson; charset=utf-8';
+  const filename = `zn-audit-ledger-${new Date().toISOString().slice(0, 10)}.${format}`;
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'X-Evidence-Integrity': check.valid ? 'valid' : 'tampered',
+    'X-Evidence-Tip-Hash': check.tip_hash,
+    'X-Evidence-Total': String(check.total),
+  });
+  try {
+    const sent = await exporter.writeExport(filePath, format, res, { size: check.bytes });
+    if (sent.total !== check.total || sent.tip_hash !== check.tip_hash || sent.valid !== check.valid) {
+      res.destroy(new Error('The evidence log changed while it was exported.'));
+      return;
+    }
+    res.end();
+  } catch (e) {
+    res.destroy(e);
+  }
 }
 
 /**
@@ -777,19 +912,7 @@ function startEvidenceUi(port = 3100, filePath = EVIDENCE_FILE) {
     if (req.url.startsWith('/api/export')) {
       const urlObj = new URL(req.url, `http://127.0.0.1:${port}`);
       const format = urlObj.searchParams.get('format') === 'csv' ? 'csv' : 'jsonl';
-      const exportData = exportEvidenceLedger(filePath, format);
-
-      const contentType = format === 'csv' ? 'text/csv; charset=utf-8' : 'application/x-ndjson; charset=utf-8';
-      const filename = `zn-audit-ledger-${new Date().toISOString().slice(0, 10)}.${format}`;
-
-      res.writeHead(200, {
-        'Content-Type': contentType,
-        'Content-Disposition': `attachment; filename="${filename}"`,
-        'X-Evidence-Integrity': exportData.valid ? 'valid' : 'tampered',
-        'X-Evidence-Tip-Hash': exportData.tip_hash,
-        'X-Evidence-Total': String(exportData.total),
-      });
-      res.end(exportData.content);
+      sendEvidenceExport(res, filePath, format).catch(() => { res.destroy(); });
       return;
     }
 
@@ -934,7 +1057,7 @@ function startEvidenceUi(port = 3100, filePath = EVIDENCE_FILE) {
           badge.textContent = '● SHA-256 Chain Verified (Tamper-Free)';
         } else {
           badge.className = 'status-badge badge-invalid';
-          badge.textContent = '✖ TAMPER DETECTED at record ' + v.broken_index;
+          badge.textContent = v.truncated_tail ? '✖ LAST RECORD INCOMPLETE: cut off or removed (not verified)' : '✖ TAMPER DETECTED at record ' + v.broken_index;
         }
 
         const tbody = document.getElementById('audit-table');
@@ -967,6 +1090,12 @@ Press Ctrl+C to stop dashboard.
   return server;
 }
 
+// Streaming export, built from the helpers above.
+const exporter = require('./evidence_export').createExporter({
+  trimBytes, canonicalForms, genesisHash: GENESIS_HASH, recordStart: RECORD_START, truncatedTailResult,
+  EvidenceLedgerError, testHooks,
+});
+
 module.exports = {
   logEvidence,
   EvidenceLedgerError,
@@ -975,6 +1104,7 @@ module.exports = {
   verifyEvidenceLedger,
   getEvidenceStats,
   exportEvidenceLedger,
+  writeEvidenceExport,
   startEvidenceUi,
   escapeHtml,
   renderAuditRow,

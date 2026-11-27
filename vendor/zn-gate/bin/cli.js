@@ -32,21 +32,56 @@ process.stdout.on('error', (err) => {
   throw err;
 });
 
+// Node 18 prints an ExperimentalWarning for the X25519 algorithm that the vault uses. Drop only that one.
+require('../lib/warnings').installX25519WarningFilter();
+
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { startMcpServer } = require('../lib/mcp');
 const { startMcpShield } = require('../lib/shield');
 const { configureEnvironments } = require('../lib/init');
-const { verifyEvidenceLedger, getEvidenceStats, exportEvidenceLedger, startEvidenceUi, recoveryHint, EVIDENCE_FILE } = require('../lib/evidence');
+const { verifyEvidenceLedger, getEvidenceStats, writeEvidenceExport, startEvidenceUi, recoveryHint, EVIDENCE_FILE } = require('../lib/evidence');
 const { analyze, analyzeLocal, isCloudEnabled, resolveEndpoint, usesStoredKey, RULES_VERSION } = require('../lib/client');
 const { evaluate, redactSecrets, redactScanSecrets, redactScanRules, SECRET_PATTERNS } = require('../lib/rules');
+// A verdict from the cloud or the ledger can come in any case; compare it the way the MCP server does.
+const isBlockVerdict = (v) => typeof v === 'string' && v.toLowerCase() === 'block';
 const { SCRUB_RULES_VERSION } = require('../lib/scrub/patterns');
 const { AUDIT_RULES_VERSION } = require('../lib/audit/rules');
 const { styles, sym, ruleLine } = require('../lib/term');
 const mcpSecrets = require('../lib/mcp-secrets');
+const { fsErrorText, humanError } = require('../lib/errors');
+
+// The evidence log, a link to it and a hard link to it are one file. An output that is any of them must
+// never be opened with 'w': that would empty the log before it is read.
+function canonicalFilePath(p) {
+  // Follows links to their end, also to a target that does not exist yet, then resolves the folder.
+  let cur = path.resolve(p);
+  for (let hop = 0; hop < 40; hop++) {
+    let st;
+    try { st = fs.lstatSync(cur); } catch (e) { break; }
+    if (!st.isSymbolicLink()) break;
+    cur = path.resolve(path.dirname(cur), fs.readlinkSync(cur));
+  }
+  let dir = path.dirname(cur);
+  try { dir = fs.realpathSync.native(dir); } catch (e) { /* the folder does not exist: keep the text */ }
+  const full = path.join(dir, path.basename(cur));
+  return process.platform === 'win32' ? full.toLowerCase() : full;
+}
+
+function isEvidenceLogFile(output, ledger) {
+  if (canonicalFilePath(output) === canonicalFilePath(ledger)) return true;
+  try {
+    const a = fs.statSync(output);
+    const b = fs.statSync(ledger);
+    return a.ino !== 0 && a.dev === b.dev && a.ino === b.ino;
+  } catch (e) {
+    return false;
+  }
+}
 const { pruneInfo, SCAN_DIRS } = require('../lib/prune');
 const { safeText } = require('../lib/audit/report');
+const { cliName } = require('../lib/zn-command');
 // Colors are decided once per run: NO_COLOR, TERM=dumb or a stdout that is not a terminal turn them off.
 const col = styles(process.stdout, process.env);
 
@@ -108,9 +143,9 @@ function secretNextStep(file, rule) {
     // On Windows the relative path uses backslashes; npx takes forward slashes there too.
     const shown = process.platform === 'win32' ? file.split(path.sep).join('/') : file;
     const arg = SAFE_FILE_ARG.test(shown) && !shown.startsWith('-') ? shown : '<file>';
-    return `Next: run npx -y zn-gate env shadow ${arg} to move the values into the local vault, and rotate any value that was ever committed or shared.`;
+    return `Next: run ${cliName('npx')} -y zn-gate env shadow ${arg} to move the values into the local vault, and rotate any value that was ever committed or shared.`;
   }
-  return 'Next: run npx -y zn-gate secret set NAME to store the value in the local vault, use the __ZN_NAME__ marker in its place, and rotate it if it was ever committed or shared.';
+  return `Next: run ${cliName('npx')} -y zn-gate secret set NAME to store the value in the local vault, use the __ZN_NAME__ marker in its place, and rotate it if it was ever committed or shared.`;
 }
 
 // The line shown with a scan finding: secrets found by the rules and by the
@@ -213,12 +248,17 @@ COMMANDS:
   shield, mcp-shield  Wrap and protect ANY external MCP server (uvx, npx, node, python)
   scan <path>         Recursively audit prompt templates, markdown, skills, and configs for injection traps and secrets
                       [--format text|json|github] (matched values are never printed)
+  scan --package NAME[@VERSION]
+                      Audit an npm package (MCP server or skill) before you add it: it is downloaded from the
+                      registry and its files with a scanned extension are read (node_modules and dist too), never installed or run; the
+                      install scripts npm would run are listed. Text output only.
   audit [path]        Review a repository's agent configs before you open it: hooks, MCP servers,
                       endpoint overrides, permissions, instructions, planted executables
                       [--format text|json|sarif] [--output FILE] [--fail-on high]
                       [--agents claude,codex,cursor,opencode,amazonq,copilot,gemini,all] [--include-home]
-  evidence            Query the local hash-chained audit log and run the UI dashboard
+  evidence            Query the local hash-chained decision log and run the UI dashboard
   logs                Tail or inspect security event logs
+  why [<id>]          Explain, in plain words, the last block in the evidence log (or the record with that id)
   mcp                 Run as standalone bidirectional MCP server for AI agents
   analyze <text>      Inspect a prompt from the CLI (local; cloud only with ZN_CLOUD=1 + key)
   test                Run the local self-test (51 curated vectors: 26 attacks, 25 benign)
@@ -238,11 +278,16 @@ SECRETS (values stay on this machine; agents only see __ZN_<NAME>__ markers):
   secret import FILE  Copy the secret values of a .env file into the vault
   secret adopt TOKEN  Store a value the scrubber detected (e.g. AWS_KEY_1) as a named secret
   env shadow [FILE]   Move .env values into the vault and leave markers in the file
+  env unshadow FILE --backup NAME
+                      Put the original values back into FILE from the encrypted copy that env shadow printed
   run -- <command>    Run a command with secrets in its environment (allowed commands only)
                       and its output masked [--secrets A,B to set env vars]
+                      -s is a short form of --secrets; --agent ID names the agent in the audit log
+                      --egress-allow HOST[:PORT],... lets the command reach only those hosts over
+                      HTTP(S) through a local proxy (off by default; see docs/secrets.md)
                       (a marker in the command's arguments is refused, never filled in)
   secret log          Show the local audit log of secret use [--since 1h] (same as vault log)
-  hooks install <agent> [--project]
+  hooks install <agent> [--project] [--no-mcp]
                       Install zn's hooks for ${require('../lib/agents').listAdapters().join(', ')}
                       (zn-gate init picks the right setup for each agent)
   hooks uninstall <agent> [--project]
@@ -251,15 +296,22 @@ SECRETS (values stay on this machine; agents only see __ZN_<NAME>__ markers):
                       hooks, wrapped MCP servers. Shows the plan first; the vault is only deleted if
                       you confirm it separately [--dry-run]. Your own terminal only
   check               Show that zn blocks your agent from reading a fake secret
-                      (also: doctor). Safe: a temporary folder, nothing is sent
+                      (also: doctor). Safe: a temporary folder, zn-gate sends nothing over the network;
+                      it runs the installed zn hooks; the only agent program it starts is <agent> --version
+  check --json        Same check as one JSON object for scripts, CI and support requests
+  check --hooks       List every installed zn hook and say if it is OK, stale or broken
+                      (reads files only; nothing is run or changed)
   connect             Optional: turn on the cloud check for analyze_prompt. Opens usezn.com,
                       you paste an analysis-only API key at a hidden prompt; it is kept in your system
                       keychain or the zn vault, never in a file. Your own terminal only
+                      With --reconnect, replace the key that is already saved.
   disconnect          Remove that key from this computer, and ask whether to revoke it on
                       usezn.com too (default no) [--revoke | --no-revoke]. Your own terminal only
   reach [path]        Show what your coding agents can reach: secrets (names only),
                       credential files, MCP servers [--json | --sarif]
                       [--fail-on high|medium|low|none] [--remember]. Read only, nothing is sent
+                      reach --history: which secrets your agents kept in their session
+                      history (types and counts, never values) [--json] [--max-seconds N]
   secrets-mcp         Run the "secrets" MCP server (stdio)
   hook <agent>        Hook entry point used by agents (reads the event on stdin)
 
@@ -284,21 +336,27 @@ OPTIONS:
 
 VAULT (local, encrypted with age; the key stays in the OS keychain):
   unlock              Unlock the vault for this session [--ttl 8h] [--idle 30m]
+                      [--backend NAME]: macos, windows, libsecret or passphrase
                       (first run creates it; --passphrase-stdin without a keychain)
   lock                Lock the vault now
   vault status        Show whether the vault exists and is unlocked
   vault log           Show the audit log of secret use [--since 1h]; checks the chain when unlocked
   vault verify        Verify the HMAC-chained audit log of secret use
+                      --acknowledge accepts the log as it is now (your own terminal only)
   vault forget [dir]  Forget the token map of a project (vault locked)
   vault reset         Lost the passphrase? Set the old vault aside and start empty (your terminal only)
   vault purge         Delete the vault, every backup and the token maps for good [--yes] (your terminal only)
   vault log export --otlp
                       Export the audit log as OpenTelemetry logs (OTLP/JSON Lines)
-                      [--since 7d] [--out FILE]
+                      [--since 7d] [--out FILE] [--unverified]
+                      (with the vault locked, the chain cannot be checked: --unverified exports a copy that is NOT verified)
+  vault team          Shows that a shared team vault is planned, not available yet
 
 TEAM (zn Team: organization policy and audit upload; needs the vault unlocked):
   team join <token>   Connect this machine to your organization (confirmed outside the agent)
-  team status         Organization, policy version and upload state [--json]
+                      options: --api URL (another server), --agent ID (claude-code, codex, ...),
+                      --include-history (also sends the audit records written before you joined)
+  team status         Organization, policy version and upload state [--json] [--rules]
   team sync           Download the policy and upload the audit log now
   team leave          Disconnect this machine (confirmed outside the agent)
   team managed-config Print the managed settings an admin deploys with MDM (nothing is written)
@@ -339,14 +397,14 @@ EXAMPLES:
   npx -y zn-gate evidence --verify
   npx -y zn-gate evidence --ui
 
-Learn more & documentation at https://usezn.com · GitHub: https://github.com/usezn/zn
+Learn more & documentation at https://usezn.com | GitHub: https://github.com/usezn/zn
 `);
 }
 
 async function runTestSuite(options) {
   process.stdout.write(`
 ${sym(process.env, '🛡️', undefined, '  ')}Running zn-gate v${VERSION} Self-Test Suite
-Engine: Local rules (the self-test never uses the network) · Rules: ${RULES_VERSION}
+Engine: Local rules (the self-test never uses the network) | Rules: ${RULES_VERSION}
 Evaluating ${TEST_VECTORS.length} curated test vectors (${TEST_VECTORS.filter(v => v.type === 'attack').length} attacks + ${TEST_VECTORS.filter(v => v.type === 'benign').length} benign developer scenarios)...\n
 `);
 
@@ -364,7 +422,7 @@ Evaluating ${TEST_VECTORS.length} curated test vectors (${TEST_VECTORS.filter(v 
     totalTimeNs += elapsedNs;
     const elapsedMs = (Number(elapsedNs) / 1e6).toFixed(2);
 
-    const isBlock = result.verdict === 'block';
+    const isBlock = isBlockVerdict(result.verdict);
     // Default policy: some heuristic rules give an advisory instead of a block.
     const isFlagged = isBlock || Boolean(result.advisory);
     const isPass = (vec.type === 'attack' && isFlagged) || (vec.type === 'benign' && !isBlock);
@@ -436,7 +494,7 @@ function homeMcpFiles() {
 
 // A file as shown in a report: relative to the current directory; one of the
 // user's own MCP configs (--include-home) outside it is shown as ~/...
-function displayPath(filePath, homeFiles) {
+function displayPathOf(filePath, homeFiles) {
   if (homeFiles && homeFiles.has(filePath)) {
     let realHome = os.homedir();
     try { realHome = fs.realpathSync(realHome); } catch (e) { /* keep it */ }
@@ -510,7 +568,8 @@ function scanDirectory(targetPath, includeCode = false, options = {}) {
       // The directory you pass is always read, whatever its name.
       if (current !== targetPath) {
         if (userExcluded.has(base)) return;
-        if (IGNORED_DIRS.has(base)) {
+        // A downloaded package is read in full (options.noPrune): nothing is skipped by name.
+        if (!options.noPrune && IGNORED_DIRS.has(base)) {
           const pruned = pruneInfo(base, path.dirname(current));
           if (pruned) {
             if (!pruned.silent) skippedDirs.push({ dir: current, reason: pruned.reason });
@@ -527,7 +586,7 @@ function scanDirectory(targetPath, includeCode = false, options = {}) {
         return;
       }
       // Editor settings are not scanned; the MCP servers of VS Code are.
-      if (base.toLowerCase() === '.vscode') entries = entries.filter((e) => e.toLowerCase() === 'mcp.json');
+      if (!options.noPrune && base.toLowerCase() === '.vscode') entries = entries.filter((e) => e.toLowerCase() === 'mcp.json');
       for (const entry of entries) {
         walk(path.join(current, entry));
       }
@@ -565,7 +624,13 @@ async function handleScan(targetPath, options) {
   }
 
   const files = scanDirectory(resolved, options.includeCode, options);
+  // Files of a package that could not be unpacked (scan --package) are part of the skipped ones.
+  for (const s of options.extraSkipped || []) files.skipped.push(s);
   const homeFiles = new Set();
+  // A package is shown with paths inside the package, never the temporary folder it was unpacked to.
+  const displayPath = options.displayBase
+    ? (p) => path.relative(options.displayBase, p).split(path.sep).join('/')
+    : displayPathOf;
   const mcpOnly = new Set();
   if (options.includeHome) {
     for (const f of homeMcpFiles()) {
@@ -580,10 +645,12 @@ async function handleScan(targetPath, options) {
   }
   if (format === 'text') process.stdout.write(`
 ${sym(process.env, '🛡️', undefined, '  ')}zn-gate Static Security Audit
-Target  : ${safeText(resolved)}
+Target  : ${safeText(options.targetLabel || resolved)}
 Scope   : ${options.includeCode ? 'All files (prompts + code)' : 'Prompt templates, docs, configs (use --code to scan source)'}
 Files   : ${files.length} file(s) queued for audit\n
 `);
+  // Notes that are not findings (what npm would run for a package), before the result.
+  if (format === 'text' && options.notes && options.notes.length) process.stdout.write(options.notes.join('\n') + '\n\n');
 
   let totalFindings = 0;
   const findings = [];
@@ -673,7 +740,7 @@ Files   : ${files.length} file(s) queued for audit\n
       };
       // A scan reports every match, including the rules that only warn by default.
       const evalRes = evaluate(line, { ...options, strict: true });
-      if (evalRes.verdict === 'block') {
+      if (isBlockVerdict(evalRes.verdict)) {
         totalFindings++;
         findings.push({ file: relPath, line: lineIdx + 1, rule: evalRes.rule, reason: evalRes.reason, type: 'injection', sample: sampleOf() });
       }
@@ -708,8 +775,9 @@ Files   : ${files.length} file(s) queued for audit\n
   // An empty or partial result is not a clean one. Findings exit 1; otherwise a
   // scan that read no file, or skipped a file or folder it should have read,
   // exits 3, unless --allow-partial accepts the skipped ones.
-  const nothingScanned = `No files were scanned in ${targetPath || '.'}`;
-  const unreadDirs = files.skippedDirs.filter((d) => d.reason === 'cannot be read').length;
+  const nothingScanned = `No files were scanned in ${options.targetLabel || targetPath || '.'}`;
+  // A package is read in full, so a directory that was skipped for any reason is incomplete coverage.
+  const unreadDirs = options.noPrune ? files.skippedDirs.length : files.skippedDirs.filter((d) => d.reason === 'cannot be read').length;
   const incomplete = files.skipped.length + unreadDirs > 0;
   const incompleteNote = `${files.skipped.length} file(s) and ${unreadDirs} folder(s) were not read`;
   const coverageExit = () => {
@@ -783,7 +851,7 @@ Files   : ${files.length} file(s) queued for audit\n
   let status = files.length - notRead === 0 ? 'No files were read: this is not a clean result' : 'Clean workspace';
   if (totalThreats) status = 'Review and neutralize detected vectors';
   else if (totalSecrets) status = 'Move the secrets out of these files (see "Next" for each one)';
-  else if (incomplete && files.length - notRead > 0) status = options.allowPartial ? `Partial coverage accepted with --allow-partial (${incompleteNote})` : `Incomplete: ${incompleteNote}. Exit code 3; use --allow-partial to accept`;
+  else if (incomplete && files.length - notRead > 0) status = options.allowPartial ? `Partial coverage accepted with --allow-partial (${incompleteNote})` : `Incomplete: ${incompleteNote}. Exit code 3${options.noPrune ? '' : '; use --allow-partial to accept'}`;
   process.stdout.write(`
 ${ruleLine(process.env, 77)}
 Audit Result : ${totalFindings === 0 ? (files.length - notRead === 0 ? col.yellow('NOTHING SCANNED') : incomplete ? col.yellow(options.allowPartial ? 'PASSED - NO THREATS DETECTED (PARTIAL COVERAGE)' : 'INCOMPLETE - SOME FILES WERE NOT READ') : col.green('PASSED - NO THREATS DETECTED')) : col.red(`FAILED - ${resultParts.join(', ')}`)}
@@ -808,6 +876,67 @@ ${ruleLine(process.env, 77)}\n
   // exitCode, not process.exit(): a large report written to a pipe must be
   // flushed completely before the process ends.
   process.exitCode = coverageExit();
+}
+
+// `scan --package NAME[@VERSION]`: the npm package is downloaded and unpacked into a temporary folder (never
+// installed, never run). The folder gets the same scan as `scan <path>` (with source files) and the agent-config
+// audit of lib/audit. Exit 1 on findings, 3 when something was not read, 2 when the package could not be fetched.
+async function runScanPackage(args, options) {
+  const fail = (msg) => {
+    process.stderr.write('zn-gate scan: ' + msg + '\n');
+    return 2;
+  };
+  const i = args.findIndex((a) => a === '--package' || a.startsWith('--package='));
+  const spec = args[i].startsWith('--package=') ? args[i].slice('--package='.length) : args[i + 1];
+  if (!spec || spec.startsWith('--')) return fail('--package needs an npm package name, as --package NAME or --package NAME@VERSION');
+  const extra = [];
+  for (let k = 1; k < args.length; k++) {
+    if (args[k] === '--package') { k++; continue; }
+    if (args[k].startsWith('--')) { if (COMMAND_OPTIONS.scan.value.includes(args[k])) k++; continue; }
+    extra.push(args[k]);
+  }
+  if (extra.length) return fail('--package scans the package from the registry: leave out the folder argument (' + extra[0].slice(0, 40) + ')');
+  if (options.includeHome) return fail('--include-home cannot be used with --package');
+  if (options.formatGiven && String(options.format).toLowerCase() !== 'text') return fail('--package supports only --format text for now');
+  if (args.some((a) => a === '--exclude' || a.startsWith('--exclude='))) return fail('--exclude cannot be used with --package: no folder of a package is skipped by name');
+  if (options.allowPartial) return fail('--allow-partial cannot be used with --package: a package is read in full, and a part that could not be read is never reported as a pass');
+
+  const { fetchPackageForScan, describePackage, auditCoverageGaps } = require('../lib/scan-package');
+  let pkg;
+  try {
+    pkg = await fetchPackageForScan(spec);
+  } catch (err) {
+    return fail(err.message);
+  }
+  const label = 'npm ' + pkg.name + '@' + pkg.version;
+  try {
+    const auditReport = require('../lib/audit/report');
+    // The package is read in full: no folder is skipped by name (node_modules, dist, build...), the code
+    // extensions npm packages use are scanned, and a file that could not be unpacked counts as not read.
+    const include = [options.include, '.mjs,.cjs,.jsx,.tsx,.mts,.cts'].filter(Boolean).join(',');
+    const extraSkipped = (pkg.notUnpacked || []).map((n) => ({ file: path.join(pkg.dir, ...n.path.split('/')), reason: 'could not be unpacked: ' + n.reason }));
+    await handleScan(pkg.dir, {
+      ...options, includeCode: true, include, noPrune: true, displayBase: pkg.dir, targetLabel: label, extraSkipped,
+      notes: describePackage(pkg.dir, auditReport.safeText),
+    });
+    const scanCode = process.exitCode || 0;
+    const audit = require('../lib/audit');
+    const result = audit.audit({ root: pkg.dir, agents: ['all'], includeHome: false, env: process.env, noPrune: true });
+    const summary = auditReport.summarize(result, 'high');
+    if (result.findings.length) {
+      process.stdout.write('\nConfig audit: ' + result.findings.length + ' finding(s) in ' + label + '\n\n');
+      process.stdout.write(auditReport.toText(result, { toolVersion: VERSION, failOn: 'high', displayRoot: label, color: false }));
+    } else {
+      process.stdout.write('\nConfig audit: no findings in ' + label + '\n');
+    }
+    // A partly walked audit (time budget, entry cap, folder not opened, agent file not fully read) is not a clean one.
+    const gaps = auditCoverageGaps(result);
+    if (gaps.length) process.stdout.write('\nConfig audit incomplete: ' + gaps.join('; ') + '. Exit code 3\n');
+    if (summary.failed || scanCode === 1) return 1;
+    return scanCode || (gaps.length ? 3 : 0);
+  } finally {
+    pkg.cleanup();
+  }
 }
 
 // Secrets broker and agent hooks. Dispatched before the global option parsing
@@ -841,7 +970,7 @@ async function runBrokerCommand(command, rest) {
   process.exitCode = await require('../lib/broker/cli').dispatch(command, rest);
 }
 
-const REACH_USAGE = 'usage: zn-gate reach [path] [--json | --sarif] [--fail-on high|medium|low|none] [--remember]';
+const REACH_USAGE = 'usage: zn-gate reach [path] [--json | --sarif] [--fail-on high|medium|low|none] [--remember]\n       zn-gate reach --history [--json] [--max-seconds N]';
 
 /*
  * zn-gate reach [path] [--json | --sarif] [--fail-on high|medium|low|none]: read only, nothing sent.
@@ -853,12 +982,22 @@ async function runReachCommand(rest) {
   let format = 'text';
   let failOn = 'none';
   let remember = false;
+  let historyMode = false;
+  let maxSeconds = null;
   const usage = (msg) => { process.stderr.write('zn-gate reach: ' + msg + '\n' + REACH_USAGE + '\n'); return 2; };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '-h' || a === '--help') { process.stdout.write(REACH_USAGE + '\nShows what the coding agents on this machine can reach. Read only: nothing is changed or sent.\n'); return 0; }
     // --remember keeps this run's counts in ~/.zn/reach-last.json for the next one; without it nothing is written.
     if (a === '--remember') { remember = true; continue; }
+    // --history: scan the local session histories of the agents for secrets (types and counts only).
+    if (a === '--history') { historyMode = true; continue; }
+    if (a === '--max-seconds' || a.startsWith('--max-seconds=')) {
+      const v = a === '--max-seconds' ? rest[++i] : a.slice('--max-seconds='.length);
+      if (!/^\d{1,4}$/.test(String(v)) || +v < 1 || +v > 3600) return usage('--max-seconds must be a whole number from 1 to 3600');
+      maxSeconds = +v;
+      continue;
+    }
     if (a === '--json' || a === '--sarif') {
       if (format !== 'text') return usage('choose one of --json and --sarif');
       format = a.slice(2);
@@ -874,6 +1013,22 @@ async function runReachCommand(rest) {
     if (target !== null) return usage('only one folder at a time');
     target = a;
   }
+  if (historyMode) {
+    if (target !== null || remember || failOn !== 'none' || format === 'sarif') return usage('--history reads your home folder: it takes only --json and --max-seconds');
+    process.env.ZN_STATS = 'off';
+    const zh = require('../lib/reach/history');
+    let h;
+    try {
+      h = zh.history({ maxSeconds: maxSeconds || undefined });
+    } catch (err) {
+      process.stderr.write('zn-gate reach: could not finish: ' + String((err && err.message) || err).slice(0, 300) + '\n');
+      return 2;
+    }
+    if (format === 'json') process.stdout.write(JSON.stringify(h, null, 2) + '\n');
+    else zh.report(h);
+    return 0;
+  }
+  if (maxSeconds !== null) return usage('--max-seconds goes with --history');
   const root = path.resolve(target || '.');
   let st = null;
   try { st = fs.statSync(root); } catch (_) { st = null; }
@@ -893,8 +1048,147 @@ async function runReachCommand(rest) {
   return zr.failed(r, failOn) ? 1 : 0;
 }
 
+// Options of scan and analyze. Any other option that starts with "--" is refused with exit 2: it is named and
+// the options the command takes are listed. Everything after a bare "--" is positional text, and so is anything
+// that does not start with "--" (analyze text may start with "-").
+const CLOUD_VALUE_OPTIONS = ['--key', '--stage', '--url', '--long-input'];
+const CLOUD_FLAG_OPTIONS = ['--local-only', '--verbose'];
+const COMMAND_OPTIONS = {
+  scan: {
+    value: ['--format', '--include', '--exclude', '--package', ...CLOUD_VALUE_OPTIONS],
+    flag: ['--code', '--all', '--allow-partial', '--include-home', ...CLOUD_FLAG_OPTIONS],
+    listed: ['--format', '--include', '--exclude', '--code', '--all', '--allow-partial', '--include-home', '--package'],
+  },
+  analyze: {
+    value: CLOUD_VALUE_OPTIONS,
+    flag: [...CLOUD_FLAG_OPTIONS, '--json'],
+    listed: CLOUD_VALUE_OPTIONS.concat(CLOUD_FLAG_OPTIONS, ['--json']),
+  },
+};
+
+// The problem with an option of scan or analyze, or null when every option is one the command takes.
+function optionProblem(command, args) {
+  const spec = COMMAND_OPTIONS[command];
+  for (let i = 1; i < args.length; i++) {
+    const tok = args[i];
+    if (tok === '--') break;
+    if (!tok.startsWith('--')) continue;
+    const name = tok.split('=')[0];
+    const shown = tok.replace(/[^\x20-\x7e]/g, '?').slice(0, 40);
+    const takesValue = spec.value.includes(name);
+    if (!takesValue && !spec.flag.includes(name)) {
+      let msg = 'unknown option "' + shown + '". The options of zn-gate ' + command + ' are ' + spec.listed.join(', ') + '.';
+      if (command === 'analyze') msg += ' To analyze text that starts with "--", put "--" before it: zn-gate analyze -- "<text>".';
+      return msg;
+    }
+    if (tok !== name) {
+      return takesValue ? '"' + shown + '": give the value as the next argument, as ' + name + ' VALUE.' : name + ' takes no value.';
+    }
+    if (takesValue) i++;
+  }
+  return null;
+}
+
+// The folder that scan audits: the first argument that is not an option or an option's value; "." when none.
+function scanTargetOf(args) {
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === '--') return args[i + 1] || '.';
+    if (!args[i].startsWith('--')) return args[i];
+    if (COMMAND_OPTIONS.scan.value.includes(args[i])) i++;
+  }
+  return '.';
+}
+
+// The arguments of scan or analyze with every --name=value of a value option split into --name and value.
+// A value after a bare "--" is positional text and is left alone, and so is the value that follows --name
+// in the spaced form, whatever it looks like. An empty value (--format=) becomes --format "" , which is
+// what --format "" has always meant.
+function expandEqualsOptions(command, args) {
+  const spec = COMMAND_OPTIONS[command];
+  if (!spec) return args.slice();
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const tok = args[i];
+    if (tok === '--') {
+      out.push(...args.slice(i));
+      break;
+    }
+    if (!tok.startsWith('--')) {
+      out.push(tok);
+      continue;
+    }
+    const eq = tok.indexOf('=');
+    const name = eq === -1 ? tok : tok.slice(0, eq);
+    if (!spec.value.includes(name)) {
+      out.push(tok);
+      continue;
+    }
+    if (eq !== -1) {
+      out.push(name, tok.slice(eq + 1));
+      continue;
+    }
+    out.push(tok);
+    if (i + 1 < args.length) out.push(args[++i]);
+  }
+  return out;
+}
+
+
+// Commands that take no options or a fixed set. An option they do not know is refused with exit 2: it is named and
+// the options the command takes are listed. -h, --help, -V and --version are handled by the general code, so they pass.
+const GLOBAL_OPTIONS = ['-h', '--help', '-V', '--version'];
+const STATUS_OPTIONS = ['--key', '--stage', '--url', '--local-only', '--verbose'];
+const EVIDENCE_VALUE_OPTIONS = ['--format', '--output', '--port', '--tail'];
+const EVIDENCE_OPTIONS = ['--verify', '--ui', '--export', ...EVIDENCE_VALUE_OPTIONS];
+
+function fixedOptionProblem(label, args, accepted, valueOptions = [], start = 1) {
+  for (let i = start; i < args.length; i++) {
+    const tok = args[i];
+    if (!tok.startsWith('-') || GLOBAL_OPTIONS.includes(tok)) continue;
+    if (accepted.includes(tok)) {
+      if (valueOptions.includes(tok)) i++;
+      continue;
+    }
+    const shown = tok.replace(/[^\x20-\x7e]/g, '?').slice(0, 40);
+    const takes = accepted.length
+      ? 'The options of zn-gate ' + label + ' are ' + accepted.join(', ') + '.'
+      : 'zn-gate ' + label + ' takes no options.';
+    return 'unknown option "' + shown + '". ' + takes;
+  }
+  return null;
+}
+
+// The problem with an option of one of those commands, or null. Other commands are checked where they are dispatched.
+function fixedOptionsProblem(args) {
+  const command = args[0];
+  if (command === 'check' || command === 'doctor') {
+    // --hooks prints the hook list as text; --json prints the agent check. Asking for both would silently drop one.
+    if (args.includes('--hooks') && args.includes('--json')) {
+      return '--hooks and --json cannot be used together. Run zn-gate ' + command + ' --json for the agent check as JSON, '
+        + 'or zn-gate ' + command + ' --hooks for the list of hooks.';
+    }
+    return fixedOptionProblem(command, args, ['--hooks', '--json']);
+  }
+  if (command === 'status') return fixedOptionProblem(command, args, STATUS_OPTIONS, ['--key', '--stage', '--url']);
+  if (command === 'version' || command === '-v') return fixedOptionProblem('version', args, []);
+  if (command === 'test') return fixedOptionProblem(command, args, []);
+  if (command === 'evidence' || command === 'logs' || command === 'export') {
+    return fixedOptionProblem(command, args, EVIDENCE_OPTIONS, EVIDENCE_VALUE_OPTIONS);
+  }
+  if (command === 'team' && args[1] === 'status') return fixedOptionProblem('team status', args, ['--json', '--rules'], [], 2);
+  return null;
+}
+
 async function main() {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
+  // scan and analyze accept --opt=value: it is split into --opt value before the parser reads the arguments.
+  const args = (rawArgs[0] === 'scan' || rawArgs[0] === 'analyze') ? expandEqualsOptions(rawArgs[0], rawArgs) : rawArgs;
+  const fixedProblem = fixedOptionsProblem(args);
+  if (fixedProblem) {
+    process.stderr.write('zn-gate: ' + fixedProblem + '\n');
+    process.exitCode = 2;
+    return;
+  }
   if (args[0] === 'audit') {
     await runAuditCommand(args.slice(1));
     return;
@@ -937,6 +1231,21 @@ async function main() {
   if (args.includes('-V') || args.includes('--version') || args[0] === 'version' || args[0] === '-v') {
     process.stdout.write(`zn-gate ${VERSION} (rules engine: ${RULES_VERSION}; scrub rules: ${SCRUB_RULES_VERSION}; audit rules: ${AUDIT_RULES_VERSION})\n`);
     process.exit(0);
+  }
+
+  if (args[0] === 'scan' || args[0] === 'analyze') {
+    const problem = optionProblem(args[0], args);
+    if (problem) {
+      process.stderr.write('zn-gate: ' + problem + '\n');
+      process.exitCode = 2;
+      return;
+    }
+  }
+
+  // Read-only: explains one block of the local evidence log. No options of its own, no network.
+  if (args[0] === 'why') {
+    process.exitCode = require('../lib/why').runWhy(args.slice(1));
+    return;
   }
 
   // Parse options
@@ -1047,16 +1356,32 @@ ${ruleLine(process.env, 60)}\n`);
 
     const notFound = scanned.filter(e => !e.exists);
     for (const nf of notFound) {
+      if (nf.unreadable) {
+        process.stdout.write(`  ${sym(process.env, '!', col.yellow)}${nf.name.padEnd(20)} [Cannot be read]\n`);
+        process.stdout.write(`    ${sym(process.env, '↳', col.yellow)}${col.yellow(nf.unreadable + ' zn did not change it.')}\n`);
+        continue;
+      }
       process.stdout.write(`  ${sym(process.env, '○', col.gray)}${nf.name.padEnd(20)} [Not installed/configured]\n`);
     }
 
     const totalModified = actions.filter(a => a.status === 'shielded' || a.status === 'reverted').length;
+    const totalFailed = actions.filter(a => a.failed).length;
+    if (totalFailed) {
+      // Exit 1: at least one config could not be changed (see the line above it for the path and the next step).
+      process.stdout.write(`\nDone. Checked ${scanned.length} environment configurations (${totalModified} modified, ${totalFailed} could not be changed).\n\n`);
+      process.exitCode = 1;
+      return;
+    }
     process.stdout.write(`\nDone. Checked ${scanned.length} environment configurations (${totalModified} modified).\n\n`);
     return;
   }
 
+  if (command === 'scan' && args.some((a) => a === '--package' || a.startsWith('--package='))) {
+    process.exitCode = await runScanPackage(args, options);
+    return;
+  }
   if (command === 'scan') {
-    const targetPath = args[1] && !args[1].startsWith('--') ? args[1] : '.';
+    const targetPath = scanTargetOf(args);
     await handleScan(targetPath, options);
     return;
   }
@@ -1064,14 +1389,57 @@ ${ruleLine(process.env, 60)}\n`);
   if (command === 'evidence' || command === 'logs' || command === 'export') {
     if (command === 'export' || options.export) {
       const format = (options.format || 'jsonl').toLowerCase();
-      const res = exportEvidenceLedger(EVIDENCE_FILE, format);
+      if (format !== 'jsonl' && format !== 'csv') {
+        const shown = String(options.format).replace(/[^\x20-\x7e]/g, '?').slice(0, 40);
+        process.stderr.write(`zn-gate: unknown --format "${shown}". The valid formats are jsonl and csv.\n`);
+        process.exitCode = 2;
+        return;
+      }
+      // The log is streamed to the output while its chain is checked, so a log of any size exports
+      // in bounded memory. The output file is opened first, so a path that cannot be written fails
+      // before anything is read.
+      let out = process.stdout;
+      if (options.output) {
+        // Checked before the output is opened, so neither file is touched when the output is the log.
+        if (isEvidenceLogFile(options.output, EVIDENCE_FILE)) {
+          process.stderr.write('zn-gate: the output file is the evidence log itself; choose another path.\n');
+          process.exitCode = 2;
+          return;
+        }
+        try {
+          out = fs.createWriteStream(options.output, { fd: fs.openSync(options.output, 'w') });
+        } catch (err) {
+          process.stderr.write((fsErrorText(err, options.output) || humanError(err)) + '\n');
+          process.exit(1);
+        }
+      }
+      let res;
+      try {
+        res = await writeEvidenceExport(EVIDENCE_FILE, format, out);
+        if (out !== process.stdout) {
+          await new Promise((resolve, reject) => {
+            const fail = (e) => { if (e) e.writeError = true; reject(e); };
+            out.once('error', fail);
+            out.end((e) => (e ? fail(e) : resolve()));
+          });
+        }
+      } catch (err) {
+        if (out !== process.stdout) out.destroy();
+        const incomplete = options.output ? ` ${options.output} is incomplete: do not use it.` : '';
+        if (err && err.writeError) {
+          process.stderr.write((fsErrorText(err, options.output) || humanError(err)) + incomplete + '\n');
+        } else {
+          process.stderr.write(`zn-gate: the export stopped. ${err.message}.${incomplete}\n`);
+        }
+        process.exitCode = 1;
+        return;
+      }
       if (!res.valid) process.stderr.write(`Tamper detected: ${res.error}\n${recoveryHint()}\n`);
       if (options.output) {
-        fs.writeFileSync(options.output, res.content, 'utf8');
         process.stdout.write(`Exported ${res.total} audit records to ${options.output} (Integrity: ${res.valid ? 'VALID' : 'TAMPERED'}).\n`);
-      } else {
-        process.stdout.write(res.content);
       }
+      // A log whose chain does not verify in full is not proof: exit 1, like --verify.
+      if (!res.valid) process.exitCode = 1;
       return;
     }
 
@@ -1082,14 +1450,25 @@ ${ruleLine(process.env, 60)}\n`);
 
     if (options.verify) {
       const verification = verifyEvidenceLedger();
+      let integrity;
+      if (verification.valid) {
+        integrity = sym(process.env, '✔', col.green) + col.green('ALL SHA-256 HASHES VERIFIED (IMMUTABLE)');
+      } else if (verification.truncated_tail) {
+        integrity = sym(process.env, '✖', col.red) + col.red('LAST RECORD INCOMPLETE: CUT OFF OR REMOVED (NOT VERIFIED)');
+      } else {
+        integrity = sym(process.env, '✖', col.red) + col.red('TAMPER DETECTED AT RECORD ' + verification.broken_index);
+      }
       process.stdout.write(`
 ${sym(process.env, '🔒')}Cryptographic Evidence Ledger Verification:
   Ledger Path   : ${EVIDENCE_FILE}
   Total Records : ${verification.total}
-  Integrity     : ${verification.valid ? sym(process.env, '✔', col.green) + col.green('ALL SHA-256 HASHES VERIFIED (IMMUTABLE)') : sym(process.env, '✖', col.red) + col.red('TAMPER DETECTED AT RECORD ' + verification.broken_index)}
+  Integrity     : ${integrity}
 \n`);
       if (!verification.valid) {
-        process.stdout.write(`  Details: ${verification.error}\n  ${recoveryHint()}\n\n`);
+        const next = verification.truncated_tail
+          ? `The first ${verification.verified} records verified; the last line is incomplete (cut off by a crash, or removed by someone). ${recoveryHint()}`
+          : recoveryHint();
+        process.stdout.write(`  Details: ${verification.error}\n  ${next}\n\n`);
         process.exit(1);
       }
       return;
@@ -1111,8 +1490,8 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
       process.stdout.write('  No events recorded yet.\n\n');
     } else {
       for (const rec of stats.recent.slice(-options.tail)) {
-        const isBlock = rec.verdict === 'block';
-        const vTag = isBlock ? col.red('BLOCK') : (rec.verdict === 'shadow' ? col.yellow('SHADOW') : col.green('ALLOW'));
+        const isBlock = isBlockVerdict(rec.verdict);
+        const vTag = isBlock ? col.red('BLOCK') : (String(rec.verdict).toLowerCase() === 'shadow' ? col.yellow('SHADOW') : col.green('ALLOW'));
         process.stdout.write(`  ${(rec.timestamp || '').slice(11, 19)} [${vTag}] tool=${rec.tool_name || 'call'} rule=${rec.rule || 'none'} hash=${(rec.record_hash || '').slice(0, 10)}...\n`);
       }
       process.stdout.write(`\nTip: Run 'zn-gate evidence --ui' to open interactive dashboard.\n\n`);
@@ -1144,15 +1523,34 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
     return;
   }
 
+  if ((command === 'check' || command === 'doctor') && args.includes('--hooks')) {
+    // Lists the installed hooks and whether each is OK, stale or broken; reads files only.
+    const hl = require('../lib/hooks-list');
+    process.exitCode = hl.report(hl.listHooks({}));
+    return;
+  }
+
   if (command === 'test') {
     await runTestSuite(options);
     return;
   }
 
   if (command === 'check' || command === 'doctor') {
+    const statsWereOn = require('../lib/stats').enabled();
     process.env.ZN_STATS = 'off'; // the test read is not counted in zn-gate stats
     const zc = require('../lib/check');
+    if (args.includes('--json')) {
+      // One JSON object on stdout and nothing else; same exit codes as the text form.
+      const data = await zc.check({});
+      let rulesErrors = [];
+      try { rulesErrors = require('../lib/rules').loadCustomConfig(true).errors.map(String); } catch (_) { /* never fails on the rules file */ }
+      const out = zc.toJson(data, { version: require('../package.json').version, rulesErrors });
+      process.stdout.write(JSON.stringify(out, null, 2) + '\n');
+      process.exitCode = out.exit_code;
+      return;
+    }
     process.exitCode = zc.report(await zc.check({}));
+    process.stdout.write('\n' + require('../lib/stats').latencyReport({ off: !statsWereOn }) + '\n');
     try {
       const cfg = require('../lib/rules').loadCustomConfig(true);
       if (cfg.errors.length > 0) {
@@ -1162,6 +1560,12 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
         process.exitCode = 1;
       }
     } catch (_) { /* the check never fails on the rules file */ }
+    try {
+      // One line on hook health from the same helper as `check --hooks`; it never changes the exit code.
+      const hl = require('../lib/hooks-list');
+      const line = hl.summaryLine(hl.listHooks({}));
+      if (line) process.stdout.write(line + '\n\n');
+    } catch (_) { /* the summary is only a hint */ }
     return;
   }
 
@@ -1186,10 +1590,11 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
   }
 
   if (command === 'analyze') {
-    const textArgs = args.filter((a, idx) => {
+    const dashAt = args.indexOf('--');
+    const textArgs = dashAt !== -1 ? args.slice(dashAt + 1) : args.filter((a, idx) => {
       if (idx === 0) return false;
       if (a.startsWith('--')) return false;
-      if (idx > 0 && args[idx - 1].startsWith('--') && args[idx - 1] !== '--local-only' && args[idx - 1] !== '--verbose') return false;
+      if (idx > 0 && args[idx - 1].startsWith('--') && args[idx - 1] !== '--local-only' && args[idx - 1] !== '--verbose' && args[idx - 1] !== '--json') return false;
       return true;
     });
 
@@ -1200,8 +1605,11 @@ Recent Events (last ${Math.min(options.tail, stats.total)}):
     }
 
     const result = await analyze(textToAnalyze, options);
+    if (result.degraded) {
+      process.stderr.write('[zn-gate] Warning: the cloud model was unavailable, so this verdict comes from the cloud gate fallback rules, not from its model.\n');
+    }
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
-    process.exit(result.verdict === 'block' ? 2 : 0);
+    process.exit(isBlockVerdict(result.verdict) ? 2 : 0);
   }
 
   if (command === 'status') {
@@ -1258,6 +1666,11 @@ ${sym(process.env, '🛡️', undefined, '  ')}zn-gate Status:
         if (notes.length) process.stdout.write('\n');
       }
     } catch (_) { /* status never fails on this check */ }
+    // Hooks written by an older zn-gate (read-only, no network; a warning only: it never changes the exit status).
+    try {
+      const w = require('../lib/hooks-list').staleWarning({});
+      if (w) process.stdout.write(w);
+    } catch (_) { /* status never fails on this check */ }
     // An end-of-life or unpatched Node.js (a warning only: it never changes the exit status).
     try {
       const adv = require('../lib/node-support').nodeAdvice(process.versions.node);
@@ -1271,6 +1684,6 @@ ${sym(process.env, '🛡️', undefined, '  ')}zn-gate Status:
 }
 
 main().catch((err) => {
-  process.stderr.write(`[zn-gate] Fatal error: ${err.message}\n`);
+  process.stderr.write(humanError(err) + '\n');
   process.exit(1);
 });

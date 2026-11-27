@@ -1,0 +1,13 @@
+{
+  "description": "The agent versions zn-gate was last tested with, one per agent. This file is the single source: `zn-gate check` reads it, and a test keeps the versions in docs/compat.md the same. A null version means no agent version was recorded for that agent.",
+  "agents": {
+    "claude-code": { "name": "Claude Code", "tested": null, "docsName": null, "command": "claude" },
+    "codex": { "name": "Codex CLI", "tested": "0.163.0", "docsName": "Codex CLI", "command": "codex" },
+    "cursor": { "name": "Cursor", "tested": null, "docsName": null, "command": null },
+    "opencode": { "name": "OpenCode", "tested": "1.19.3", "docsName": "OpenCode", "command": "opencode" },
+    "antigravity": { "name": "Antigravity", "tested": "1.4.7", "docsName": "`agy` CLI", "command": "agy" },
+    "copilot": { "name": "GitHub Copilot", "tested": "1.0.98", "docsName": "GitHub Copilot CLI", "command": "copilot" },
+    "gemini": { "name": "Gemini CLI", "tested": "0.64.0", "docsName": "Gemini CLI", "command": "gemini" },
+    "zcode": { "name": "ZCode", "tested": "3.16.3", "docsName": "ZCode desktop app", "command": null }
+  }
+}

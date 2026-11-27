@@ -1,8 +1,8 @@
 {
   "name": "zn-gate",
   "mcpName": "io.github.usezn/zn-gate",
-  "version": "1.15.0",
-  "description": "The local security layer for coding agents. zn-gate guards your secrets, your data and your systems while you use Claude Code, Codex CLI, Cursor, OpenCode, Antigravity or ZCode desktop app.",
+  "version": "1.18.0",
+  "description": "The local security layer for coding agents. zn-gate guards your secrets, your data and your systems while you use Claude Code, Codex CLI, Cursor, OpenCode, Antigravity or ZCode desktop app (plus Gemini CLI (experimental) and Copilot CLI (experimental)). No account, and nothing is sent by default; the optional cloud check uses the Galvanize 3.1 classifier.",
   "license": "MIT",
   "author": "usezn <admin@usezn.com>",
   "homepage": "https://usezn.com",
@@ -38,7 +38,8 @@
   "types": "lib/client.d.ts",
   "scripts": {
     "postinstall": "node lib/agents/refresh.js",
-    "test": "node test/run-all.js"
+    "test": "node test/run-all.js",
+    "check:rules": "node --test test/rules_snapshot.test.js"
   },
   "contentPolicy": {
     "class": "dual-use"
@@ -63,6 +64,9 @@
   "devDependencies": {
     "c8": "12.0.0",
     "fast-check": "4.10.2",
-    "typescript": "5.9.3"
+    "typescript": "7.0.2"
+  },
+  "overrides": {
+    "minimatch": "^11.0.1"
   }
 }

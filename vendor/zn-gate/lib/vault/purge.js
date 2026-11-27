@@ -224,8 +224,7 @@ async function purgeVault(opts, io) {
     if (note) out(note);
     return 0;
   }
-  const policyFiles = policy.paths(o);
-  if ([policyFiles.teamFile, policyFiles.policyFile].some((x) => fs.existsSync(x))) { process.stderr.write('[zn] ' + reset.TEAM_REFUSAL + '\n'); return 1; }
+  if (policy.onTeamMachine(o)) { process.stderr.write('[zn] ' + reset.TEAM_REFUSAL + '\n'); return 1; }
   if (await daemon.isRunning(o)) { process.stderr.write('[zn] The vault is unlocked. Run `' + zn('lock') + '` first, then `' + zn('vault purge') + '`.\n'); return 1; }
 
   out('This deletes the vault for good, with every backup. It cannot be undone. These ' + t.files.length + ' files will be deleted:');

@@ -126,7 +126,7 @@ function absolutePath(pathValue, platform = process.platform, where = {}) {
 
 /*
  * An absolute PATH entry can still point into the project zn runs in: its bin/, node_modules/.bin, a folder direnv adds.
- * trustedPath drops the entries whose real path is in the folder zn runs in (`cwd`), the git work tree around it, the
+ * trustedPath drops the entries whose real path is in the folder zn runs in (`cwd`), the git work trees around it, the
  * project the agent names (CLAUDE_PROJECT_DIR) or a node_modules folder, the rule of the plugins' zn-node.sh. The home
  * folder and the folders above it are never the project (a Node.js from nvm or volta there stays). Real paths and the
  * work tree are looked up once per process: this runs on every hook.
@@ -150,31 +150,66 @@ function insideOrSame(p, dir) {
 }
 
 const GIT_ROOTS = new Map();
-function gitRootOf(dir) {
+/*
+ * The git work trees around `dir`, nearest first. The nearest is found however far up it is; after it the walk goes on
+ * for at most 8 more levels, so a repository inside another one counts with the one around it (a bin/ of the outer
+ * repository is as much the project's as the inner one's).
+ */
+function gitRootsOf(dir) {
   const start = path.resolve(dir);
   if (GIT_ROOTS.has(start)) return GIT_ROOTS.get(start);
-  let root = null;
+  const roots = [];
+  let extra = 0;
   for (let cur = start; ; cur = path.dirname(cur)) {
-    try { if (fs.existsSync(path.join(cur, '.git'))) { root = cur; break; } } catch (_) { /* keep going */ }
+    try { if (fs.existsSync(path.join(cur, '.git'))) roots.push(cur); } catch (_) { /* keep going */ }
+    if (roots.length && ++extra > 8) break;
     if (path.dirname(cur) === cur) break;
   }
   if (GIT_ROOTS.size > 64) GIT_ROOTS.clear();
-  GIT_ROOTS.set(start, root);
-  return root;
+  GIT_ROOTS.set(start, roots);
+  return roots;
 }
 
-/* The folders a program must not come from: the folder zn runs in, its git work tree and the agent's project. */
+/*
+ * Without a git work tree the project has no marker to find, so the nearest folder above `dir` (8 levels at most) that
+ * holds a project file stands for it. CLAUDE_PROJECT_DIR, when the agent sets it, is better and always counts too.
+ */
+const PROJECT_FILES = ['package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod', 'Gemfile', 'pom.xml', 'composer.json', 'CLAUDE.md', 'AGENTS.md'];
+function projectRootOf(dir, stop) {
+  let cur = path.resolve(dir);
+  for (let i = 0; i <= 8 && path.dirname(cur) !== cur && cur !== stop; i++, cur = path.dirname(cur)) {
+    if (PROJECT_FILES.some((f) => { try { return fs.existsSync(path.join(cur, f)); } catch (_) { return false; } })) return cur;
+  }
+  return null;
+}
+
+/*
+ * The folders a program must not come from: the folder zn runs in, the git work trees around it, the agent's project
+ * (CLAUDE_PROJECT_DIR) and, with no git work tree, the nearest folder with a project file.
+ *
+ * The home folder and the folders above it are never the project: Node.js, zn and the other tools are installed in many
+ * places there (nvm, volta, fnm, asdf, pyenv, ~/.local/bin, a global npm prefix), and skipping them would leave the hooks
+ * with nothing to start. A home folder that is itself a git work tree (dotfiles) is therefore treated as no work tree
+ * at all: the folder zn runs in and the nearest folder with a project file still count, the rest of the home does not.
+ */
 function projectPlaces(cwd, env, win) {
   const e = env || process.env;
   const here = cwd || process.cwd();
   const home = realKey(e.HOME || e.USERPROFILE || os.homedir(), win);
+  const roots = gitRootsOf(here).filter((r) => !insideOrSame(home, realKey(r, win)));
+  const extra = roots.length ? [] : [projectRootOf(here, home)];
   const out = [];
-  for (const d of [here, gitRootOf(here), e.CLAUDE_PROJECT_DIR]) {
+  for (const d of [here, ...roots, ...extra, e.CLAUDE_PROJECT_DIR]) {
     if (!d || !path.isAbsolute(String(d))) continue;
     const k = realKey(String(d), win);
     if (!insideOrSame(home, k) && !out.includes(k)) out.push(k);
   }
   return out;
+}
+
+/* Is `real` inside one of the places? */
+function inPlaces(real, places) {
+  return places.some((d) => insideOrSame(real, d));
 }
 
 // A PATH entry (a folder) is untrusted in the project or in any node_modules folder (node_modules/.bin).
@@ -186,7 +221,7 @@ function untrustedPlace(real, places) {
 // fnm) links bin/<prog> to ../lib/node_modules/<package>/..., which is not the project, while a link into the
 // project's own node_modules still is.
 function inProject(real, places) {
-  return places.some((d) => insideOrSame(real, d));
+  return inPlaces(real, places);
 }
 
 // The node_modules folder right in the home folder: packages installed with a package.json in ~, never a global install
@@ -495,6 +530,7 @@ function psEnv(ps, base, extra) {
 module.exports = { programInProject,
   absolutePath,
   projectPlaces,
+  inPlaces,
   trustedPath,
   programEnv,
   findProgram,

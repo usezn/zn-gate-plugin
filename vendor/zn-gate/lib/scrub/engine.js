@@ -46,10 +46,21 @@ const { findPatterns, findPii, hintsIn, SECRET_TYPES, PII_TYPES } = require('./p
 const { collectSources, buildMatcher, MIN_LENGTH } = require('./exact');
 const { find: findCustom } = require('../team/detectors');
 const { CODES } = require('../errors');
+const { cliName } = require('../zn-command');
 const { warnNotice, WARN_REASON } = require('../team/effective');
 /* The vault's resolve-policy answer version this engine understands. */
 const RESOLVE_POLICY = 1;
 const { invisibleView } = require('../rules');
+// normalize.js is loaded on first use. A text with no candidate (a %XX, '' or "") has no decoded view, which is what
+// normalisedView returns for it, so such a text never loads the module. NORM_CANDIDATE must stay equal to CANDIDATE_RE
+// in normalize.js (a test compares the two); this copy has no `g` flag, so it keeps no state between calls.
+const NORM_CANDIDATE = /%[0-9A-Fa-f]{2}|''|""/;
+let normalizeModule = null;
+function normalisedView(text) {
+  if (!NORM_CANDIDATE.test(text)) return null;
+  if (normalizeModule === null) normalizeModule = require('./normalize');
+  return normalizeModule.normalisedView(text);
+}
 
 const TOKEN_SOURCE = '__ZN_([A-Z0-9](?:[A-Z0-9_]*[A-Z0-9])?)__';
 const TOKEN_RE = new RegExp(TOKEN_SOURCE, 'g');
@@ -164,13 +175,65 @@ function scan(text, ctx) {
   // union is resolved as one set of spans.
   const direct = scanText(text, c);
   const view = invisibleView(text);
-  if (!view) return direct;
-  const viaView = scanText(view.clean, c).map((s) => ({
-    ...s,
-    start: view.map[s.start],
-    end: s.end > s.start ? view.map[s.end - 1] + 1 : view.map[s.start],
-  }));
-  return resolveOverlaps(direct.concat(viaView));
+  const norm = normalisedView(text);
+  if (!view && !norm) return direct;
+  let all = direct;
+  if (view) {
+    all = all.concat(scanText(view.clean, c).map((s) => ({
+      ...s,
+      start: view.map[s.start],
+      end: s.end > s.start ? view.map[s.end - 1] + 1 : view.map[s.start],
+    })));
+  }
+  // Shell-split quotes and percent-encoding: scanned as one decoded view; a
+  // span covers the whole original word or encoded value.
+  if (norm) {
+    for (const [from, to] of normWindows(norm, c)) {
+      all = all.concat(scanText(from === 0 && to === norm.clean.length ? norm.clean : norm.clean.slice(from, to), c).map((s) => {
+        const a = s.start + from;
+        return { ...s, start: norm.starts[a], end: s.end > s.start ? norm.ends[s.end + from - 1] : norm.starts[a] };
+      }));
+    }
+  }
+  return resolveOverlaps(all);
+}
+
+// Only the text around a changed spot can give a span the direct scan did not
+// find, so the decoded view is rescanned in windows (the changed offsets plus
+// NORM_MARGIN characters each side, widened to whole lines and merged) instead
+// of in full. A vault that matches remotely answers per full text, so there
+// the whole view is scanned.
+const NORM_MARGIN = 512;
+function normWindows(norm, c) {
+  const text = norm.clean;
+  const n = text.length;
+  if (c.vaultRemote) return [[0, n]];
+  const out = [];
+  let from = -1;
+  let to = -1;
+  let nlAt = -2; // forward newline search cache: -2 none yet, -1 no newline after nlFrom
+  let nlFrom = 0;
+  for (const m of norm.marks) {
+    if (m - NORM_MARGIN <= to && from >= 0) {
+      // overlaps the open window: extend it
+    } else {
+      if (from >= 0) out.push([from, to]);
+      from = Math.max(0, m - NORM_MARGIN);
+      from = from === 0 ? 0 : text.lastIndexOf('\n', from - 1) + 1;
+    }
+    let e = Math.min(n, m + NORM_MARGIN);
+    if (e < n) {
+      // e never goes down: a newline found before is still the next one while it is at or after e, and "none" stays true,
+      // so a text with many marks and no newline is not searched to its end once per mark.
+      if (nlAt === -1 && e >= nlFrom) { /* still none */ }
+      else if (nlAt >= e) { /* still the next one */ }
+      else { nlFrom = e; nlAt = text.indexOf('\n', e); }
+      e = nlAt < 0 ? n : nlAt;
+    }
+    if (e > to) to = e;
+  }
+  if (from >= 0) out.push([from, to]);
+  return out;
 }
 
 function scanText(text, c) {
@@ -240,7 +303,7 @@ function vaultUnavailableOnPurpose(err) {
 function vaultInfoFailure(err) {
   const why = String((err && err.message) || 'unknown error');
   return Object.assign(new Error('zn could not read what your secret vault protects (' + why + '), so it cannot check this against your vault values. ' +
-    'Make sure the vault is running and unlocked (zn unlock), then try again.'), { code: CODES.LOCKED, vaultFailed: true, vaultUnanswered: true, cause: err });
+    'Make sure the vault is running and unlocked (' + cliName('zn') + ' unlock), then try again.'), { code: CODES.LOCKED, vaultFailed: true, vaultUnanswered: true, cause: err });
 }
 
 
@@ -381,14 +444,24 @@ async function prepare(ctx) {
   return c;
 }
 
+/* The texts scan() reads for `text`: itself, without invisible characters, and decoded (split quotes, %XX). The vault
+ * daemon is asked about each one, so scanText finds an answer for every view. */
+function textsToFetch(text) {
+  const out = [text];
+  const view = invisibleView(text);
+  if (view) out.push(view.clean);
+  const norm = normalisedView(text);
+  if (norm && !out.includes(norm.clean)) out.push(norm.clean);
+  return out;
+}
+
 /* scan() for a prepared context, with the vault's matches: the daemon says where its values occur in the text (and in
  * the text without invisible characters, which scan() also reads). -> {spans}. When the vault does not answer it throws
  * (ZN_LOCKED, vaultFailed): a text scanned without the vault's values would look clean, so the caller must hold the
  * text back (the post-hook withholds it, the other hooks follow their fail mode, the stream writes a notice). */
 async function scanChecked(text, c) {
   if (!c.vaultRemote || text.length === 0) return { spans: scan(text, c) };
-  const view = invisibleView(text);
-  const want = view ? [text, view.clean] : [text];
+  const want = textsToFetch(text);
   const memo = c.vaultMemo;
   const missing = memo ? want.filter((t) => !memo.has(t)) : want;
   const got = missing.length ? await fetchVaultSpans(c, missing) : { map: new Map(), failed: false };
@@ -409,9 +482,7 @@ async function warm(ctx, texts) {
   const all = new Set();
   for (const t of texts) {
     if (typeof t !== 'string' || t.length === 0 || (t.length < MIN_LENGTH && !(c.vaultRemote.shortCount > 0))) continue;
-    all.add(t);
-    const view = invisibleView(t);
-    if (view) all.add(view.clean);
+    for (const w of textsToFetch(t)) all.add(w);
   }
   if (all.size === 0) return c;
   const { map, failed } = await fetchVaultSpans(c, [...all]);

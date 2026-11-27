@@ -10,7 +10,8 @@
  *
  * It only decides for plain ASCII text. Anything with a non-ASCII character
  * (invisible characters, homoglyphs, bidirectional marks, other scripts), an
- * ANSI escape or a C-style comment goes to the full rules, because the rules
+ * invisible control character, an ANSI escape or a C-style comment goes to the
+ * full rules, because the rules
  * normalise those before matching. In plain ASCII text the only normalisation
  * left is joining words split across lines, which removes whitespace; so the
  * hints below are looked for in the text with all whitespace removed, and every
@@ -22,7 +23,8 @@
  * together with the rules.
  */
 
-const NON_ASCII_RE = /[^\x00-\x7f]/;
+// Non-ASCII, or one of the control characters the rules count as invisible (size:invisible).
+const NON_ASCII_RE = /[^\x00-\x7f]|[\x00-\x08\x0e-\x1a\x1c-\x1f]/;
 const NORMALIZED_AWAY_RE = /\x1b|\/\*/;
 const WHITESPACE_RE = /\s+/g;
 const MAX_PREFILTER_CHARS = 256 * 1024;

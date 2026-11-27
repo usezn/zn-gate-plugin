@@ -9,7 +9,7 @@
  *   zn team managed-config [--agent claude-code|cursor|codex|all] [--os macos|linux|windows|all]
  *                          [--managed-hooks-only] [--exclusive-mcp] [--json]
  *
- * The hook commands are the ones `zn hooks install --scope project` writes
+ * The hook commands are the ones `zn hooks install --project` writes
  * (`zn hook <agent>`, see lib/agents/config-file.js hookCommand), so each
  * machine needs zn-gate installed with `zn` on the PATH, and the policy check
  * of `zn hooks install` (lib/agents/managed-policy.js) recognizes them as zn's.
@@ -70,7 +70,8 @@ const INSTALL_NOTE = 'zn-gate must be installed on each machine with `zn` on the
 // The hooks run `zn` from the PATH inside zn's start guard, as a project install writes them (launcher.projectShCommand):
 // a missing zn or Node.js blocks, and neither zn, node nor powershell.exe can come from the folder the agent runs in.
 // On Windows, Codex runs command_windows through cmd.exe, so it names powershell.exe through %SystemRoot%.
-const shGuard = (agent) => (event) => launcher.projectShCommand(agent, event);
+// The scrub of the guard follows the system the file is for (Git Bash on Windows needs the form that reads names in any case), not the one running this command.
+const shGuard = (agent, os) => (event) => launcher.projectShCommand(agent, event, { platform: os === 'windows' ? 'win32' : 'linux' });
 const winGuard = (agent, opts) => (event) => launcher.windowsScriptCommand(launcher.projectWindowsScript(agent, event), opts);
 
 function osDefault() {
@@ -112,7 +113,7 @@ function claudeFiles(os, opts) {
   const dir = managedDir(PLATFORM[os]);
   // ourHooks gives one matcher group per event; settings hold a list of groups per event.
   // Claude Code runs hook commands through sh (Git Bash on Windows), so every OS gets the sh guard.
-  const settings = { hooks: Object.fromEntries(Object.entries(claude.ourHooks(shGuard('claude-code'))).map(([e, g]) => [e, [g]])) };
+  const settings = { hooks: Object.fromEntries(Object.entries(claude.ourHooks(shGuard('claude-code', os))).map(([e, g]) => [e, [g]])) };
   if (opts.managedHooksOnly) settings.allowManagedHooksOnly = true;
   const files = [{
     file: join(os, dir, 'managed-settings.json'),
@@ -143,7 +144,7 @@ function claudeFiles(os, opts) {
 
 function cursorFiles(os, opts) {
   // Cursor wraps hook commands in PowerShell on Windows: the PowerShell form of the guard there.
-  const entries = cursor.hookEntries(os === 'windows' ? winGuard('cursor') : shGuard('cursor'));
+  const entries = cursor.hookEntries(os === 'windows' ? winGuard('cursor') : shGuard('cursor', os));
   const notes = [
     'If this file already exists, merge the "hooks" entries into it.',
     'failClosed is on for beforeReadFile and beforeSubmitPrompt: if the hook crashes, times out or prints nothing, Cursor blocks the read or the prompt.',

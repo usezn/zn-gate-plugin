@@ -3,6 +3,25 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { fsErrorText } = require('./errors');
+const { configParseError } = require('./config-parse');
+
+// What to tell the user to do by hand when a config cannot be parsed (the file is never rewritten then).
+const WRAP_BY_HAND = 'wrap the MCP servers by hand with zn-gate shield (see docs/shield.md)';
+
+/**
+ * JSON.parse with the plain-language error of lib/config-parse.js. A file that
+ * does not parse is "manual": zn-gate does not rewrite it. The caller strips the BOM.
+ */
+function parseConfigJson(raw, file) {
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    const err = new Error(configParseError(file, raw, e, WRAP_BY_HAND));
+    err.manual = true;
+    throw err;
+  }
+}
 
 /*
  * Config formats (verified against each agent's official docs, 2026-10-11):
@@ -74,7 +93,7 @@ function shieldArgv(originalArgv, options) {
 // ---------------------------------------------------------------------------
 const mcpServersJson = {
   list(raw, env) {
-    const json = JSON.parse(raw);
+    const json = parseConfigJson(raw, env.filePath);
     const srvs = json[env.key || 'mcpServers'] || {};
     return Object.entries(srvs).map(([name, cfg]) => {
       const command = (cfg && cfg.command) || '';
@@ -83,7 +102,7 @@ const mcpServersJson = {
     });
   },
   shield(raw, env, options) {
-    const json = JSON.parse(raw);
+    const json = parseConfigJson(raw, env.filePath);
     const srvs = json[env.key || 'mcpServers'] || {};
     let modified = false;
     for (const cfg of Object.values(srvs)) {
@@ -102,13 +121,7 @@ const mcpServersJson = {
 // Adapter: OpenCode  { mcp: { name: { type: "local", command: [..] } } }
 // ---------------------------------------------------------------------------
 function parseStrictJson(raw, filePath) {
-  try {
-    return JSON.parse(raw);
-  } catch (e) {
-    const err = new Error(`${path.basename(filePath)} is not strict JSON (comments/trailing commas?). Not rewriting it; add zn-gate manually.`);
-    err.manual = true;
-    throw err;
-  }
+  return parseConfigJson(raw, filePath);
 }
 
 const opencodeJson = {
@@ -298,10 +311,18 @@ function scanEnvironments(customEnvList = null) {
   for (const env of envs) {
     const exists = fs.existsSync(env.filePath);
     let servers = [];
+    // existsSync says false for a folder it may not enter: tell "not there" from "cannot be read".
+    let unreadable = '';
+    if (!exists) {
+      try { fs.lstatSync(env.filePath); } catch (e) {
+        if (e && (e.code === 'EACCES' || e.code === 'EPERM')) unreadable = require('./errors').fsErrorText(e, env.filePath) || '';
+      }
+    }
 
     if (exists) {
       try {
-        const raw = fs.readFileSync(env.filePath, 'utf8');
+        // A leading byte order mark is not part of the JSON: it is dropped here and put back when the file is written.
+        const raw = fs.readFileSync(env.filePath, 'utf8').replace(/^﻿/, '');
         servers = adapterFor(env).list(raw, env);
       } catch (e) {
         servers = [{ name: 'error', error: e.message }];
@@ -312,6 +333,7 @@ function scanEnvironments(customEnvList = null) {
     results.push({
       ...env,
       exists,
+      unreadable,
       servers,
       serverCount: valid.length,
       allShielded: valid.length > 0 && valid.filter((s) => !s.remote).every((s) => s.shielded),
@@ -451,6 +473,47 @@ function assertRealDir(dir) {
   }
 }
 
+/**
+ * Creates a new temp file (never reusing an existing one), writes data to it, then calls commit(tmpFile).
+ * If any step fails, the temp file is removed, so a full disk never leaves a 0-byte or half-written file behind.
+ * The temp file is only removed once it was created by this call (an open that fails with EEXIST is not ours).
+ */
+function writeTempThen(tmpFile, data, mode, commit) {
+  let fd;
+  let ours = false;
+  try {
+    fd = fs.openSync(tmpFile, 'wx', mode);
+    ours = true;
+    let off = 0;
+    while (off < data.length) {
+      const n = fs.writeSync(fd, data, off, data.length - off);
+      if (!(n > 0)) throw Object.assign(new Error('write made no progress'), { code: 'EIO' });
+      off += n;
+    }
+    const toClose = fd;
+    fd = undefined;
+    fs.closeSync(toClose);
+    try {
+      fs.chmodSync(tmpFile, mode);
+    } catch {}
+    commit(tmpFile);
+  } catch (err) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+    if (ours) {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {}
+    }
+    // Name the file that was being written (the temp name maps back to the real name in the message).
+    if (err && typeof err === 'object' && !err.path) err.path = tmpFile;
+    throw err;
+  }
+}
+
 /** Writes content to a temp file next to target, then renames it over target. */
 function atomicWrite(target, content) {
   assertRealDir(path.dirname(target));
@@ -459,22 +522,7 @@ function atomicWrite(target, content) {
     mode = fs.statSync(target).mode & 0o777;
   } catch {}
   const tmpFile = path.join(path.dirname(target), `.${path.basename(target)}.zn-tmp.${process.pid}.${Date.now()}`);
-  let created = false;
-  try {
-    fs.writeFileSync(tmpFile, content, { flag: 'wx', mode });
-    created = true;
-    try {
-      fs.chmodSync(tmpFile, mode);
-    } catch {}
-    renameWithRetry(tmpFile, target);
-  } catch (err) {
-    if (created) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {}
-    }
-    throw err;
-  }
+  writeTempThen(tmpFile, Buffer.from(content, 'utf8'), mode, (tmp) => renameWithRetry(tmp, target));
 }
 
 /**
@@ -501,23 +549,10 @@ function createBackup(src, backup) {
   } catch {}
   const data = fs.readFileSync(src);
   const tmpFile = path.join(path.dirname(backup), `.${path.basename(backup)}.zn-tmp.${process.pid}.${Date.now()}`);
-  let created = false;
-  try {
-    fs.writeFileSync(tmpFile, data, { flag: 'wx', mode });
-    created = true;
-    try {
-      fs.chmodSync(tmpFile, mode);
-    } catch {}
+  writeTempThen(tmpFile, data, mode, (tmp) => {
     if (!lstatMissing()) throw exists();
-    renameWithRetry(tmpFile, backup);
-  } catch (err) {
-    if (created) {
-      try {
-        fs.unlinkSync(tmpFile);
-      } catch {}
-    }
-    throw err;
-  }
+    renameWithRetry(tmp, backup);
+  });
 }
 
 /** Renames over target; on Windows-style sharing errors waits briefly and retries. */
@@ -605,7 +640,15 @@ function configureEnvironments(options = {}) {
           }
           actions.push({ env: env.name, status: 'reverted', from: latestBak });
         } catch (err) {
-          actions.push({ env: env.name, status: 'skipped_unsafe', file: env.filePath, error: `${latestBak}: ${err.message}; skipped` });
+          // A full or unwritable disk is a failure of the command (the config stays as it is, and the exit code says so).
+          const fsText = fsErrorText(err, latestBak);
+          actions.push({
+            env: env.name,
+            status: 'skipped_unsafe',
+            file: env.filePath,
+            error: fsText ? `${fsText} The servers stay as they are; zn did not change the file.` : `${latestBak}: ${err.message}; skipped`,
+            ...(fsText ? { failed: true } : {}),
+          });
         }
       } else if (env.serverCount > 0) {
         actions.push({ env: env.name, status: 'no_backup_found' });
@@ -620,14 +663,15 @@ function configureEnvironments(options = {}) {
     }
 
     try {
-      const raw = fs.readFileSync(env.filePath, 'utf8');
-      const { modified, content, manual } = adapterFor(env).shield(raw, env, options);
+      const text = fs.readFileSync(env.filePath, 'utf8');
+      const bom = text.charCodeAt(0) === 0xFEFF; // kept: the file is written back with the same first bytes
+      const { modified, content, manual } = adapterFor(env).shield(bom ? text.slice(1) : text, env, options);
 
       let backup;
       if (modified && !options.dryRun) {
         backup = path.join(resolved.dir, `${path.basename(env.filePath)}.bak.${Date.now()}`);
         createBackup(resolved.target, backup);
-        atomicWrite(resolved.target, content);
+        atomicWrite(resolved.target, (bom ? '﻿' : '') + content);
       }
 
       if (modified) {
@@ -645,7 +689,11 @@ function configureEnvironments(options = {}) {
         actions.push({ env: env.name, status: 'already_shielded' });
       }
     } catch (err) {
-      actions.push({ env: env.name, status: err.manual ? 'manual_required' : 'error', error: err.message, file: env.filePath });
+      const status = err.manual ? 'manual_required' : 'error';
+      // The file is not changed when a write fails (temp file removed, rename not reached): say so with the path.
+      const fsText = fsErrorText(err, env.filePath);
+      const error = fsText ? `${fsText} The servers stay unwrapped; zn did not change the file.` : err.message;
+      actions.push({ env: env.name, status, error, file: env.filePath, ...(status === 'error' ? { failed: true } : {}) });
     }
   }
 

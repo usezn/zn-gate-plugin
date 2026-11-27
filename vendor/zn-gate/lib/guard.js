@@ -52,9 +52,9 @@ class NestingTooDeep extends Error {}
  * limit, so callers can fail closed. A container that contains itself is walked
  * once.
  */
-function extractStrings(data, maxDepth = MAX_DEPTH, path = new WeakSet()) {
-  if (typeof data === 'string') return [data];
-  if (data instanceof Uint8Array) return [Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('utf8')];
+function extractStrings(data, maxDepth = MAX_DEPTH, path = new WeakSet(), out = []) {
+  if (typeof data === 'string') { out.push(data); return out; }
+  if (data instanceof Uint8Array) { out.push(Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('utf8')); return out; }
   let children;
   if (Array.isArray(data) || data instanceof Set) {
     children = Array.from(data);
@@ -65,14 +65,14 @@ function extractStrings(data, maxDepth = MAX_DEPTH, path = new WeakSet()) {
     children = [];
     for (const [k, v] of Object.entries(data)) children.push(k, v);
   } else {
-    return [];
+    return out;
   }
   if (maxDepth <= 0) throw new NestingTooDeep();
-  if (path.has(data)) return [];
+  if (path.has(data)) return out;
   path.add(data);
   try {
-    const out = [];
-    for (const child of children) out.push(...extractStrings(child, maxDepth - 1, path));
+    // Collected into one shared list: spreading a large child list into push() overflows the call stack.
+    for (const child of children) extractStrings(child, maxDepth - 1, path, out);
     return out;
   } finally {
     path.delete(data);

@@ -28,7 +28,7 @@
 
 // Version of the type catalogue (secret and PII patterns, validators). Bump it
 // when a pattern, validator or type name changes; see CONTRIBUTING.md.
-const SCRUB_RULES_VERSION = '2026-10-24.1';
+const SCRUB_RULES_VERSION = '2026-11-24.2';
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -215,18 +215,39 @@ function e164Valid(raw) {
   return digits.length >= 10 && digits.length <= 15;
 }
 
+// A phone number in the text: compact E.164 or with single separators. Separated forms that look like a date,
+// an IPv4 address or a dotted version are not phone numbers.
+function phoneValid(raw) {
+  if (/[ .\u00a0\u202f\u2007-]/.test(raw)) {
+    if (/\d{4}-\d{2}-\d{2}/.test(raw)) return false;
+    if (/^\+\d{1,3}(?:\.\d{1,3}){3}$/.test(raw)) return false;
+    if (/^\+\d(?:[ .\u00a0\u202f\u2007-]{1,2}\d)+$/.test(raw)) return false;
+  }
+  // A country code, one space and a compact national number (+34 600123456): the country must be one whose
+  // national length is known, so a plus sign and two digit runs in a sum or a note is not a phone number.
+  const cc = /^\+(\d{1,3})[ \u00a0\u202f\u2007]{1,2}\d+$/.exec(raw);
+  if (cc && cc[1] !== '1' && !E164_LENGTHS[cc[1]]) return false;
+  return e164Valid(raw.replace(/[ .\u00a0\u202f\u2007-]/g, ''));
+}
+
 function ipv4Public(raw) {
   const parts = raw.split('.').map(Number);
   if (parts.length !== 4 || parts.some((p) => !(p >= 0 && p <= 255))) return false;
-  const [a, b] = parts;
+  const [a, b, c, d] = parts;
   if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
   if (a === 169 && b === 254) return false;
   if (a === 172 && b >= 16 && b <= 31) return false;
   if (a === 192 && b === 168) return false;
   if (a === 100 && b >= 64 && b <= 127) return false;
-  if (a === 192 && b === 0) return false;     // 192.0.0.0/24 and TEST-NET-1
-  if (a === 198 && (b === 18 || b === 19 || b === 51)) return false;
-  if (a === 203 && b === 0) return false;
+  // Only the reserved /24 blocks, not the whole /16 around them: 192.0.0.0/24 (IETF protocol
+  // assignments), 192.0.2.0/24, 198.51.100.0/24 and 203.0.113.0/24 (documentation), 198.18.0.0/15
+  // (benchmarking). Other addresses in 192.0.x.x, 198.51.x.x and 203.0.x.x are public, and so are
+  // 192.0.0.9 and 192.0.0.10 (PCP and TURN anycast), which the IANA registry lists as globally reachable.
+  if (a === 192 && b === 0 && c === 0 && d !== 9 && d !== 10) return false;
+  if (a === 192 && b === 0 && c === 2) return false;
+  if (a === 198 && (b === 18 || b === 19)) return false;
+  if (a === 198 && b === 51 && c === 100) return false;
+  if (a === 203 && b === 0 && c === 113) return false;
   return true;
 }
 
@@ -485,8 +506,14 @@ function findQuotedKv(text, out) {
 const PATTERNS = [
   { type: 'ANTHROPIC_KEY', hints: ['sk-ant-'], re: re(NB + 'sk-ant-[a-z]{3,8}\\d{2}-[A-Za-z0-9_-]{32,200}' + NA),
     check: (v) => !maskedBody(v.replace(/^sk-ant-[a-z]+\d{2}-/, '')) },
+  /* A key with hyphens or underscores in the body (sk-test-..., sk-<name>_<id>): 40 to 200 characters. The body
+   * must look random and hold a digit, so a lower-case hyphenated slug (a blog post title) is not a key. Case does
+   * not matter: sk-or-v1- plus hex and lower-case sk-/sk-proj- keys are real secrets. */
   { type: 'OPENAI_KEY', hints: ['sk-'], re: re(NB + 'sk-(?!ant-)(?:proj-|svcacct-|admin-|or-v1-)?[A-Za-z0-9_-]{40,200}' + NA),
-    check: (v) => looksRandom(v.replace(/^sk-(?:proj-|svcacct-|admin-|or-v1-)?/, ''), 2, 3.5) },
+    check: (v) => {
+      const body = v.replace(/^sk-(?:proj-|svcacct-|admin-|or-v1-)?/, '');
+      return looksRandom(body, 2, 3.5) && /[0-9]/.test(body);
+    } },
   /* Legacy DeepSeek-style key: `sk-` + 32 hex digits. The length and charset
    * are not stated in the provider's docs (checked 2026-10-14); the shape
    * follows rules.js secret:openai_key, which already accepts it. */
@@ -526,6 +553,12 @@ const PATTERNS = [
    * upper; mixed case is not a SID). Same shape as gitleaks twilio-api-key. */
   { type: 'TWILIO_KEY', hints: ['SK', 'AC'], re: re('(?<![A-Za-z0-9])SK(?:[0-9a-f]{32}|[0-9A-F]{32})(?![A-Za-z0-9])'),
     check: (v) => /\d/.test(v.slice(2)) && /[a-fA-F]/.test(v.slice(2)) },
+  /* Twilio auth token: 32 hex digits under a TWILIO_AUTH_TOKEN or auth_token label (env, YAML or JSON, quoted or
+   * not; any case). The token has no prefix of its own, so an unlabelled 32-hex value (a hash, an id) is left
+   * alone. The account SID (`AC` + 32 hex) next to it is an identifier and stays visible. */
+  { type: 'TWILIO_AUTH_TOKEN', hints: null, prefilter: /auth_token/i,
+    re: re('(?<![A-Za-z0-9])(?:twilio_)?auth_token["\']?[ \t]*[=:][ \t]*["\']?([0-9a-f]{32})(?![A-Za-z0-9])', 'i'),
+    group: 1, check: (v) => /\d/.test(v) && /[a-f]/i.test(v) && !/^(.)\1+$/.test(v) },
   { type: 'MAILGUN_KEY', hints: ['key-'], re: re(NB + 'key-[0-9a-f]{32}' + NA),
     check: (v) => /\d/.test(v.slice(4)) && /[a-f]/.test(v.slice(4)) },
   { type: 'SHOPIFY_TOKEN', hints: ['shpat_', 'shpca_', 'shppa_', 'shpss_'], re: re(NB + 'shp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}' + NA) },
@@ -685,12 +718,22 @@ const PATTERNS = [
     re: re('(Authorization[ \\t]*:[ \\t]*Bearer[ \\t]+)([A-Za-z0-9._~+/=-]{20,})', 'i'),
     group: 2, check: (v) => !isPlaceholder(v) && !/^__ZN_[A-Z0-9_]+__$/.test(v) &&
       !maskedBody(v.replace(/^(?:sk-ant-[a-z]+\d{2}-|xox[a-z]-|gh[a-z]_|sk-)/, '')) && !/^(.)\1+$/.test(v.replace(/-/g, '')) },
-  /* Generic assignment: sensitive key = quoted high-entropy value. */
+  /* Generic assignment: sensitive key = quoted high-entropy value. The key and
+   * the value quotes may carry a backslash (`export api_key=\"value\"` inside a
+   * JSON string, as tool-call arguments and logs show it). */
   { type: 'SECRET', hints: null, prefilter: /(?:pass|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth)/i,
-    re: re('(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)[A-Za-z0-9_]{0,64}["\']?\\s*(?:=|:|=>|:=)\\s*["\'`]([^"\'`\\s\\\\]{12,200})["\'`]', 'i'),
+    re: re('(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)[A-Za-z0-9_]{0,64}(?:\\\\{0,2}["\'])?\\s*(?:=|:|=>|:=)\\s*\\\\{0,2}["\'`]([^"\'`\\s\\\\]{12,200})\\\\{0,2}["\'`]', 'i'),
     group: 1,
     check: (v) => !isPlaceholder(v) && looksRandom(v, 3, 3.7) && !/^[a-z]+(?:[_.-][a-z]+)+$/i.test(v) &&
       !/^(?:process\.env|os\.environ|\$|\{|%|<|https?:)/.test(v) && !/[()\[\]{};,]/.test(v) },
+  /* URL query parameter: `?api_key=value`, `&token=value`, same names as the
+   * assignment above. The value runs up to the next `&`, `#`, quote or
+   * whitespace; other parameters are left alone. */
+  { type: 'SECRET', hints: null, prefilter: /(?:pass|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth)/i,
+    re: re('[?&](?:[A-Za-z0-9_.-]{0,64}[_.-])?(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)[A-Za-z0-9_]{0,64}=([^&#\\s"\'`\\\\]{12,})', 'i'),
+    group: 1,
+    check: (v) => !isPlaceholder(v) && looksRandom(v, 2, 3.0) && !/^[a-z]+(?:[_.-][a-z]+)+$/i.test(v) &&
+      !/^(?:\$|\{|%7B|%3C|<|https?:)/i.test(v) && !/__ZN_[A-Z0-9_]+__/.test(v) },
   /* Generic dotenv line: SENSITIVE_NAME=unquoted high-entropy value. */
   { type: 'SECRET', hints: null, prefilter: /(?:PASS|SECRET|TOKEN|KEY|CREDENTIAL|AUTH)/,
     re: re('^[ \\t]*(?:export[ \\t]+)?[A-Z][A-Z0-9_]{0,64}(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?|AUTH)[A-Z0-9_]{0,64}[ \\t]*=[ \\t]*([^\\s"\'`#]{16,200})[ \\t]*$', 'm'),
@@ -786,13 +829,87 @@ for (const ch of 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 function isAlnum(c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
 const EMAIL_DOMAIN = /(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}(?![A-Za-z0-9-])/y;
 
+/* JSON escapes before an address. The local part may swallow the letters of an escape right before it
+ * (`\nuser@x.com`, `auser@x.com`); the span must never cut an escape, or the masked text keeps a stray
+ * backslash and is no longer valid JSON. A `\uXXXX` escape that decodes to a local-part character is part of the
+ * address: the span starts at its backslash and takes in the escapes of that kind right before it. Any other
+ * escape (a space, a surrogate half, `\n`) is a boundary: the span starts after it. Same rules as the Rust scrubber. */
+function oddBackslashes(text, end) {
+  let n = 0;
+  while (end - n > 0 && text.charCodeAt(end - n - 1) === 92) n++;
+  return n % 2 === 1;
+}
+const HEX4 = /^[0-9a-fA-F]{4}$/;
+function unicodeEscapeAt(text, i) {
+  if (i < 0 || i + 6 > text.length || text.charCodeAt(i) !== 92 || text[i + 1] !== 'u') return -1;
+  const hex = text.slice(i + 2, i + 6);
+  if (!HEX4.test(hex) || !oddBackslashes(text, i + 1)) return -1;
+  return parseInt(hex, 16);
+}
+function isLocalCode(c) { return c >= 0 && c < 128 && LOCAL_CHARS[c] === 1; }
+/* Move the start back over what is still the local part: raw local-part characters and `\uXXXX` escapes that decode
+ * to one, in any mix. It stops at the first other character and at an escape that decodes to something else. A raw
+ * character that ends a short escape (`\n`) belongs to that escape, so the walk never splits one. */
+function extendEmailStart(text, start) {
+  for (;;) {
+    if (start >= 6) {
+      const c = unicodeEscapeAt(text, start - 6);
+      if (c >= 0) {
+        if (!isLocalCode(c)) break;
+        start -= 6;
+        continue;
+      }
+    }
+    const endsEscape = start >= 2 && text.charCodeAt(start - 2) === 92 && oddBackslashes(text, start - 1);
+    if (start > 0 && isLocalCode(text.charCodeAt(start - 1)) && !endsEscape) { start--; continue; }
+    break;
+  }
+  return start;
+}
+/* Start of the address span given the start `s` found by the local-part scan, or -1 when no address is left. */
+function emailStartAfterEscape(text, s, at) {
+  if (!(s > 0 && text.charCodeAt(s - 1) === 92 && oddBackslashes(text, s))) return s;
+  const c = text[s];
+  if (c === 'u' && s + 5 <= at && HEX4.test(text.slice(s + 1, s + 5))) {
+    if (isLocalCode(unicodeEscapeAt(text, s - 1))) return s - 1;
+    return s + 5 < at ? s + 5 : -1;
+  }
+  if (c === 'n' || c === 't' || c === 'r' || c === 'b' || c === 'f') return s + 1 < at ? s + 1 : -1;
+  return s;
+}
+
+/* Characters of the local part between `s` and the '@' once decoded: a `\uXXXX` escape counts as one. Counting stops
+ * past `limit`, so a long run costs at most limit + 1 steps. */
+function decodedLocalLength(text, s, at, limit) {
+  let n = 0;
+  for (let i = s; i < at && n <= limit; n++) i += unicodeEscapeAt(text, i) >= 0 ? 6 : 1;
+  return n;
+}
+
 function findEmails(text, check, out) {
   let at = text.indexOf('@');
   while (at >= 0) {
+    // Raw local-part characters right before the '@', at most 64. The scan stops at a `\uXXXX` escape, on its 'u'
+    // as it stops on any backslash: the hex digits of an escape are never counted as characters of the address and
+    // the start never lands inside an escape (extendEmailStart reads the escapes that come before).
     let s = at;
-    while (s > 0 && at - s < 64 && text.charCodeAt(s - 1) < 128 && LOCAL_CHARS[text.charCodeAt(s - 1)]) s--;
+    while (s > 0 && at - s < 64 && text.charCodeAt(s - 1) < 128 && LOCAL_CHARS[text.charCodeAt(s - 1)]) {
+      if (s >= 6 && unicodeEscapeAt(text, s - 6) >= 0) { s -= 5; break; }
+      s--;
+    }
     const boundaryOk = s === 0 || !(text.charCodeAt(s - 1) < 128 && LOCAL_CHARS[text.charCodeAt(s - 1)]);
     if (s < at && boundaryOk && isAlnum(text.charCodeAt(s)) && isAlnum(text.charCodeAt(at - 1))) {
+      s = emailStartAfterEscape(text, s, at);
+      if (s >= 0) s = extendEmailStart(text, s);
+      // the span may now start on a raw '.', '_', '%', '+' or '-': an address starts with a letter or digit
+      while (s >= 0 && s < at && text.charCodeAt(s) !== 92 && !isAlnum(text.charCodeAt(s))) s++;
+      if (s >= 0 && s !== at && text.charCodeAt(s) !== 92 && !isAlnum(text.charCodeAt(s))) s = -1;
+      // an address has at most 64 characters before the '@', counted once escapes are decoded
+      if (s >= 0 && decodedLocalLength(text, s, at, 64) > 64) s = -1;
+    } else {
+      s = -1;
+    }
+    if (s >= 0) {
       EMAIL_DOMAIN.lastIndex = at + 1;
       const m = EMAIL_DOMAIN.exec(text);
       if (m) {
@@ -916,7 +1033,9 @@ const PII = [
       if (/\.\./.test(v)) return false;
       return true;
     } },
-  { type: 'PHONE', key: 'phone', hints: ['+'], re: re('(?<![A-Za-z0-9+])\\+[1-9]\\d{7,14}(?![0-9])'), check: (v) => e164Valid(v) },
+  // Compact E.164 (+34600123456), or + country code (1 to 3 digits) and digit groups split by single spaces, dashes
+  // or dots (+34 600 123 456, +1 202-555-0143). National formats without + are not matched on purpose.
+  { type: 'PHONE', key: 'phone', hints: ['+'], re: re('(?<![A-Za-z0-9+])\\+[1-9](?:\\d{0,2}(?:(?:[ .\\u00a0\\u202f\\u2007-]|[ \\u00a0\\u202f\\u2007]{2})\\d{1,9}){2,6}|\\d{0,2}[ \\u00a0\\u202f\\u2007]{1,2}\\d{6,12}|\\d{7,14})(?![0-9])'), check: (v) => phoneValid(v) },
   { type: 'IBAN', key: 'iban', hints: null, prefilter: /[A-Z]{2}\d{2}/,
     re: re('(?<![A-Za-z0-9])[A-Z]{2}\\d{2}(?:[ ]?[A-Z0-9]{4}){2,7}(?:[ ]?[A-Z0-9]{1,4})?(?![A-Za-z0-9])'),
     check: (v) => ibanValid(v) },

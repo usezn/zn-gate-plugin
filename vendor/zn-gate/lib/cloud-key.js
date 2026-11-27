@@ -124,8 +124,12 @@ function configFile() {
   return path.join(znHome(), 'config.json');
 }
 
+function readConfigAt(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')) || {}; } catch (_) { return {}; }
+}
+
 function readConfig() {
-  try { return JSON.parse(fs.readFileSync(configFile(), 'utf8')) || {}; } catch (_) { return {}; }
+  return readConfigAt(configFile());
 }
 
 function writeConfig(cfg) {
@@ -137,8 +141,8 @@ function writeConfig(cfg) {
 }
 
 /** {store, connectedAt, last4} when `connect` stored a key, else null. Never the key. */
-function readMarker() {
-  const c = readConfig().cloud;
+function readMarker(file) {
+  const c = (file ? readConfigAt(file) : readConfig()).cloud;
   if (!c || typeof c !== 'object' || !STORES.includes(c.store)) return null;
   return {
     store: c.store,
@@ -166,6 +170,23 @@ function forgetMarker() { clearMarker(); }
 /** True when `zn-gate connect` has stored a key (a cheap file read; no keychain access). */
 function isConnected() {
   return readMarker() !== null;
+}
+
+/**
+ * True when `zn-gate connect` stored a key, judged only by the .zn/config.json in the home folder of the operating-system
+ * account (stats.userHome: from os.userInfo(), not from HOME, USERPROFILE or ZN_HOME, which a project can set for the
+ * agent and point at a folder it ships). Used for the opt-in cloud check of tool output. False when the system does not
+ * report the account home, and false when the folder the rest of zn uses (ZN_HOME, HOME) is a different one: the stored
+ * key is looked up through the marker in that folder, so it must be the account's own.
+ */
+function isConnectedAtUserHome() {
+  const real = require('./stats').userHome();
+  if (!real) return false;
+  const same = process.platform === 'win32'
+    ? path.resolve(znHome()).toLowerCase() === path.resolve(real).toLowerCase()
+    : path.resolve(znHome()) === path.resolve(real);
+  if (!same) return false;
+  return readMarker(path.join(real, 'config.json')) !== null;
 }
 
 /* ------------------------------ stores ------------------------------ */
@@ -305,6 +326,7 @@ module.exports = {
   readMarker,
   forgetMarker,
   isConnected,
+  isConnectedAtUserHome,
   availableStore,
   saveKey,
   loadStoredKey,

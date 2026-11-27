@@ -45,21 +45,25 @@ function entriesOf(tree) {
   return out;
 }
 
+/* { tree } for a file that was read and parsed, { tooLarge: true } for one over the cap (not read, so it must
+   not be taken for "no hooks"), and { tree: null } for anything else (missing, unreadable, not valid). */
 function parsedFile(file) {
   const { readBounded } = require('./audit')._internal;
   const r = readBounded(file, CAP, false);
-  if (typeof r.text !== 'string') return null;
+  if (r.skip === 'too-large') return { tooLarge: true };
+  if (typeof r.text !== 'string') return { tree: null };
   try {
-    return file.endsWith('.toml') ? require('./audit/parse').parseToml(r.text).data : JSON.parse(r.text.replace(/^\uFEFF/, ''));
+    return { tree: file.endsWith('.toml') ? require('./audit/parse').parseToml(r.text).data : JSON.parse(r.text.replace(/^\uFEFF/, '')) };
   } catch (_) {
-    return null;
+    return { tree: null };
   }
 }
 
 /*
  * The first hook of another tool that could change a call or answer an approval, in the Codex folder
  * (hooks.json, config.toml) and in the project's .codex folder; null if none.
- * Returns { file, event }.
+ * Returns { file, event }. A file over the size cap is not read; so that it cannot hide a hook, the first such
+ * file is returned as { file, tooLarge: true } when no hook was found in a file that could be read.
  */
 function findOtherHooks(codexHome, projectDir) {
   const { isOurs } = require('./agents/config-file');
@@ -68,11 +72,14 @@ function findOtherHooks(codexHome, projectDir) {
     const proj = [path.join(projectDir, '.codex', 'hooks.json'), path.join(projectDir, '.codex', 'config.toml')];
     for (const f of proj) if (!files.some((x) => path.resolve(x) === path.resolve(f))) files.push(f);
   }
+  let large = null;
   for (const file of files) {
-    const hit = entriesOf(parsedFile(file)).find((e) => !isOurs(e.command, 'codex') && !isBackground(e) && matches(e.matcher));
+    const p = parsedFile(file);
+    if (p.tooLarge) { if (!large) large = { file, tooLarge: true }; continue; }
+    const hit = entriesOf(p.tree).find((e) => !isOurs(e.command, 'codex') && !isBackground(e) && matches(e.matcher));
     if (hit) return { file, event: hit.event };
   }
-  return null;
+  return large;
 }
 
 module.exports = { findOtherHooks, _internal: { entriesOf, matches } };

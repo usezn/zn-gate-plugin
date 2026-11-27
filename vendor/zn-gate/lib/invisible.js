@@ -12,7 +12,13 @@
 const BMP_CLASS = '\\u200B-\\u200D\\u2060\\uFEFF\\u00AD\\uFE00-\\uFE0F\\u061C\\u180E\\u200E\\u200F\\u115F\\u1160\\u3164\\uFFA0';
 const ASTRAL_CLASS = '\\u{E0000}-\\u{E007F}\\u{E0100}-\\u{E01EF}';
 
-const ZERO_WIDTH_RE = new RegExp('[' + BMP_CLASS + ']', 'g');
+// CONTROL_CLASS: the C0 control characters except the whitespace ones (tab, line feed, vertical tab, form feed,
+// carriage return) and ESC (U+001B, which starts the ANSI sequences the rules strip next). A secret split by one
+// of them (a NUL inside a key) is the same value to the agent, so they are removed for matching like the invisible
+// ones. They are not part of BMP_CLASS: the audit and reach views list only characters that hide text from a reader.
+const CONTROL_CLASS = '\\u0000-\\u0008\\u000E-\\u001A\\u001C-\\u001F';
+
+const ZERO_WIDTH_RE = new RegExp('[' + CONTROL_CLASS + BMP_CLASS + ']', 'g');
 const INVISIBLE_ASTRAL_RE = new RegExp('[' + ASTRAL_CLASS + ']', 'gu');
 
 // The text with every invisible character replaced by spaces, one space per UTF-16 code unit (an astral
@@ -29,4 +35,4 @@ function spaceInvisibleForMatch(str) {
   return str.replace(ZERO_WIDTH_RE, ' ').replace(INVISIBLE_ASTRAL_RE, ' ');
 }
 
-module.exports = { BMP_CLASS, ASTRAL_CLASS, ZERO_WIDTH_RE, INVISIBLE_ASTRAL_RE, spaceInvisible, spaceInvisibleForMatch };
+module.exports = { BMP_CLASS, CONTROL_CLASS, ASTRAL_CLASS, ZERO_WIDTH_RE, INVISIBLE_ASTRAL_RE, spaceInvisible, spaceInvisibleForMatch };

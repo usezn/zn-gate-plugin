@@ -20,12 +20,13 @@
  *    reason, overwrite, permissionOverrides}. "allow" means "proceed, deferring to the next hook or the
  *    default policy", so it is the way to say "no opinion" (never auto_approve).
  *
- * Tools named in the docs: run_command (shell), view_file, write_to_file, replace_file_content,
- * multi_replace_file_content, list_dir, find_by_name, grep_search, search_web, read_url_content,
- * and agent-management tools. The argument names are NOT documented (only that run_command takes a command
- * line), so this adapter finds the command by its likely names and finds file paths by key name
- * (anything called path, file, target, uri or dir), skipping keys that hold content. How an MCP tool is
- * named is not documented either: names that start with "mcp" are treated as MCP calls.
+ * Tools named in the official docs (https://antigravity.google/docs/hooks, checked 2026-11-06): run_command
+ * (CommandLine, Cwd), view_file (AbsolutePath), write_to_file and replace_file_content and
+ * multi_replace_file_content (TargetFile), list_dir (DirectoryPath), find_by_name (SearchDirectory),
+ * grep_search (SearchPath), search_web (query), read_url_content (Url), and agent-management tools. The
+ * argument names above are the documented ones; the adapter also finds the command by its likely names and
+ * finds file paths by key name (anything called path, file, target, uri or dir), skipping keys that hold
+ * content. The docs do not name MCP tools: names that start with "mcp" are treated as MCP calls.
  * A tool zn cannot classify gets "allow" (no opinion).
  *
  * Observed on a real Antigravity (Windows, 2026-10-20): a PreToolUse hook that fails, prints nothing,
@@ -41,11 +42,13 @@
 const fs = require('fs');
 const { spawnSync } = require('child_process');
 const { fileURLToPath } = require('url');
+const { MAX_NEST_DEPTH, MAX_NEST_NODES } = require('../nest-limits');
 const os = require('os');
 const path = require('path');
 const cfg = require('./config-file');
 const launcher = require('./launcher');
 const policy = require('../hooks/policy');
+const { winCommandText } = require('../zn-command');
 
 const id = 'antigravity';
 const HOOK_NAME = 'zn-gate';
@@ -70,33 +73,53 @@ function firstString(obj, keys) {
 }
 
 /**
- * Every string argument whose key looks like a file or folder (content-like keys are skipped), three levels of
- * objects and arrays deep. A key called url counts only when its value is a file: URI. A file: URI that cannot
+ * A file: address with a host other than localhost would become a network (UNC) path on Windows, so it is refused
+ * on every platform. A localhost host is dropped so the address stays a local path.
+ */
+function localFileUrl(v) {
+  const u = new URL(v);
+  if (u.hostname && u.hostname.toLowerCase() !== 'localhost') throw new Error('file: URL names a remote host');
+  u.hostname = '';
+  return u;
+}
+
+/**
+ * Every string argument whose key looks like a file or folder (content-like keys are skipped), down to MAX_NEST_DEPTH (the limit of the text
+ * scan), through objects and arrays. Objects left unvisited because of the depth or node limit set `bad`: a path may be hidden there. A key called url counts only when its value is a file: URI. A file: URI that cannot
  * be turned into a path sets `bad`, so the call is refused instead of passed.
  */
 function pathsOf(args) {
   const out = [];
   let bad = false;
+  // A candidate name taken from a long or multi-line value: a file: URI in it is decoded like a one-line value.
+  const addName = (x) => {
+    if (/^file:/i.test(x)) { try { out.push(fileURLToPath(localFileUrl(x))); } catch (_) { bad = true; } return; }
+    out.push(x);
+  };
   const add = (k, v) => {
     if (typeof v !== 'string' || !v) return;
     if (/^file:/i.test(v)) {
-      try { out.push(fileURLToPath(v)); } catch (_) { bad = true; }
+      try { out.push(fileURLToPath(localFileUrl(v))); } catch (_) { bad = true; }
       return;
     }
     if (/url/i.test(k) && !PATH_KEY_RE.test(k)) return;
-    if (v.length > MAX_PATH_LEN || /[\r\n]/.test(v)) return;
+    // A long value is classified like any other (classifyPath reads long input); a value with line breaks (code, a message) is
+    // not one file name: its trimmed whole and each line that starts like a path are checked (pathCandidatesOf).
+    if (v.length > MAX_PATH_LEN || /[\r\n]/.test(v)) { for (const x of require('./copilot').pathCandidatesOf(v)) addName(x); return; }
     out.push(v);
   };
   const keyOk = (k) => (PATH_KEY_RE.test(k) || /url/i.test(k)) && !NOT_PATH_KEY_RE.test(k);
+  let nodes = 0;
   const walk = (obj, depth) => {
+    if (++nodes > MAX_NEST_NODES) { bad = true; return; }
     for (const [k, v] of Object.entries(obj)) {
       if (keyOk(k)) {
         if (Array.isArray(v)) v.forEach((x) => add(k, x)); else add(k, v);
       }
-      if (depth < 3) {
+      if (depth < MAX_NEST_DEPTH) {
         if (isObj(v)) walk(v, depth + 1);
         else if (Array.isArray(v)) v.forEach((x) => { if (isObj(x)) walk(x, depth + 1); });
-      }
+      } else if (isObj(v) || (Array.isArray(v) && v.some(isObj))) bad = true;
     }
   };
   walk(args, 0);
@@ -294,6 +317,16 @@ function normalize(raw) {
     const dirs = scan.dirs;
     const e = { ...ev, tool: 'bash', input: { command: cmd || '', texts: [], ...(dirs.length ? { scanDirs: dirs } : {}), ...(scan.ask ? { scanAsk: scan.ask } : {}) } };
     if (cmd === undefined) e.unreadable = 'zn: could not read the command of this call, so zn cannot check it.';
+    if (!SHELL_TOOLS.has(toolName)) {
+      // A tool zn does not know that carries a command and also names files: the files keep their read and write checks (a .env
+      // write among them is judged on what the call writes); an address zn cannot read refuses the call.
+      const named = pathsOf(args);
+      const loose = require('./copilot').pathsOf(args, { loose: true });
+      named.paths = [...new Set([...named.paths, ...loose.paths])];
+      named.bad = named.bad || loose.bad;
+      e.input.alsoPaths = named.paths;
+      if (named.bad && !e.unreadable) e.unreadable = 'zn: could not read a file address in this call, so zn cannot check it.';
+    }
     return e;
   }
   const { paths, bad } = pathsOf(args);
@@ -308,9 +341,13 @@ function normalize(raw) {
   }
   // Any other tool that names a file (a viewer, a reader, a future tool) gets the read and write checks on
   // every path in it. list_dir and find_by_name show names only, and tools with no path get no opinion.
-  if (!READ_TOOLS.has(toolName) && (paths.length || bad)) {
-    const e = { ...ev, tool: 'fileaccess', input };
-    if (bad) e.unreadable = 'zn: could not read a file address in this call, so zn cannot check it.';
+  // A tool zn does not know: a path under any key counts too (src, dst, from, to, nested objects), and arguments zn cannot walk to
+  // the end are refused.
+  const loose = READ_TOOLS.has(toolName) ? { paths: [], bad: false } : require('./copilot').pathsOf(args, { loose: true });
+  const all = [...new Set([...paths, ...loose.paths])];
+  if (!READ_TOOLS.has(toolName) && (all.length || bad || loose.bad)) {
+    const e = { ...ev, tool: 'fileaccess', input: { ...input, path: all[0], paths: all } };
+    if (bad || loose.bad) e.unreadable = 'zn: could not read a file address in this call, so zn cannot check it.';
     return e;
   }
   return { ...ev, tool: toolName || 'unknown', input: { texts: [] } };
@@ -420,7 +457,7 @@ function selfCheck(command, opts = {}) {
  * no text from zn (or not at all). A project install writes `sh -c` (PowerShell on Windows) around `zn hook
  * antigravity` with the same deny answer when zn or node is missing. A command given by the caller stays as it is.
  */
-function commandFor(opts = {}) {
+function commandFor(opts = {}, notes = []) {
   const platform = opts.platform || process.platform;
   if (opts.command) return cfg.hookCommand(id, opts);
   // A project install is shared through the repository, so it names `zn` on the PATH instead of this machine's
@@ -439,14 +476,21 @@ function commandFor(opts = {}) {
   // No path without spaces: nothing that Antigravity can start can be written, so refuse instead of writing a hook that never runs.
   const file = launcher.launcherFile(id, opts);
   if (!launcher.plainPathOk(file)) throw new Error(launcher.spaceMessage(file));
-  return launcher.launcherCommand(launcher.writeLauncher(id, node, runner, { ...opts, deadlineS: launcher.launcherDeadlineS(HOOK_TIMEOUT_S), deadlineSoft: true }), 'PreToolUse', platform, { plain: true });
+  const script = launcher.writeLauncher(id, node, runner, { ...opts, deadlineS: launcher.launcherDeadlineS(HOOK_TIMEOUT_S), deadlineSoft: true });
+  // Linux: the static launcher first (see static-launcher.js), in the same folder, so its path needs no quotes either.
+  const sl = require('./static-launcher');
+  const st = sl.useStatic(opts, notes, id);
+  if (st && launcher.plainPathOk(st)) return sl.execParts(st, id, 'PreToolUse', script, ['PreToolUse']).join(' ');
+  return launcher.launcherCommand(script, 'PreToolUse', platform, { plain: true });
 }
 
 function install(opts = {}) {
   const file = hooksFile(opts);
-  const command = commandFor(opts); // may refuse (a launcher path Antigravity cannot start): before anything is written
+  const notes = [];
+  const command = commandFor(opts, notes); // may refuse (a launcher path Antigravity cannot start): before anything is written
   const data = cfg.readJson(file);
   const report = { settings: file, backup: cfg.backup(file), warnings: [] };
+  report.warnings.push(...notes);
   if (report.backup && (opts.scope || 'user') === 'project') report.warnings.push('The backup ' + report.backup + ' sits inside the project: do not commit it.');
   stripOurs(data);
   // Antigravity splits the hook command on spaces and ignores quotes, so on
@@ -461,14 +505,14 @@ function install(opts = {}) {
   report.warnings.push('zn checks tool calls before they run (PreToolUse): it blocks reads and writes of secret files and shell commands that handle secrets.');
   if ((opts.scope || 'user') === 'project' && !opts.command) report.warnings.push('The project hook runs `zn` from your PATH (zn hook antigravity): every teammate who opens this project in Antigravity needs zn-gate installed. Without it the hook answers a deny that says how to install it, so Antigravity blocks the call instead of running it unchecked. The command is written for this kind of machine (' + ((opts.platform || process.platform) === 'win32' ? 'Windows' : 'macOS and Linux') + '): a teammate on the other kind runs `zn hooks install antigravity --project` in their own copy of the project.');
   report.warnings.push('Antigravity hooks cannot rewrite or redact what a tool returns, so a value printed by a command or a file the agent is allowed to read reaches the model. Keep secrets in the vault.');
-  report.warnings.push('Antigravity does not document what happens when a hook fails or times out. In our tests (Windows, October 2026) a hook that failed to start or answered with something that is not a decision made Antigravity deny every tool call; a timeout was not tested. If the Node.js zn was installed with goes away, the launcher script answers a deny that says how to repair it, and zn itself answers every event with an explicit decision. Run `zn-gate check` to see that the hook works.');
+  report.warnings.push(winCommandText('Antigravity does not document what happens when a hook fails or times out. In our tests (Windows, October 2026) a hook that failed to start or answered with something that is not a decision made Antigravity deny every tool call; a timeout was not tested. If the Node.js zn was installed with goes away, the launcher script answers a deny that says how to repair it, and zn itself answers every event with an explicit decision. Run `zn-gate check` to see that the hook works.', opts.platform || process.platform));
   if (opts.selfCheck) {
     report.selfCheck = selfCheck(command, { ...opts, splitOnSpaces: !opts.command });
     if (!report.selfCheck.ok) {
       const fix = (opts.scope || 'user') === 'project' && !opts.command
         ? 'install zn-gate for your user (npm install -g zn-gate) so that `zn` is on your PATH, then run this command again'
         : 'run `npx -y zn-gate check`, then `npm install -g zn-gate` and this command again; if it still fails, run `zn hooks uninstall antigravity` before you use Antigravity';
-      report.warnings.push('SELF-CHECK FAILED: the hook was started once with a harmless test event and ' + report.selfCheck.detail + '. Antigravity would deny every tool call. Next step: ' + fix + '.');
+      report.warnings.push('SELF-CHECK FAILED: the hook was started once with a harmless test event and ' + report.selfCheck.detail + '. Antigravity would deny every tool call. Next step: ' + winCommandText(fix, opts.platform || process.platform) + '.');
     } else {
       report.warnings.push('Self-check passed: the hook was started once with a harmless test event and ' + report.selfCheck.detail + '.');
     }
@@ -511,6 +555,7 @@ module.exports = {
   normalize,
   respond,
   selfCheck,
+  pathsOf,
   capabilities: { ask: 'all', rewriteInput: false, rewriteOutput: false },
   HOOK_NAME,
   hooksFile,

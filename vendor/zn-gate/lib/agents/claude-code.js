@@ -72,10 +72,12 @@ function spawnSync(...args) {
 const { writeFileAtomic } = require('../broker/files');
 const { whichSync } = require('../broker/markers');
 const { shQuote, portablePath } = require('../shell-quote');
-const { claudeCodePolicyWarnings } = require('./managed-policy');
+const { claudeCodePolicyWarnings, managedDir } = require('./managed-policy');
 const cfg = require('./config-file');
+const { configParseError } = require('../config-parse');
 const { hooksOf } = cfg;
 const launcher = require('./launcher');
+const { isSecretsToolName } = require('../broker/secrets-tools');
 
 const id = 'claude-code';
 
@@ -88,7 +90,17 @@ const HOOK_TIMEOUT_S = 15;
 // Older versions wrote the paths in double quotes; both forms are ours.
 // zn's launcher script (lib/agents/launcher.js) is ours too: '<dir>/zn-hook-claude-code.sh' <Event>
 const OUR_COMMAND_RE = /(\bhook claude-code|hooks[\\/]runner\.js["']? claude-code|zn-hook-claude-code\.sh["']? [A-Za-z]+)\s*$/;
+// A hook in exec form (command + args: the static launcher on Linux, see static-launcher.js) read as one command line.
+const entryText = (h) => (h && typeof h.command === 'string' ? (Array.isArray(h.args) ? require('./static-launcher').execText([h.command, ...h.args.map(String)]) : h.command) : '');
 const MCP_SERVER_NAME = 'secrets';
+// `claude mcp` is a CLI that zn runs at install and uninstall: a CLI that never answers must not hang the command.
+const CLAUDE_MCP_TIMEOUT_MS = 30000;
+function claudeMcpSpawn(claude, args, opts) {
+  return spawnSync(claude, args, { encoding: 'utf8', windowsHide: true, env: require('../exe').programEnv(opts.env || process.env),
+    timeout: opts.mcpTimeoutMs || CLAUDE_MCP_TIMEOUT_MS, killSignal: 'SIGKILL' });
+}
+function timedOut(r) { return !!(r.error && r.error.code === 'ETIMEDOUT'); }
+function mcpSeconds(opts) { return (opts.mcpTimeoutMs || CLAUDE_MCP_TIMEOUT_MS) / 1000; }
 
 const TOOL_MAP = {
   Bash: 'bash',
@@ -126,9 +138,38 @@ function textsOf(tool, input) {
 // `ours` is set only for a call to zn's own server, verified from the MCP configuration (znMcpServerKind).
 function mcpInfo(server, tool, event, cwd) {
   const info = { server, tool };
-  const ours = event === 'pre_tool' ? znMcpServerKind(server, cwd) : null;
-  if (ours) info.ours = ours;
+  // Only an exact tool of zn's server counts: a server named secrets_ or secrets__x sends mcp__secrets___... or
+  // mcp__secrets__x__..., which parse as server secrets with a tool zn does not have. Those fail closed.
+  // The detector server (`zn-gate mcp`) is told apart the same way: only its own three tools count.
+  const want = isSecretsToolName(tool) ? 'secrets' : DETECTOR_TOOL_NAMES.includes(tool) ? 'analyze' : null;
+  const ours = event === 'pre_tool' && want ? znMcpServerKind(server, cwd) : null;
+  if (ours && ours === want) info.ours = ours;
   return info;
+}
+
+const KNOWN_TOOLS = new Set(Object.values(TOOL_MAP));
+
+/* A tool name zn does not know (Copilot in VS Code sends its own names, such as view, read_file or run_in_terminal,
+   through the Claude-format hook). If its input carries a command, it gets the shell checks; if it names files, every
+   path gets the read and write checks, as in the Copilot adapter. A tool with neither gets no opinion. */
+function unknownToolEvent(base, toolName, ti) {
+  const { pathsOf, firstString, COMMAND_KEYS, patchTextOf, patchInput, nestedCommand } = require('./copilot');
+  const patch = patchTextOf(toolName, ti);
+  if (patch !== undefined) return { ...base, tool: 'write', toolName, input: patchInput(patch) };
+  const cmd = firstString(ti, COMMAND_KEYS) !== undefined ? firstString(ti, COMMAND_KEYS) : nestedCommand(ti, base.cwd);
+  if (cmd === null) return { ...base, tool: 'bash', toolName, input: { texts: [] } };
+  if (cmd !== undefined) {
+    // The files the call also names keep their read and write checks (a .env write among them is judged on what the call writes); an
+    // address zn cannot read refuses the call.
+    const named = pathsOf(ti, { loose: true });
+    if (named.bad) return { ...base, tool: 'write', toolName, input: { paths: named.paths, unparsed: true, texts: [] } };
+    return { ...base, tool: 'bash', toolName, input: { command: cmd, alsoPaths: named.paths, texts: [] } };
+  }
+  // A path under any key counts (src, dst, from, to, nested objects), in every node; arguments nested deeper than zn reads are refused.
+  const { paths, bad } = pathsOf(ti, { loose: true });
+  if (bad) return { ...base, tool: 'write', toolName, input: { paths, unparsed: true, texts: [] } };
+  if (paths.length) return { ...base, tool: 'fileaccess', toolName, input: { path: paths[0], paths, texts: [] } };
+  return null;
 }
 
 function normalize(raw) {
@@ -137,8 +178,16 @@ function normalize(raw) {
   const event = name === 'PreToolUse' ? 'pre_tool'
     : name === 'PostToolUse' ? 'post_tool'
       : name === 'UserPromptSubmit' ? 'user_prompt'
-        : name === 'UserPromptExpansion' ? 'prompt_expansion' : null;
+        : name === 'UserPromptExpansion' ? 'prompt_expansion'
+          : name === 'ConfigChange' ? 'config_change'
+            : name === 'InstructionsLoaded' ? 'instructions_loaded' : null;
   const base = { event, cwd: raw.cwd || process.cwd(), sessionId: raw.session_id || null, raw };
+  // A configuration file changed during the session (source: user_settings, project_settings, local_settings, policy_settings,
+  // skills), or an instruction file (CLAUDE.md, .claude/rules/*.md) was loaded into context. Neither carries a tool.
+  if (event === 'config_change') return { ...base, tool: null, input: { texts: [] }, configSource: typeof raw.source === 'string' ? raw.source : '', filePath: typeof raw.file_path === 'string' ? raw.file_path : '' };
+  if (event === 'instructions_loaded') {
+    return { ...base, tool: null, input: { texts: [] }, filePath: typeof raw.file_path === 'string' ? raw.file_path : '', memoryType: typeof raw.memory_type === 'string' ? raw.memory_type : '', loadReason: typeof raw.load_reason === 'string' ? raw.load_reason : '' };
+  }
   if (event === 'user_prompt') return { ...base, tool: null, input: { prompt: typeof raw.prompt === 'string' ? raw.prompt : '' }, output: undefined };
   if (event === 'prompt_expansion') return { ...base, tool: null, input: { prompt: typeof raw.prompt === 'string' ? raw.prompt : '' }, output: undefined };
   if (!event) return base;
@@ -146,6 +195,10 @@ function normalize(raw) {
   const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
   const tool = mcp ? 'mcp' : (TOOL_MAP[toolName] || toolName.toLowerCase());
   const ti = raw.tool_input && typeof raw.tool_input === 'object' ? raw.tool_input : {};
+  if (!mcp && event === 'pre_tool' && !TOOL_MAP[toolName] && !KNOWN_TOOLS.has(tool)) {
+    const generic = unknownToolEvent(base, toolName, ti);
+    if (generic) return generic;
+  }
   const input = {
     command: typeof ti.command === 'string' ? ti.command : undefined,
     path: ti.file_path || ti.notebook_path || ti.filePath || ti.path || undefined,
@@ -239,6 +292,11 @@ function respondInner(d, ev) {
   if (ev.event === 'prompt_expansion') {
     return d.decision === 'deny' ? { decision: 'block', reason: d.message || 'Blocked by zn' } : null;
   }
+  // ConfigChange: {decision: "block"} keeps the new settings from taking effect (not for policy_settings, which Claude Code applies
+  // whatever a hook says). InstructionsLoaded has no decision control: Claude Code ignores its output.
+  if (ev.event === 'config_change') {
+    return d.decision === 'deny' ? { decision: 'block', reason: d.message || 'Blocked by zn' } : null;
+  }
   return null;
 }
 
@@ -279,13 +337,23 @@ function hookCommand(opts = {}) {
 }
 
 function readJson(file) {
-  let data;
+  let text;
   try {
-    const text = fs.readFileSync(file, 'utf8');
-    data = text.replace(/^\uFEFF/, '').trim() ? cfg.parseJson(text) : {};
+    text = fs.readFileSync(file, 'utf8');
   } catch (err) {
     if (err.code === 'ENOENT') return {};
-    throw new Error('cannot parse ' + file + ': ' + err.message);
+    // A file that cannot be read (no permission, a folder in its place) is not a parse error.
+    throw new Error(require('../errors').fsErrorText(err, file) || 'cannot parse ' + file + ': ' + err.message);
+  }
+  let data;
+  if (text.replace(/^\uFEFF/, '').trim()) {
+    try {
+      data = cfg.parseJson(text);
+    } catch (err) {
+      throw new Error(configParseError(file, text, err));
+    }
+  } else {
+    data = {};
   }
   if (data === null || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error(file + ' must hold a JSON object, not ' + (data === null ? 'null' : Array.isArray(data) ? 'an array' : typeof data) + ' (left unchanged)');
@@ -323,15 +391,19 @@ function stripOurs(groups) {
   const out = [];
   for (const g of groups) {
     if (!g || !Array.isArray(g.hooks)) { out.push(g); continue; }
-    const hooks = g.hooks.filter((h) => !(h && typeof h.command === 'string' && (OUR_COMMAND_RE.test(h.command) || launcher.isProjectGuard(h.command, id))));
+    const hooks = g.hooks.filter((h) => !(h && typeof h.command === 'string' && (OUR_COMMAND_RE.test(entryText(h)) || launcher.isProjectGuard(h.command, id))));
     if (hooks.length) out.push({ ...g, hooks });
   }
   return out;
 }
 
-// command: one command for every event, or a function of the event name (the launcher needs it).
+// command: one command for every event, or a function of the event name (the launcher needs it) that returns the command, or
+// {command, args} for the exec form (no shell).
 function ourHooks(command) {
-  const h = (event) => ({ type: 'command', command: typeof command === 'function' ? command(event) : command, timeout: HOOK_TIMEOUT_S });
+  const h = (event) => {
+    const c = typeof command === 'function' ? command(event) : command;
+    return { type: 'command', ...(typeof c === 'string' ? { command: c } : c), timeout: HOOK_TIMEOUT_S };
+  };
   return {
     // A hook that cannot start or times out blocks the call (Claude Code 2.1.295 and later; earlier
     // versions ignore the field, and the launcher covers them).
@@ -342,6 +414,10 @@ function ourHooks(command) {
     UserPromptSubmit: { hooks: [{ ...h('UserPromptSubmit'), onFailure: 'block' }] },
     // A typed skill or command expands after UserPromptSubmit; this checks the expanded text.
     UserPromptExpansion: { hooks: [{ ...h('UserPromptExpansion'), onFailure: 'block' }] },
+    // A settings or skill file that changes during the session (a change can be blocked), and an instruction file that goes into
+    // context (only recorded). Neither has onFailure: a hook that cannot run leaves the session as it was.
+    ConfigChange: { hooks: [h('ConfigChange')] },
+    InstructionsLoaded: { hooks: [h('InstructionsLoaded')] },
   };
 }
 
@@ -351,13 +427,18 @@ function ourHooks(command) {
  * a project install (the file is shared, an absolute path is not) runs `zn` from the PATH inside a start guard that blocks the same
  * way; a command given by the caller keeps the plain command. Claude Code runs hooks with sh (Git Bash on Windows), so the same script serves Windows.
  */
-function commandFor(opts = {}) {
+function commandFor(opts = {}, notes = []) {
   if (opts.command) return hookCommand(opts);
   // A project install names `zn` on the PATH inside zn's own start guard (launcher.projectShCommand): a missing zn or Node.js blocks.
   if ((opts.scope || 'user') === 'project') return (event) => launcher.projectShCommand(id, event);
   const node = opts.nodePath || process.execPath;
   const runner = opts.runnerPath || runnerPath();
   const file = launcher.writeLauncher(id, node, runner, { ...opts, deadlineS: launcher.launcherDeadlineS(HOOK_TIMEOUT_S), deadlineSoft: true });
+  // Linux: the static launcher in exec form (`args`: Claude Code starts it with no shell), so no dynamic loader runs before zn can
+  // refuse a loader variable (see static-launcher.js). Elsewhere, or when it cannot be set up, the launcher script as before.
+  const sl = require('./static-launcher');
+  const st = sl.useStatic(opts, notes, id);
+  if (st) return (event) => ({ command: st, args: sl.execParts(st, id, event, file, [event]).slice(1) });
   return (event) => launcher.launcherCommand(file, event, opts.platform);
 }
 
@@ -421,9 +502,10 @@ function installMcp(opts, report) {
   }
   // Only absolute PATH entries outside the project: a `claude` script that starts with `#!/usr/bin/env node`
   // looks node up there.
-  const r = spawnSync(claude, ['mcp', 'add-json', '--scope', 'user', MCP_SERVER_NAME, JSON.stringify({ type: 'stdio', ...conf })],
-    { encoding: 'utf8', windowsHide: true, env: require('../exe').programEnv(opts.env || process.env) });
+  const r = claudeMcpSpawn(claude, ['mcp', 'add-json', '--scope', 'user', MCP_SERVER_NAME, JSON.stringify({ type: 'stdio', ...conf })], opts);
   if (r.status === 0) report.mcp = 'claude mcp (user scope)';
+  else if (timedOut(r)) report.warnings.push('`claude mcp add-json` did not answer within ' + mcpSeconds(opts) + ' seconds, so zn stopped it. ' +
+    'Check with `claude mcp list`; if the MCP server is missing, register it yourself with: ' + manual);
   else report.warnings.push('`claude mcp add-json` failed (' + String(r.stderr || r.stdout || r.error || '').trim().slice(0, 300) + '): register the MCP server yourself with: ' + manual);
 }
 
@@ -444,7 +526,9 @@ function install(opts = {}) {
   const data = readJson(file);
   const report = { settings: file, backup: backup(file), warnings: [] };
   data.hooks = hooksOf(data, file);
-  const ours = ourHooks(commandFor(opts));
+  const notes = [];
+  const ours = ourHooks(commandFor(opts, notes));
+  report.warnings.push(...notes);
   for (const [event, group] of Object.entries(ours)) {
     data.hooks[event] = stripOurs(data.hooks[event]);
     data.hooks[event].push(group);
@@ -519,8 +603,9 @@ function uninstall(opts = {}) {
       } else if (claude && /\.(?:cmd|bat)$/i.test(claude)) {
         report.warnings.push('`claude` is a batch file (' + path.basename(claude) + '), which zn does not run through cmd.exe: remove the MCP server yourself with: claude mcp remove --scope user ' + MCP_SERVER_NAME);
       } else if (claude) {
-        spawnSync(claude, ['mcp', 'remove', '--scope', 'user', MCP_SERVER_NAME],
-          { encoding: 'utf8', windowsHide: true, env: require('../exe').programEnv(opts.env || process.env) });
+        const removed = claudeMcpSpawn(claude, ['mcp', 'remove', '--scope', 'user', MCP_SERVER_NAME], opts);
+        if (timedOut(removed)) report.warnings.push('`claude mcp remove` did not answer within ' + mcpSeconds(opts) + ' seconds, so zn stopped it: ' +
+          'remove zn\'s MCP server yourself with: claude mcp remove --scope user ' + MCP_SERVER_NAME);
       } else if (ours === true) {
         report.warnings.push('`claude` is not on your PATH: remove zn\'s MCP server yourself with: claude mcp remove --scope user ' + MCP_SERVER_NAME);
       }
@@ -528,6 +613,11 @@ function uninstall(opts = {}) {
   }
   return report;
 }
+
+/* The only package specs that mean the npm registry's zn-gate (zn's own servers it registered with npx): no alias
+ * (`zn-gate@npm:other`), no `file:`, `github:` or URL spec, no tag other than latest or next. Package names and dist-tags
+ * are lower case, so no case folding. */
+const NPX_SPEC = /^zn-gate(?:@(?:latest|next|\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?))?$/;
 
 /* zn's own "secrets" server: `secrets-mcp` as an argument of zn-gate's bin/cli.js, of `zn`/`zn-gate`, or of `npx zn-gate`.
  * A server that only mentions the word (another package, a note in env) is someone else's. */
@@ -540,7 +630,7 @@ function isZnSecretsServer(s) {
   const cmd = path.basename(String(s.command || '').replace(/\\/g, '/')).replace(/\.(?:cmd|exe|ps1)$/i, '').toLowerCase();
   if (/(?:^|\/)zn-gate\/bin\/cli\.js$/i.test(prev)) return true;
   if (i === 0 && (cmd === 'zn' || cmd === 'zn-gate')) return true;
-  return /^zn-gate(?:@[^\s]+)?$/i.test(prev) && (cmd === 'npx' || cmd === 'npm');
+  return NPX_SPEC.test(prev) && (cmd === 'npx' || cmd === 'npm');
 }
 
 /* The user-scope MCP servers live in .claude.json (in CLAUDE_CONFIG_DIR when set): true when the "secrets"
@@ -591,8 +681,76 @@ function isBareZnSecrets(s) {
   return (s.command === 'zn' || s.command === 'zn-gate') && args[0] === 'secrets-mcp';
 }
 
+/* zn's own detector server (`zn-gate mcp`: analyze_prompt, check_tool_call, check_tool_result): the user-scope entry named
+ * `zn-gate` or `zn` that runs this Node.js with a zn-gate bin/cli.js, by absolute path, outside the project (the shape
+ * `isInstalledZnServer` checks). An `npx` entry is not recognised in any form: Claude Code starts a user-scope server with the
+ * project as its working folder, so npx would run a `node_modules/.bin/zn-gate` the project carries, read the project's
+ * .npmrc registry, and a relative `npx` is found through the PATH or, on Windows, the project folder. It is checked like any
+ * other server. */
+const DETECTOR_SERVER_NAMES = ['zn-gate', 'zn'];
+const DETECTOR_TOOL_NAMES = ['analyze_prompt', 'check_tool_call', 'check_tool_result'];
+
+function isZnDetectorServer(s, opts = {}) {
+  return isInstalledZnServer(s, 'mcp', opts);
+}
+
+/* The --mcp-config values (JSON text or file paths) of the claude process, read from the hook's ancestors. Linux only:
+ * other systems give no reliable argument list, so a server added only that way is not seen there.
+ * opts.argv (a list of argument lists) replaces the process lookup, for tests. */
+function ancestorArgv(opts) {
+  if (opts.argv) return opts.argv;
+  const out = [];
+  if (process.platform !== 'linux') return out;
+  let pid = process.ppid;
+  for (let i = 0; i < 8 && pid > 1; i += 1) {
+    try {
+      out.push(fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').split('\0').filter((x) => x !== ''));
+      const m = /^PPid:\s*(\d+)/m.exec(fs.readFileSync('/proc/' + pid + '/status', 'utf8'));
+      pid = m ? Number(m[1]) : 0;
+    } catch (_) { break; }
+  }
+  return out;
+}
+
+function isFile(f) {
+  try { return fs.statSync(f).isFile(); } catch (_) { return false; }
+}
+
+/* Servers defined by --mcp-config, or null when a value cannot be read (the caller then trusts nothing). */
+function cliMcpServers(server, cwd, opts) {
+  const found = [];
+  for (const argv of ancestorArgv(opts)) {
+    for (let i = 0; i < argv.length; i += 1) {
+      let values = null;
+      if (argv[i].startsWith('--mcp-config=')) values = [argv[i].slice('--mcp-config='.length)];
+      else if (argv[i] === '--mcp-config') {
+        values = [];
+        // The first value must be readable (else not trusted). After it, stop at the first value that is neither JSON
+        // nor an existing file: it is the prompt (`claude --mcp-config cfg.json "fix the tests"`).
+        for (let j = i + 1; j < argv.length && !argv[j].startsWith('--'); j += 1) {
+          if (j > i + 1 && !/^\s*[{[]/.test(argv[j]) && !isFile(path.resolve(cwd || process.cwd(), argv[j]))) break;
+          values.push(argv[j]);
+        }
+      }
+      if (!values) continue;
+      for (const v of values) {
+        let data;
+        if (/^\s*[{[]/.test(v)) {
+          try { data = JSON.parse(v); } catch (_) { return null; }
+        } else {
+          data = readJsonFile(path.resolve(cwd || process.cwd(), v));
+          if (data === undefined || data === null) return null;
+        }
+        if (data && data.mcpServers && data.mcpServers[server]) found.push(data.mcpServers[server]);
+      }
+    }
+  }
+  return found;
+}
+
 function znMcpServerKind(server, cwd, opts = {}) {
-  if (server !== MCP_SERVER_NAME) return null;
+  const detector = DETECTOR_SERVER_NAMES.includes(server);
+  if (server !== MCP_SERVER_NAME && !detector) return null;
   const env = opts.env || process.env;
   const file = env.CLAUDE_CONFIG_DIR ? path.join(configDir(opts), '.claude.json') : path.join(opts.home || os.homedir(), '.claude.json');
   const data = readJsonFile(file);
@@ -612,6 +770,13 @@ function znMcpServerKind(server, cwd, opts = {}) {
   }
   const seen = new Set();
   const overrides = [];
+  // Servers from the organization's managed-mcp.json and from --mcp-config count like a project entry.
+  const managed = readJsonFile(path.join(opts.managedDir || managedDir(opts.platform || process.platform), 'managed-mcp.json'));
+  if (managed === null) return null;
+  if (managed && managed.mcpServers && managed.mcpServers[server]) overrides.push(managed.mcpServers[server]);
+  const cli = cliMcpServers(server, cwd, opts);
+  if (cli === null) return null;
+  overrides.push(...cli);
   for (const start of starts) {
     let dir = path.resolve(start);
     for (;;) {
@@ -631,6 +796,8 @@ function znMcpServerKind(server, cwd, opts = {}) {
     }
   }
   if (overrides.length) return null;
+  // The detector server: only the user-scope entry, and only when no other entry uses the name at all.
+  if (detector) return userServers[server] !== undefined && isZnDetectorServer(userServers[server], { ...opts, env, cwd: path.resolve(cwd || process.cwd()) }) ? 'analyze' : null;
   return isInstalledSecretsServer(userServers[server], { ...opts, env, cwd: path.resolve(cwd || process.cwd()) }) ? 'secrets' : null;
 }
 
@@ -648,26 +815,39 @@ function realOf(p) {
  * Any zn-gate copy counts, not only the one running this hook: the plugin loads zn-gate from its own vendor folder
  * while the server was registered from the npm package. */
 function isInstalledSecretsServer(s, opts = {}) {
+  return isInstalledZnServer(s, 'secrets-mcp', opts);
+}
+
+function isInstalledZnServer(s, sub, opts = {}) {
   if (!s || typeof s !== 'object' || s.url || typeof s.command !== 'string') return false;
   const args = Array.isArray(s.args) ? s.args.map(String) : [];
-  if (args[1] !== 'secrets-mcp' || !path.isAbsolute(s.command) || !path.isAbsolute(args[0] || '')) return false;
+  if (args[1] !== sub || !path.isAbsolute(s.command) || !path.isAbsolute(args[0] || '')) return false;
+  // The detector server takes no other argument: an entry that adds one is not the plain launcher.
+  if (sub === 'mcp' && args.length !== 2) return false;
   const node = realOf(s.command);
   const cli = realOf(args[0]);
   if (!node || !cli) return false;
   const win = process.platform === 'win32';
   if (!(win ? /^node\.exe$/ : /^node$/).test(path.basename(node))) return false;
   if (!cli.split(path.sep).join('/').endsWith('/zn-gate/bin/cli.js')) return false;
+  return launcherEnvIsClean(s, opts, [node, cli]);
+}
+
+/* None of `files` inside the project, and nothing in the entry changes what the launcher loads. */
+function launcherEnvIsClean(s, opts, files) {
+  const win = process.platform === 'win32';
   const places = require('../exe').projectPlaces(opts.cwd || process.cwd(), opts.env || process.env, win);
+  const exe = require('../exe');
   const inside = (p, d) => { const rel = path.relative(d, p); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); };
-  if (places.some((d) => inside(node, d) || inside(cli, d))) return false;
-  // Nothing in the entry may change what that Node.js loads: no NODE_OPTIONS or NODE_PATH, and no folder to run in
+  if (files.some((f) => exe.inPlaces(f, places) || places.some((d) => inside(realOf(f) || path.resolve(f), d)))) return false;
+  // Nothing in the entry may change what that Node.js loads: no NODE_OPTIONS or NODE_PATH, no LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH, DYLD_* or OPENSSL_CONF (they load code into any program), and no folder to run in
   // that is inside the project.
   const env = s.env && typeof s.env === 'object' ? Object.keys(s.env) : [];
-  if (env.some((k) => /^NODE_(?:OPTIONS|PATH)$/i.test(k))) return false;
+  if (env.some((k) => /^(?:NODE_(?:OPTIONS|PATH)|LD_(?:PRELOAD|LIBRARY_PATH|AUDIT)|DYLD_.*|OPENSSL_CONF)$/i.test(k))) return false;
   if (s.cwd !== undefined) {
     if (typeof s.cwd !== 'string' || !path.isAbsolute(s.cwd)) return false;
     const where = realOf(s.cwd) || (win ? path.resolve(s.cwd).toLowerCase() : path.resolve(s.cwd));
-    if (places.some((d) => inside(where, d))) return false;
+    if (exe.inPlaces(where, places)) return false;
   }
   return true;
 }

@@ -92,22 +92,32 @@ function applyEdits(parsed, edits) {
 }
 
 /**
- * Is this .env already shadowed? True when every sensitive key with a
- * value of 8+ characters holds a __ZN_ marker (or only a marker in place of
- * the password of a connection string).
+ * Names of the sensitive variables that still hold a real value: not empty,
+ * not a __ZN_ marker (or a connection string whose password is one), whatever
+ * the length. Names only, never values.
  */
-function isShadowed(text) {
+function plainSecretNames(text) {
   const { entries } = parseDotenv(text);
+  const names = [];
   for (const e of entries) {
     if (!isSensitiveKey(e.key)) continue;
-    if (e.value.length < MIN_SECRET_LEN) continue;
-    if (e.value.includes('__ZN_')) continue;
+    if (e.value === '') continue; // nothing to leak
+    if (/^__ZN_[A-Z0-9_]+__$/.test(e.value)) continue; // the whole value must be a marker: x__ZN_ is a real value
     const pw = connectionPassword(e.value);
     if (pw && /^__ZN_[A-Z0-9_]+__$/.test(e.value.slice(pw.start, pw.end))) continue;
-    if (!pw && /^[a-z][a-z0-9+.-]*:\/\//i.test(e.value)) continue; // URL without credentials
-    return false;
+    // A URL without credentials is not a secret, but only under a _URL or _URI name: API_KEY=https://example.com still is one.
+    if (!pw && /_UR[LI]$/i.test(e.key) && /^[a-z][a-z0-9+.-]*:\/\//i.test(e.value)) continue;
+    if (!names.includes(e.key)) names.push(e.key);
   }
-  return true;
+  return names;
+}
+
+/**
+ * Is this .env already shadowed? True when no sensitive variable still holds a
+ * plain value. Short values count too: a 3-character password is still a password.
+ */
+function isShadowed(text) {
+  return plainSecretNames(text).length === 0;
 }
 
 module.exports = {
@@ -117,5 +127,6 @@ module.exports = {
   isSensitiveKey,
   connectionPassword,
   applyEdits,
+  plainSecretNames,
   isShadowed,
 };

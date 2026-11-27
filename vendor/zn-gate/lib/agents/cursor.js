@@ -204,7 +204,7 @@ function commandFor(opts = {}) {
   if (opts.command) return cfg.hookCommand(id, opts);
   if ((opts.scope || 'user') === 'project') {
     // `zn` from the PATH inside zn's start guard (launcher.projectShCommand / projectWindowsScript): a missing zn or Node.js blocks.
-    return (event) => (platform === 'win32' ? launcher.windowsScriptCommand(launcher.projectWindowsScript(id, event)) : launcher.projectShCommand(id, event));
+    return (event) => (platform === 'win32' ? launcher.windowsScriptCommand(launcher.projectWindowsScript(id, event)) : launcher.projectShCommand(id, event, { platform }));
   }
   const node = opts.nodePath || process.execPath;
   const runner = opts.runnerPath || cfg.runnerPath();

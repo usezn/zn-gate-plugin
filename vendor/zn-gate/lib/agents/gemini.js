@@ -44,6 +44,7 @@
 const fs = require('fs');
 const { askAsDeny, isPlainAsk } = require('./ask-deny');
 const { fileURLToPath } = require('url');
+const { MAX_NEST_DEPTH, MAX_NEST_NODES } = require('../nest-limits');
 const os = require('os');
 const path = require('path');
 const cfg = require('./config-file');
@@ -74,31 +75,52 @@ function firstString(obj, keys) {
 }
 
 /**
- * Every string argument whose key looks like a file or folder (content-like keys are skipped), three levels deep.
+ * A file: address with a host other than localhost would become a network (UNC) path on Windows, so it is refused
+ * on every platform. A localhost host is dropped so the address stays a local path.
+ */
+function localFileUrl(v) {
+  const u = new URL(v);
+  if (u.hostname && u.hostname.toLowerCase() !== 'localhost') throw new Error('file: URL names a remote host');
+  u.hostname = '';
+  return u;
+}
+
+/**
+ * Every string argument whose key looks like a file or folder (content-like keys are skipped), down to MAX_NEST_DEPTH (the limit of the text
+ * scan). Objects left unvisited because of the depth or node limit set `bad`: a path may be hidden there.
  * A file: address that cannot be turned into a path sets `bad`, so the call is refused instead of passed.
  */
 function pathsOf(args) {
   const out = [];
   let bad = false;
+  // A candidate name taken from a long or multi-line value: a file: URI in it is decoded like a one-line value.
+  const addName = (x) => {
+    if (/^file:/i.test(x)) { try { out.push(fileURLToPath(localFileUrl(x))); } catch (_) { bad = true; } return; }
+    out.push(x);
+  };
   const add = (v) => {
     if (typeof v !== 'string' || !v) return;
     if (/^file:/i.test(v)) {
-      try { out.push(fileURLToPath(v)); } catch (_) { bad = true; }
+      try { out.push(fileURLToPath(localFileUrl(v))); } catch (_) { bad = true; }
       return;
     }
-    if (v.length > MAX_PATH_LEN || /[\r\n]/.test(v)) return;
+    // A long value is classified like any other (classifyPath reads long input); a value with line breaks (code, a message) is
+    // not one file name: its trimmed whole and each line that starts like a path are checked (pathCandidatesOf).
+    if (v.length > MAX_PATH_LEN || /[\r\n]/.test(v)) { for (const x of require('./copilot').pathCandidatesOf(v)) addName(x); return; }
     out.push(v);
   };
   const keyOk = (k) => PATH_KEY_RE.test(k) && !NOT_PATH_KEY_RE.test(k);
+  let nodes = 0;
   const walk = (obj, depth) => {
+    if (++nodes > MAX_NEST_NODES) { bad = true; return; }
     for (const [k, v] of Object.entries(obj)) {
       if (keyOk(k)) {
         if (Array.isArray(v)) v.forEach(add); else add(v);
       }
-      if (depth < 3) {
+      if (depth < MAX_NEST_DEPTH) {
         if (isObj(v)) walk(v, depth + 1);
         else if (Array.isArray(v)) v.forEach((x) => { if (isObj(x)) walk(x, depth + 1); });
-      }
+      } else if (isObj(v) || (Array.isArray(v) && v.some(isObj))) bad = true;
     }
   };
   walk(args, 0);
@@ -155,9 +177,12 @@ function normalize(raw) {
     return e;
   }
   // Any other tool that names a file (a future tool, an extension) gets the read and write checks on every path.
-  if (!NAMES_ONLY_TOOLS.has(toolName) && (paths.length || bad)) {
-    const e = { ...ev, tool: 'fileaccess', input };
-    if (bad) e.unreadable = 'zn: could not read a file address in this call, so zn cannot check it.';
+  // A path under any key counts too (src, dst, from, to, nested objects), and arguments zn cannot walk to the end are refused.
+  const loose = NAMES_ONLY_TOOLS.has(toolName) ? { paths: [], bad: false } : require('./copilot').pathsOf(args, { loose: true });
+  const all = [...new Set([...paths, ...loose.paths])];
+  if (!NAMES_ONLY_TOOLS.has(toolName) && (all.length || bad || loose.bad)) {
+    const e = { ...ev, tool: 'fileaccess', input: { ...input, path: all[0], paths: all } };
+    if (bad || loose.bad) e.unreadable = 'zn: could not read a file address in this call, so zn cannot check it.';
     return e;
   }
   return { ...ev, tool: toolName.toLowerCase(), input: { texts: [] } };

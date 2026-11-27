@@ -18,9 +18,10 @@ const short = (s, n) => String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f
 function policyProblem(pol) {
   switch (pol.status) {
     case 'none': return 'the organization has not published a policy yet';
-    case 'rejected': return 'the downloaded policy was refused' + (pol.error ? ' (' + short(pol.error, 120) + ')' : '');
+    case 'rejected': return 'the downloaded policy was refused' + (pol.error ? ' (' + short(pol.error, 160) + ')' : '') +
+      (pol.error === 'policy expired' ? ": this computer's clock may be ahead, so check its date and time" : '');
     case 'revoked': return 'this machine was removed from the organization';
-    case 'offline': return 'could not reach the server' + (pol.error ? ' (' + short(pol.error, 60) + ')' : '');
+    case 'offline': return 'could not reach the zn server';
     case 'stopped': return 'the vault was locked before the sync finished';
     case 'stale': return 'this machine left or changed its organization while the sync was running; nothing was applied';
     default: return 'the policy state is unknown (' + short(pol.status, 40) + ')';
@@ -32,11 +33,14 @@ function syncOutcome(result) {
   const problems = [];
   const pol = r.policy && typeof r.policy === 'object' ? r.policy : null;
   const policyOk = Boolean(pol) && POLICY_OK.has(pol.status);
-  if (!pol) problems.push('the sync did not report a policy state');
-  else if (!policyOk) problems.push(policyProblem(pol));
   const up = r.upload && typeof r.upload === 'object' ? r.upload : null;
+  if (!pol) problems.push('the sync did not report a policy state');
+  // An inactive organization is the real cause when there is no policy to send: do not blame the missing policy.
+  else if (!policyOk && !(pol.status === 'none' && up && up.status === 'inactive')) problems.push(policyProblem(pol));
   if (up && up.status === 'stale') {
     problems.push('audit upload stopped: this machine left or changed its organization while it was running');
+  } else if (up && up.status === 'inactive') {
+    problems.push('your organization is not active on zn right now');
   } else if (up && UPLOAD_FAILED.has(up.status)) {
     problems.push('audit upload failed (' + short(up.status, 20) + (up.pending > 0 ? ', ' + up.pending + ' records pending' : '') + ')');
   }

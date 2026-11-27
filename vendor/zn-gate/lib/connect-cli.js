@@ -16,6 +16,7 @@
 const cloudKey = require('./cloud-key');
 const messages = require('./messages');
 const { znCommand } = require('./zn-command');
+const { deadlineLookup } = require('./dns-deadline');
 
 const CONNECT_URL = 'https://usezn.com/connect?source=cli&utm_source=cli';
 // The only host this module talks to, and the routes on it.
@@ -93,6 +94,7 @@ function request(h, method, path, key, saved) {
         method,
         headers: { Authorization: 'Bearer ' + key, Accept: 'application/json', 'User-Agent': 'zn-gate/' + version() + ' (connect)' },
         timeout: REQUEST_TIMEOUT_MS,
+        lookup: deadlineLookup(REQUEST_TIMEOUT_MS),
         rejectUnauthorized: true,
       }, (res) => {
         let body = '';

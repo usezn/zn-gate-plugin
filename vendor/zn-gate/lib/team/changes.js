@@ -202,7 +202,8 @@ function writeNotice(home, n) {
 /**
  * takeNotices({home, org, change, detectorsMissing, statusCommand, syncCommand, now}) -> [lines]
  * The change line is given once per change; the "detectors not applied" line
- * at most once an hour. What was shown is remembered in ~/.zn/team-notice.json.
+ * at most once an hour. What was shown is remembered in ~/.zn/team-notice.json,
+ * except the change line when `trusted` (the vault holds that, see teamChangeShown).
  */
 function takeNotices(o) {
   const lines = [];
@@ -211,12 +212,17 @@ function takeNotices(o) {
   const next = Object.assign({}, seen);
   let dirty = false;
   const change = cleanChange(o.change);
-  if (change && !(seen.change_to === change.to && seen.change_org === (o.org || null))) {
+  // trusted: the change and what was already shown come from the vault, not from a file a process of the
+  // same user can edit. Then the file is not consulted (and not written) for the change line.
+  const already = o.trusted === true ? o.shown === (change && change.to) : (seen.change_to === (change && change.to) && seen.change_org === (o.org || null));
+  if (change && !already) {
     lines.push('zn: your organization changed its policy (version ' + change.to + ') and removed or loosened ' + change.count +
       (change.count === 1 ? ' restriction' : ' restrictions') + ' on this machine. See which with: ' + o.statusCommand + '.');
-    next.change_to = change.to;
-    next.change_org = o.org || null;
-    dirty = true;
+    if (o.trusted !== true) {
+      next.change_to = change.to;
+      next.change_org = o.org || null;
+      dirty = true;
+    }
   }
   if (o.detectorsMissing && !(Number.isFinite(seen.detectors_at) && now - seen.detectors_at < DETECTORS_NOTICE_EVERY_MS)) {
     lines.push('zn: Team detectors not applied. Your organization\'s custom secret formats are not active here because its policy is missing or does not verify on this machine. Run: ' + o.syncCommand + '.');
